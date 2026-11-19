@@ -214,6 +214,9 @@
     valSokolow: document.getElementById("valSokolow"),
     valCornell: document.getElementById("valCornell"),
     selectPatientSex: document.getElementById("selectPatientSex"),
+    calPulseActions: document.getElementById("calPulseActions"),
+    calPulseText: document.getElementById("calPulseText"),
+    btnApplyPulseGain: document.getElementById("btnApplyPulseGain"),
     valMacruz: document.getElementById("valMacruz"),
     vcgCanvas: document.getElementById("vcgCanvas"),
     chkVcgVectors: document.getElementById("chkVcgVectors"),
@@ -719,6 +722,11 @@
       // Populate visual verification images (use clean aligned_image for interactive vector overlay)
       const vis = state.digitization.visualizations || {};
       state.originalOverlayTraces = JSON.parse(JSON.stringify(state.digitization.overlay_traces || []));
+      state.originalTraceQuality = state.originalOverlayTraces.map((tr) =>
+        state.digitization.lead_quality && state.digitization.lead_quality[tr.lead]
+          ? JSON.parse(JSON.stringify(state.digitization.lead_quality[tr.lead]))
+          : null
+      );
       state.overlayInkMap = null;
       state.selectedTraceIdx = 0;
 
@@ -765,6 +773,7 @@
       state.calRulerHover = null;
       el.inputPxPerMm.value = detPxPerMm.toFixed(2);
       updateDigitizationMetaBanner();
+      renderCalPulseActions();
       setTimeout(() => {
         renderPhotoCalibrationCanvas();
         renderTraceOverlayCanvas();
@@ -809,7 +818,16 @@
       `Источник: ${state.currentSource || "—"} • Раскладка: ${state.digitization.layout_label} • ` +
       `Калибровка сетки: ${pxMm.toFixed(2)} пикс/мм (1 клетка 5мм = ${(pxMm * 5).toFixed(1)} пикс, угол ${skew}°) • ` +
       `Скорость: ${state.digitization.paper_speed_mm_s} мм/с • Время: ${state.digitization.elapsed_sec} с` +
+      calPulseSummary() +
       ((state.digitization.warnings || []).length ? ` • ⚠ ${state.digitization.warnings.join(" • ⚠ ")}` : "");
+  }
+
+  function calPulseSummary() {
+    const cp = state.digitization && state.digitization.calibration_pulse;
+    if (!cp) return "";
+    if (cp.status === "not_found") return " • Импульс 1 мВ: не найден";
+    const n = cp.consistent_count || cp.count;
+    return ` • Импульс 1 мВ: ${cp.height_mm.toFixed(1)} мм (${n} шт.) ${cp.status === "ok" ? "✓ усиление подтверждено" : "≠ заданному усилению"}`;
   }
 
   // Interactive Photo & Grid Calibration Overlay Renderer (#calGridCanvas over #imgAligned)
@@ -1463,7 +1481,7 @@
     ctx.restore();
   }
 
-  async function syncTraceToDigitalLead(traceIdx, reanalyzeBackend = true) {
+  async function syncTraceToDigitalLead(traceIdx, reanalyzeBackend = true, markManual = true) {
     if (!state.digitization || !state.digitization.overlay_traces) return;
     const tr = state.digitization.overlay_traces[traceIdx];
     if (!tr || !tr.points_px || tr.points_px.length < 4) return;
@@ -1510,6 +1528,13 @@
     Object.keys(editedLeads).forEach((ln) => {
       state.calibBase[ln] = { sig: editedLeads[ln].slice(), pxPerMm: state.activePxPerMm || pxPerMmX };
     });
+    // The automatic trace-quality verdict no longer applies to a hand-corrected line
+    if (!state.digitization.lead_quality) state.digitization.lead_quality = {};
+    if (markManual) {
+      Object.keys(editedLeads).forEach((ln) => {
+        state.digitization.lead_quality[ln] = { level: "manual", score: null, issues: ["линия исправлена вручную во вкладке «Контур»"] };
+      });
+    }
 
     if (reanalyzeBackend) {
       // Re-analyze ONLY the edited lead(s) and merge them: manual R-peak / caliper / artifact work on all
@@ -1791,6 +1816,7 @@
     migrateKey(state.artifactsByLead);
     migrateKey(state.originalBeatsByLead);
     migrateKey(state.calibBase);
+    migrateKey(state.digitization.lead_quality);
     // Keep the "reset line" backup aligned with the new names too (it is indexed by trace position)
     if (state.originalOverlayTraces[traceIdx]) state.originalOverlayTraces[traceIdx].lead = newLeadName;
     if (otherIdx >= 0 && state.originalOverlayTraces[otherIdx]) state.originalOverlayTraces[otherIdx].lead = oldName;
@@ -1798,7 +1824,7 @@
 
     populateOverlayTraceDropdown();
     renderTraceOverlayCanvas();
-    await syncTraceToDigitalLead(traceIdx, true);
+    await syncTraceToDigitalLead(traceIdx, true, false);
 
     const msg = otherIdx >= 0 ? `Отведения ${oldName} ↔ ${newLeadName} поменяны местами` : `Отведение ${oldName} переименовано в ${newLeadName}`;
     if (el.overlayEditStatus) el.overlayEditStatus.textContent = msg;
@@ -1969,9 +1995,12 @@
           // otherwise the old name would be re-created as a duplicate lead
           const currentName = traces[state.selectedTraceIdx].lead;
           traces[state.selectedTraceIdx] = { ...JSON.parse(JSON.stringify(orig)), lead: currentName };
+          // Back to the automatic line → back to its automatic quality verdict
+          const origQ = state.originalTraceQuality && state.originalTraceQuality[state.selectedTraceIdx];
+          if (origQ && state.digitization.lead_quality) state.digitization.lead_quality[currentName] = JSON.parse(JSON.stringify(origQ));
           populateOverlayTraceDropdown();
           renderTraceOverlayCanvas();
-          syncTraceToDigitalLead(state.selectedTraceIdx, true);
+          syncTraceToDigitalLead(state.selectedTraceIdx, true, false);
           if (el.overlayEditStatus) {
             el.overlayEditStatus.textContent = `Восстановлена исходная линия ${orig.lead}`;
           }
@@ -2716,16 +2745,50 @@
     }
   }
 
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+  }
+
+  // Backend per-lead trust score: { level: ok|warn|bad|manual, score, issues[] } → class + tooltip text
+  function leadQualityInfo(leadName) {
+    const q = state.digitization && state.digitization.lead_quality && state.digitization.lead_quality[leadName];
+    if (!q) return { level: "", title: "" };
+    const label = { ok: "Качество трассировки: хорошее", warn: "Качество трассировки: сомнительное", bad: "Качество трассировки: плохое — проверьте линию", manual: "Линия исправлена вручную" }[q.level] || "";
+    const score = typeof q.score === "number" ? ` (${Math.round(q.score * 100)}%)` : "";
+    const issues = (q.issues || []).map((t) => `• ${t}`).join("\n");
+    return { level: q.level, title: `${label}${score}${issues ? "\n" + issues : ""}` };
+  }
+
   function buildLeadPills(leadNames) {
     el.leadPillsContainer.innerHTML = "";
     leadNames.forEach((ln) => {
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.className = "lead-pill" + (ln === state.activeLead ? " active" : "");
+      const qi = leadQualityInfo(ln);
+      btn.className = "lead-pill" + (ln === state.activeLead ? " active" : "") + (qi.level && qi.level !== "ok" ? ` q-${qi.level}` : "");
       btn.textContent = ln;
+      if (qi.title) btn.title = qi.title;
       btn.addEventListener("click", () => selectLead(ln));
       el.leadPillsContainer.appendChild(btn);
     });
+  }
+
+  // 1-mV calibration pulse: offer to re-digitize with the gain the pulse actually shows
+  function renderCalPulseActions() {
+    if (!el.calPulseActions) return;
+    const cp = state.digitization && state.digitization.calibration_pulse;
+    if (!cp || cp.status !== "mismatch") {
+      el.calPulseActions.hidden = true;
+      return;
+    }
+    const entered = cp.entered_gain_mm_mv;
+    const sugg = cp.suggested_gain_mm_mv;
+    el.calPulseText.textContent =
+      `Калибровочный импульс 1 мВ = ${cp.height_mm.toFixed(1)} мм, а задано ${entered} мм/мВ` +
+      (sugg ? ` — вероятно, запись сделана с усилением ${sugg} мм/мВ.` : ". Проверьте усиление.");
+    el.btnApplyPulseGain.hidden = !sugg || state.staticMode;
+    el.btnApplyPulseGain.textContent = sugg ? `Применить ${sugg} мм/мВ и пересчитать` : "Применить";
+    el.calPulseActions.hidden = false;
   }
 
   function getLeadTotalMs(leadName) {
@@ -5207,9 +5270,14 @@
         const st80 = amp.st_80_mv || 0;
         const isAct = ln === state.activeLead ? "active-row" : "";
 
+        const qi = leadQualityInfo(ln);
+        const qBadge = qi.level && qi.level !== "ok"
+          ? `<span class="q-badge q-${qi.level}" title="${escapeHtml(qi.title)}">${qi.level === "manual" ? "✎" : "●"}</span>`
+          : "";
+
         return `
-        <tr class="${isAct}" data-lead="${ln}">
-          <td class="mono-val">${ln}</td>
+        <tr class="${isAct}" data-lead="${escapeHtml(ln)}">
+          <td class="mono-val">${escapeHtml(ln)}${qBadge}</td>
           <td class="mono-val">${(m.hr_bpm || 0).toFixed(0)}</td>
           <td class="mono-val">${(m.rr_ms || 0).toFixed(0)}</td>
           <td class="mono-val">${(dur.p_wave || 0).toFixed(0)}</td>
@@ -5791,6 +5859,23 @@
   }
 
   function bindUIEvents() {
+    // Calibration pulse disagrees with the entered gain → re-digitize with the gain the pulse shows
+    if (el.btnApplyPulseGain) {
+      el.btnApplyPulseGain.addEventListener("click", () => {
+        const cp = state.digitization && state.digitization.calibration_pulse;
+        if (!cp || !cp.suggested_gain_mm_mv) return;
+        const val = String(cp.suggested_gain_mm_mv);
+        if (!Array.from(el.selectGain.options).some((o) => o.value === val)) {
+          const opt = document.createElement("option");
+          opt.value = val;
+          opt.textContent = `${val} мм/мВ`;
+          el.selectGain.appendChild(opt);
+        }
+        el.selectGain.value = val;
+        runDigitization();
+      });
+    }
+
     // Patient sex only changes the Cornell LVH threshold: recompute indices without re-digitizing
     if (el.selectPatientSex) {
       el.selectPatientSex.addEventListener("change", () => {

@@ -109,3 +109,81 @@ def test_numba_viterbi_matches_numpy_reference() -> None:
     _viterbi_forward_numba(dp, bp, reward, blank, mask, idx, pq.astype(np.float64), pn.astype(np.float64))
     assert np.array_equal(bp, bp_ref)
     assert np.allclose(dp, dp_ref)
+
+
+# ----------------------------------------------------------------------------- calibration pulse & lead quality
+from app.core.digitizer import (  # noqa: E402
+    assess_lead_quality,
+    classical_grid_and_signal_maps,
+    detect_calibration_pulses,
+    remove_pulses_from_leads,
+    summarize_calibration_pulses,
+)
+
+
+def synthetic_sheet_with_pulses(px_per_mm: float, pulse_mm: float, n_rows: int = 4, w: int = 1000, h: int = 700) -> np.ndarray:
+    """White paper, pink 1/5-mm grid, black traces with a 1-mV pulse (height `pulse_mm`, 5 mm wide) at row starts."""
+    import cv2
+
+    img = np.full((h, w, 3), 252, np.uint8)
+    for k in range(int(max(h, w) / px_per_mm) + 1):
+        pos = int(round(k * px_per_mm))
+        col = (240, 150, 160) if k % 5 == 0 else (250, 215, 220)
+        if pos < w:
+            img[:, pos] = col
+        if pos < h:
+            img[pos, :] = col
+    ys = np.linspace(0.18 * h, 0.85 * h, n_rows).astype(int)
+    ph, pw = int(round(pulse_mm * px_per_mm)), int(round(5 * px_per_mm))
+    for y in ys:
+        x0 = int(0.04 * w)
+        pts = [(x0, y), (x0 + 8, y), (x0 + 8, y - ph), (x0 + 8 + pw, y - ph), (x0 + 8 + pw, y), (w - 10, y)]
+        cv2.polylines(img, [np.array(pts, np.int32)], False, (20, 20, 20), 2, cv2.LINE_8)
+    return img
+
+
+@pytest.mark.parametrize("pulse_mm", [10.0, 5.0])
+def test_calibration_pulses_are_found_and_measured(pulse_mm: float) -> None:
+    img = synthetic_sheet_with_pulses(4.0, pulse_mm)
+    ink, _ = classical_grid_and_signal_maps(img)
+    pulses = detect_calibration_pulses(ink, 4.0, 4.0)
+    assert len(pulses) == 4
+    for pl in pulses:
+        assert pl["height_mm"] == pytest.approx(pulse_mm, rel=0.08)
+    summary = summarize_calibration_pulses(pulses, gain_mm_mv=10.0)
+    if pulse_mm == 10.0:
+        assert summary["status"] == "ok"
+    else:
+        assert summary["status"] == "mismatch"
+        assert summary["suggested_gain_mm_mv"] == 5.0
+
+
+def test_no_pulses_on_plain_grid_and_traces() -> None:
+    img = synthetic_sheet_with_pulses(4.0, 10.0)
+    img[:, : int(0.2 * img.shape[1])] = 252  # wipe the pulses (left margin), keep grid squares elsewhere
+    ink, _ = classical_grid_and_signal_maps(img)
+    assert detect_calibration_pulses(ink, 4.0, 4.0) == []
+    assert summarize_calibration_pulses([], 10.0)["status"] == "not_found"
+
+
+def test_shorter_broken_pulse_does_not_win_a_tie() -> None:
+    pulses = [{"height_mm": 9.6}, {"height_mm": 4.5}]
+    assert summarize_calibration_pulses(pulses, 10.0)["height_mm"] == pytest.approx(9.6)
+
+
+def test_pulse_inside_a_traced_strip_is_bridged_out_of_the_signal() -> None:
+    sig = [0.0] * 100 + [1.0] * 20 + [0.0] * 380  # 1-mV square near the start of a 500-sample lead
+    leads = {"V5": list(sig)}
+    traces = [{"lead": "V5", "x_range_px": [0, 500], "baseline_y_px": 200.0}]
+    pulse = {"x_px": [100, 120], "top_px": 160, "bottom_px": 200}
+    assert remove_pulses_from_leads([pulse], traces, leads) == ["V5"]
+    assert max(abs(v) for v in leads["V5"]) < 0.05
+
+
+def test_lead_quality_levels() -> None:
+    good = assess_lead_quality({"ink_support": 0.98, "edge_hits": 0.0, "neighbor_overlap": 0.0, "displaced": 0.0}, [0, 1.2, -0.3, 0])
+    jumped = assess_lead_quality({"ink_support": 0.4, "edge_hits": 0.0, "neighbor_overlap": 0.35, "displaced": 0.4}, [0, 2.0, 0])
+    flat = assess_lead_quality({"ink_support": 0.99, "edge_hits": 0.0, "neighbor_overlap": 0.0, "displaced": 0.0}, [0.0, 0.02, 0.0])
+    assert good["level"] == "ok" and not good["issues"]
+    assert jumped["level"] == "bad" and len(jumped["issues"]) >= 2
+    assert flat["level"] in ("warn", "bad")

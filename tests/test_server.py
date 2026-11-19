@@ -62,6 +62,9 @@ def test_digitize_example_with_layout_hint_end_to_end() -> None:
     dig, ana = j["digitization"], j["analysis"]
     assert dig["layout"] == "3x4_r2"
     assert isinstance(dig["warnings"], list)
+    assert dig["calibration_pulse"]["status"] in ("ok", "mismatch", "not_found")
+    assert set(dig["lead_quality"]) == set(dig["leads_mv"])
+    assert all(q["level"] in ("ok", "warn", "bad") for q in dig["lead_quality"].values())
     assert {"I", "II", "V6", "II (ритм)", "I (ритм)"} <= set(dig["leads_mv"])
     assert 40 <= ana["global_hr_bpm"] <= 120
     assert dig["visualizations"]["aligned_image"].startswith("data:image/jpeg;base64,")

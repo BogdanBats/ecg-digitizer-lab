@@ -1247,7 +1247,8 @@ def determine_column_x_ranges(
 def extract_column_leads_with_peeling(
     col_sig_map: np.ndarray,
     n_rows_in_col: int,
-) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray]:
+    min_displaced_run_px: int = 40,
+) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray, List[Dict[str, float]]]:
     """
     Extracts `n_rows_in_col` lead traces from a single column sub-image `col_sig_map` `(H, W_c)`:
     1. Detects the exact baseline Y positions and smooth local baseline curves `b_r(x)` within this column.
@@ -1311,6 +1312,7 @@ def extract_column_leads_with_peeling(
         qrs_col_mask = ndimage.binary_dilation(raw_qrs_cols, structure=np.ones(2 * dil_w + 1, dtype=bool))
 
     traces_px: List[np.ndarray] = []
+    trace_quality: List[Dict[str, float]] = []
     # Soft claimed-trace penalty map (never erases `work_sig` into blank paper, so crossing strokes remain valid ink bridges!)
     claimed_penalty_full = np.zeros((H, W_c), dtype=np.float64)
 
@@ -1360,6 +1362,32 @@ def extract_column_leads_with_peeling(
         global_y = y0 + local_trace
         traces_px.append(global_y)
 
+        # Trace diagnostics: how much of the path sits on actual ink, and how often it is pinned to the search-band
+        # edge (an R / S tip taller than the allowed window is clipped there)
+        H_band = band.shape[0]
+        t_idx = np.clip(np.round(local_trace).astype(int), 0, H_band - 1)
+        cols_idx = np.arange(W_c)
+        near_ink = np.max(np.stack([band[np.clip(t_idx + dy, 0, H_band - 1), cols_idx] for dy in (-2, -1, 0, 1, 2)]), axis=0)
+        # "Displaced" = the path stays far from this row's baseline for longer than any QRS (>= ~0.25 s): the
+        # tracker has jumped to another row or is running across blank paper (typical square-wave failure)
+        exc_rel = np.abs(global_y - baseline_curves[r_idx]) / max(1.0, median_spacing)
+        far = np.concatenate([[0], (exc_rel > 0.55).astype(np.int8), [0]])
+        d_far = np.diff(far)
+        run_starts, run_ends = np.nonzero(d_far == 1)[0], np.nonzero(d_far == -1)[0]
+        displaced_px = 0
+        for b, e in zip(run_starts, run_ends):
+            if e - b < min_displaced_run_px:
+                continue
+            seg = global_y[b:e]
+            # a whole row away, or a dead-flat shelf far from baseline (blank paper); a tall rounded T is neither
+            if float(np.median(exc_rel[b:e])) > 0.85 or float(np.ptp(seg)) < 0.12 * median_spacing:
+                displaced_px += int(e - b)
+        trace_quality.append({
+            "ink_support": float(np.mean(near_ink >= 0.10)),
+            "edge_hits": float(np.mean((local_trace <= 1.0) | (local_trace >= H_band - 2.0))),
+            "displaced": float(displaced_px / max(1, W_c)),
+        })
+
         # Record this row's traced waveform into `claimed_penalty_full`:
         # - Standard claimed QRS stroke penalty (+1.65): prevents subsequent leads (like V5) from riding
         #   an already-claimed deep S-wave limb (like V4's S-wave), while keeping `work_sig` intact for `blank_cumsum`!
@@ -1385,7 +1413,16 @@ def extract_column_leads_with_peeling(
                 hi_seg = min(H, gy + 4)
                 claimed_penalty_full[lo_seg:hi_seg, x] = np.maximum(claimed_penalty_full[lo_seg:hi_seg, x], pen_val)
 
-    return traces_px, baseline_curves, baselines_y
+    # Fraction of the strip where a row runs (almost) on top of a neighbouring row: leads crossing / stealing waves
+    close_px = max(3.0, 0.08 * median_spacing)
+    for r_idx in range(len(traces_px)):
+        close = np.zeros(W_c, dtype=bool)
+        for nb in (r_idx - 1, r_idx + 1):
+            if 0 <= nb < len(traces_px):
+                close |= np.abs(traces_px[r_idx] - traces_px[nb]) < close_px
+        trace_quality[r_idx]["neighbor_overlap"] = float(np.mean(close))
+
+    return traces_px, baseline_curves, baselines_y, trace_quality
 
 
 def extract_all_leads_for_layout(
@@ -1398,7 +1435,7 @@ def extract_all_leads_for_layout(
     target_fs: float = 500.0,
     text_map: Optional[np.ndarray] = None,
     detected_labels: Optional[List[Dict[str, Any]]] = None,
-) -> Tuple[Dict[str, List[float]], List[Dict[str, Any]], np.ndarray]:
+) -> Tuple[Dict[str, List[float]], List[Dict[str, Any]], np.ndarray, Dict[str, Dict[str, float]]]:
     """
     Extracts calibrated digital signals (in mV, sampled at `target_fs` Hz) and
     pixel-space trace overlays for every lead in the specified `layout_key`.
@@ -1424,6 +1461,9 @@ def extract_all_leads_for_layout(
     leads_mv: Dict[str, List[float]] = {}
     overlay_traces: List[Dict[str, Any]] = []
     all_baselines_y: List[int] = []
+    trace_quality_by_lead: Dict[str, Dict[str, float]] = {}
+    # 0.12 s of paper: the far-from-baseline part of a QRS is shorter, so a sustained run means the tracker left the trace
+    min_run_px = max(6, int(round(0.12 * paper_speed_mm_s * px_per_mm_x)))
 
     def slice_pixels_to_calibrated_mv(
         seg_y: np.ndarray,
@@ -1464,7 +1504,7 @@ def extract_all_leads_for_layout(
     for c_idx in range(n_cols):
         cx0, cx1 = col_ranges[c_idx]
         col_slice = sig_map[:main_y_limit, cx0:cx1]
-        col_traces, col_bases, col_by = extract_column_leads_with_peeling(col_slice, n_main_rows)
+        col_traces, col_bases, col_by, col_q = extract_column_leads_with_peeling(col_slice, n_main_rows, min_run_px)
 
         for r_idx in range(min(n_main_rows, len(col_traces))):
             row_lead_names = grid_rows[r_idx]
@@ -1479,8 +1519,10 @@ def extract_all_leads_for_layout(
             base_c = col_bases[r_idx]
             mv_series = slice_pixels_to_calibrated_mv(trace_y, base_c, invert_sign=invert)
             leads_mv[display_name] = mv_series
+            trace_quality_by_lead[display_name] = col_q[r_idx]
             if invert and clean_name not in leads_mv:
                 leads_mv[clean_name] = [round(-v, 4) for v in mv_series]
+                trace_quality_by_lead[clean_name] = col_q[r_idx]
 
             step_ov = max(1, (cx1 - cx0) // 350)
             xs_local = list(range(0, cx1 - cx0, step_ov))
@@ -1500,7 +1542,7 @@ def extract_all_leads_for_layout(
         rx1 = col_ranges[-1][1]
         rhy_y0 = max(0, main_y_limit - int(0.08 * H))
         rhy_slice = sig_map[rhy_y0:, rx0:rx1]
-        rhy_traces, rhy_bases, rhy_by = extract_column_leads_with_peeling(rhy_slice, n_rhythm_rows)
+        rhy_traces, rhy_bases, rhy_by, rhy_q = extract_column_leads_with_peeling(rhy_slice, n_rhythm_rows, min_run_px)
         for rhy_i, rhy_name in enumerate(rhythm_leads):
             if rhy_i >= len(rhy_traces):
                 break
@@ -1508,6 +1550,7 @@ def extract_all_leads_for_layout(
             base_c = rhy_y0 + rhy_bases[rhy_i]
             mv_series = slice_pixels_to_calibrated_mv(trace_y, base_c, invert_sign=False)
             leads_mv[rhy_name] = mv_series
+            trace_quality_by_lead[rhy_name] = rhy_q[rhy_i]
             step_ov = max(1, (rx1 - rx0) // 500)
             xs_local = list(range(0, rx1 - rx0, step_ov))
             pts_px = [[int(rx0 + xl), round(float(trace_y[xl]), 1)] for xl in xs_local]
@@ -1520,7 +1563,227 @@ def extract_all_leads_for_layout(
                 "points_px": pts_px,
             })
 
-    return leads_mv, overlay_traces, np.array(all_baselines_y, dtype=int)
+    return leads_mv, overlay_traces, np.array(all_baselines_y, dtype=int), trace_quality_by_lead
+
+
+STANDARD_GAINS_MM_MV = (2.5, 5.0, 10.0, 20.0, 40.0)
+# Lead-quality thresholds, checked against visual review of the bundled examples' trace overlays
+QUALITY_MIN_INK_SUPPORT = 0.70
+QUALITY_MAX_EDGE_HITS = 0.005
+QUALITY_MAX_NEIGHBOR_OVERLAP = 0.10
+QUALITY_MAX_DISPLACED = 0.03
+
+
+def detect_calibration_pulses(
+    ink_map: np.ndarray,
+    px_per_mm_y: float,
+    px_per_mm_x: float,
+    margin_frac: float = 0.2,
+    thr_hi: float = 0.25,
+    thr_lo: float = 0.12,
+) -> List[Dict[str, Any]]:
+    """
+    Finds 1-mV calibration pulses (an upside-down "U": rise from the baseline, flat top, fall back to the
+    baseline) in the left / right margins of the sheet. Works on a dark-ink map (the U-Net signal class does NOT
+    contain calibration pulses). Each reliable vertical stroke is used as an anchor; the flat top line is walked
+    to its end, where the second (possibly faint) edge must cover >= 70 % of the height. Closed boxes (grid
+    squares, UI buttons) are rejected because a pulse is open at the bottom, and text because it is not empty
+    inside. Heights are measured line-centre to line-centre.
+    """
+    H, W = ink_map.shape
+    k3 = np.ones((3, 3), dtype=bool)
+    ink_hi = ndimage.binary_dilation(ink_map > thr_hi, structure=k3)
+    ink_lo = ndimage.binary_dilation(ink_map > thr_lo, structure=k3)
+    h_min, h_max = 4.0 * px_per_mm_y, 24.0 * px_per_mm_y  # 4-24 mm: covers 5 / 10 / 20 mm/mV
+    w_min, w_max = 1.5 * px_per_mm_x, 15.0 * px_per_mm_x
+
+    runs: List[Tuple[int, int, int]] = []
+    for x in range(W):
+        if margin_frac * W <= x < (1.0 - margin_frac) * W:
+            continue
+        col = np.concatenate([[0], ink_hi[:, x].astype(np.int8), [0]])
+        d = np.diff(col)
+        for a, b in zip(np.nonzero(d == 1)[0], np.nonzero(d == -1)[0]):
+            if h_min * 0.8 <= b - a <= h_max * 1.15 + 6:
+                runs.append((x, int(a), int(b - 1)))
+    strokes: List[Dict[str, int]] = []
+    for x, a, b in sorted(runs):
+        for st in strokes:
+            if x - st["x1"] <= 1 and abs(a - st["top"]) <= 2 and abs(b - st["bot"]) <= 2:
+                st["x1"], st["top"], st["bot"] = x, min(st["top"], a), max(st["bot"], b)
+                break
+        else:
+            strokes.append({"x0": x, "x1": x, "top": a, "bot": b})
+
+    found: List[Dict[str, Any]] = []
+    for st in strokes:
+        top, bot = st["top"], st["bot"]
+        xc = 0.5 * (st["x0"] + st["x1"])
+        band = slice(max(0, top - 1), min(H, top + 4))
+        for direction in (1, -1):
+            x = st["x1"] + 1 if direction == 1 else st["x0"] - 1
+            last, gap = None, 0
+            while 0 <= x < W and abs(x - xc) <= w_max + 3:
+                if ink_lo[band, x].any():
+                    last, gap = x, 0
+                else:
+                    gap += 1
+                    if gap > 2:
+                        break
+                x += direction
+            if last is None or abs(last - xc) < w_min:
+                continue
+            ys = slice(top, bot + 1)
+            cover = {cx: float(np.mean(ink_lo[ys, cx])) for cx in range(last - 3 * direction, last + direction, direction) if 0 <= cx < W}
+            if not cover:
+                continue
+            ex = max(cover, key=lambda c: cover[c])
+            if cover[ex] < 0.7:
+                continue
+            xa, xb = (int(st["x1"]) + 1, ex - 2) if direction == 1 else (ex + 2, int(st["x0"]) - 1)
+            if xb < xa:
+                continue
+            thick_cols = [
+                int(np.argmin(ink_hi[top:top + 15, cx])) if not ink_hi[top:top + 15, cx].all() else 15 for cx in range(xa, xb + 1)
+            ]
+            thick = float(np.median(thick_cols)) if thick_cols else 3.0
+            top_cov = float(np.mean(ink_lo[band, xa:xb + 1].any(axis=0)))
+            bot_cov = float(np.mean(ink_lo[max(0, bot - 2):bot + 1, xa:xb + 1].any(axis=0)))
+            iy0, iy1 = top + int(thick) + 1, bot - int(thick) - 1
+            interior = float(np.mean(ink_lo[iy0:iy1, xa:xb + 1])) if iy1 > iy0 else 1.0
+            if top_cov < 0.85 or bot_cov > 0.35 or interior > 0.12:
+                continue
+            h_px = (bot - top + 1) - thick
+            if not (h_min <= h_px <= h_max):
+                continue
+            x_left, x_right = (xc, float(ex)) if direction == 1 else (float(ex), xc)
+            found.append({
+                "x_px": [int(round(x_left)), int(round(x_right))],
+                "top_px": int(top),
+                "bottom_px": int(bot),
+                "height_mm": round(h_px / px_per_mm_y, 2),
+                "width_mm": round((x_right - x_left) / px_per_mm_x, 2),
+            })
+    unique: List[Dict[str, Any]] = []
+    for pl in sorted(found, key=lambda q: (q["x_px"][0], q["top_px"])):
+        if any(abs(pl["x_px"][0] - u["x_px"][0]) <= 4 and abs(pl["top_px"] - u["top_px"]) <= 4 for u in unique):
+            continue
+        unique.append(pl)
+    return unique
+
+
+def summarize_calibration_pulses(pulses: List[Dict[str, Any]], gain_mm_mv: float) -> Dict[str, Any]:
+    """
+    Turns detected pulses into a gain check. Pulses are grouped by height (+/-12 %); the largest group wins and
+    ties go to the TALLER group (a broken stroke can only make a pulse look shorter, never taller).
+    """
+    out: Dict[str, Any] = {"status": "not_found", "count": 0, "entered_gain_mm_mv": gain_mm_mv, "pulses": pulses}
+    if not pulses:
+        return out
+    heights = np.array([pl["height_mm"] for pl in pulses], dtype=np.float64)
+    best_members: List[int] = []
+    for h in sorted(heights, reverse=True):
+        members = [i for i, hh in enumerate(heights) if abs(hh - h) <= 0.12 * h]
+        if len(members) > len(best_members):
+            best_members = members
+    height_mm = float(np.median(heights[best_members]))
+    ratio = height_mm / max(1e-6, gain_mm_mv)
+    out.update({
+        "count": len(pulses),
+        "consistent_count": len(best_members),
+        "height_mm": round(height_mm, 2),
+        "measured_gain_mm_mv": round(height_mm, 2),
+        "gain_ratio": round(ratio, 3),
+        "status": "ok" if 0.85 <= ratio <= 1.18 else "mismatch",
+    })
+    if out["status"] == "mismatch":
+        nearest = min(STANDARD_GAINS_MM_MV, key=lambda g: abs(g - height_mm) / g)
+        if abs(nearest - height_mm) / nearest <= 0.15:
+            out["suggested_gain_mm_mv"] = nearest
+    return out
+
+
+def remove_pulses_from_leads(
+    pulses: List[Dict[str, Any]],
+    overlay_traces: List[Dict[str, Any]],
+    leads_mv: Dict[str, List[float]],
+) -> List[str]:
+    """
+    If a calibration pulse lies inside a traced strip (its bottom on that row's baseline), the 1-mV square would
+    enter the lead signal and could be mistaken for a QRS complex: replace that span by a straight baseline bridge.
+    Returns the names of the leads that were cleaned.
+    """
+    cleaned: List[str] = []
+    for pl in pulses:
+        px0, px1 = pl["x_px"][0] - 3, pl["x_px"][1] + 3
+        h_px = pl["bottom_px"] - pl["top_px"]
+        for tr in overlay_traces:
+            rng = tr.get("x_range_px")
+            if not rng or px1 < rng[0] or px0 > rng[1]:
+                continue
+            if not (pl["top_px"] - 0.2 * h_px <= tr["baseline_y_px"] <= pl["bottom_px"] + 0.3 * h_px):
+                continue
+            names = [tr["lead"]] + ([tr["lead"].lstrip("-")] if str(tr["lead"]).startswith("-") else [])
+            for name in names:
+                sig = leads_mv.get(name)
+                if not sig:
+                    continue
+                n = len(sig)
+                span = max(1.0, float(rng[1] - rng[0]))
+                i0 = int(np.floor(max(0.0, (px0 - rng[0]) / span) * (n - 1)))
+                i1 = int(np.ceil(min(1.0, (px1 - rng[0]) / span) * (n - 1)))
+                if i1 <= i0:
+                    continue
+                left = sig[i0 - 1] if i0 > 0 else (sig[i1 + 1] if i1 + 1 < n else 0.0)
+                right = sig[i1 + 1] if i1 + 1 < n else left
+                for i in range(i0, i1 + 1):
+                    t = (i - i0) / max(1, i1 - i0)
+                    sig[i] = round(float(left * (1 - t) + right * t), 4)
+                if name not in cleaned:
+                    cleaned.append(name)
+    return cleaned
+
+
+def assess_lead_quality(trace_q: Dict[str, float], mv: List[float]) -> Dict[str, Any]:
+    """Per-lead trust score (0-1) + human-readable issues, from tracker diagnostics and the calibrated signal."""
+    issues: List[str] = []
+    score = 1.0
+    sup = trace_q.get("ink_support")
+    edge = trace_q.get("edge_hits")
+    ovl = trace_q.get("neighbor_overlap")
+    arr = np.asarray(mv, dtype=np.float64)
+    p2p = float(np.ptp(arr)) if arr.size else 0.0
+    peak = float(np.max(np.abs(arr))) if arr.size else 0.0
+    disp = trace_q.get("displaced")
+    if disp is not None and disp > QUALITY_MAX_DISPLACED:
+        score -= min(0.6, 0.25 + disp * 3.0)
+        issues.append(f"линия уходит с сигнала на {100 * disp:.0f}% длины (скачок в соседний ряд или по пустой бумаге)")
+    if sup is not None and sup < QUALITY_MIN_INK_SUPPORT:
+        score -= min(0.2, (QUALITY_MIN_INK_SUPPORT - sup) * 0.5)
+        issues.append(f"{100 * (1 - sup):.0f}% линии проходит по бледному/прерывистому сигналу — сверьте с фото")
+    if edge is not None and edge > QUALITY_MAX_EDGE_HITS:
+        score -= min(0.4, edge * 20.0)
+        issues.append("зубцы упираются в границу области поиска — вершины R/S могут быть обрезаны")
+    if ovl is not None and ovl > QUALITY_MAX_NEIGHBOR_OVERLAP:
+        score -= min(0.6, 0.15 + ovl * 2.0)
+        issues.append(f"линия совпадает с соседним отведением на {100 * ovl:.0f}% длины — возможен захват чужих зубцов")
+    if p2p < 0.12:
+        score -= 0.5
+        issues.append("почти плоская линия — отведение могло быть не найдено")
+    if peak > 5.0:
+        score -= 0.3
+        issues.append(f"амплитуда {peak:.1f} мВ > 5 мВ — проверьте калибровку или захват соседнего ряда")
+    score = float(np.clip(score, 0.0, 1.0))
+    return {
+        "score": round(score, 2),
+        "level": "ok" if score >= 0.75 else ("warn" if score >= 0.5 else "bad"),
+        "issues": issues,
+        "ink_support": round(sup, 3) if sup is not None else None,
+        "edge_hits": round(edge, 4) if edge is not None else None,
+        "neighbor_overlap": round(ovl, 3) if ovl is not None else None,
+        "displaced": round(disp, 3) if disp is not None else None,
+        "p2p_mv": round(p2p, 3),
+    }
 
 
 def render_diagnostic_visualizations(
@@ -1743,7 +2006,7 @@ def digitize_ecg_image(
     layout_info = LAYOUT_DEFINITIONS[chosen_layout]
 
     # Stage 5: Waveform Extraction for all leads in layout
-    leads_mv, overlay_traces, final_baselines = extract_all_leads_for_layout(
+    leads_mv, overlay_traces, final_baselines, trace_quality = extract_all_leads_for_layout(
         aligned_sig,
         layout_key=chosen_layout,
         px_per_mm_x=spacing["px_per_mm_x"],
@@ -1754,6 +2017,31 @@ def digitize_ecg_image(
         text_map=aligned_text,
         detected_labels=detected_labels,
     )
+
+    # Stage 5b: 1-mV calibration pulse check (dark-ink map: the U-Net signal class does not contain pulses)
+    try:
+        ink_map = aligned_sig if method == "krones_hough_cv" else classical_grid_and_signal_maps(aligned_rgb)[0]
+        pulses = detect_calibration_pulses(ink_map, float(spacing["px_per_mm_y"]), float(spacing["px_per_mm_x"]))
+    except Exception:
+        pulses = []
+    calibration_pulse = summarize_calibration_pulses(pulses, gain_mm_mv)
+    calibration_pulse["removed_from_leads"] = remove_pulses_from_leads(pulses, overlay_traces, leads_mv)
+    if calibration_pulse["status"] == "mismatch":
+        hint = (
+            f" — вероятно, запись сделана с усилением {calibration_pulse['suggested_gain_mm_mv']:g} мм/мВ"
+            if "suggested_gain_mm_mv" in calibration_pulse
+            else ""
+        )
+        warnings.append(
+            f"Калибровочный импульс 1 мВ имеет высоту {calibration_pulse['height_mm']:.1f} мм, а задано усиление "
+            f"{gain_mm_mv:g} мм/мВ{hint}; все амплитуды, ST и индексы ГЛЖ пересчитайте с верным усилением"
+        )
+
+    # Stage 5c: per-lead trace quality (tracker diagnostics + signal plausibility)
+    lead_quality = {ln: assess_lead_quality(trace_quality.get(ln, {}), sig) for ln, sig in leads_mv.items()}
+    poor = [ln for ln, q in lead_quality.items() if q["level"] == "bad"]
+    if poor:
+        warnings.append(f"Низкое качество трассировки: {', '.join(poor)} — проверьте эти линии во вкладке «Контур»")
 
     # Stage 6: Render Diagnostic Overlays
     visuals = render_diagnostic_visualizations(
@@ -1785,6 +2073,8 @@ def digitize_ecg_image(
             "row_count_scores": {str(k): v for k, v in row_count_scores.items()},
         },
         "leads_mv": leads_mv,
+        "lead_quality": lead_quality,
+        "calibration_pulse": calibration_pulse,
         "overlay_traces": overlay_traces,
         "visualizations": visuals,
         "elapsed_sec": elapsed_s,
