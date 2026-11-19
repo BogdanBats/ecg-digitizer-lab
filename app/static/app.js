@@ -10,6 +10,9 @@
   const state = {
     config: null,
     uploadedFile: null,
+    uploadedPdfDoc: null,
+    uploadedPdfRawFile: null,
+    uploadedPdfPage: 1,
     currentSource: null,
     digitization: null,
     analysis: null,
@@ -99,6 +102,7 @@
   // DOM Elements
   const el = {
     selectExample: document.getElementById("selectExample"),
+    selectPdfPage: document.getElementById("selectPdfPage"),
     fileUploadInput: document.getElementById("fileUploadInput"),
     exampleDescription: document.getElementById("exampleDescription"),
     selectMethod: document.getElementById("selectMethod"),
@@ -698,6 +702,9 @@
         const formData = new FormData();
         if (state.uploadedFile) {
           formData.append("file", state.uploadedFile);
+          if (state.uploadedPdfPage) {
+            formData.append("pdf_page", String(state.uploadedPdfPage));
+          }
         } else {
           formData.append("example_name", el.selectExample.value);
         }
@@ -4556,37 +4563,135 @@
     });
   }
 
+  async function renderUploadedPdfPage(pageNum = 1) {
+    if (!state.uploadedPdfDoc || !state.uploadedPdfRawFile) return;
+    try {
+      const pdfDoc = state.uploadedPdfDoc;
+      const cleanPage = Math.max(1, Math.min(pdfDoc.numPages, parseInt(pageNum, 10) || 1));
+      state.uploadedPdfPage = cleanPage;
+      setStatus(`Рендеринг страницы ${cleanPage}/${pdfDoc.numPages} PDF ЭКГ...`, "busy");
+
+      const page = await pdfDoc.getPage(cleanPage);
+      const baseVp = page.getViewport({ scale: 1.0 });
+      const targetScale = Math.max(2.0, Math.min(3.5, 1800 / Math.max(400, Math.max(baseVp.width, baseVp.height))));
+      const viewport = page.getViewport({ scale: targetScale });
+
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(viewport.width);
+      canvas.height = Math.round(viewport.height);
+      const ctx = canvas.getContext("2d");
+      // Fill solid white background so transparent PDFs never render with dark/black background
+      ctx.fillStyle = "#FFFFFF";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      await page.render({ canvasContext: ctx, viewport }).promise;
+
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+      const baseName = state.uploadedPdfRawFile.name.replace(/\.pdf$/i, "");
+      const pageFileName = `${baseName}_page_${cleanPage}.png`;
+      state.uploadedFile = new File([blob], pageFileName, { type: "image/png" });
+      el.exampleDescription.textContent =
+        `PDF: ${state.uploadedPdfRawFile.name} (стр. ${cleanPage}/${pdfDoc.numPages}, ${canvas.width}×${canvas.height} пикс)`;
+      el.selectLayout.value = "auto";
+      await runDigitization();
+    } catch (err) {
+      console.error("PDF page render error:", err);
+      // Fallback: pass raw PDF file to backend PyMuPDF if available
+      state.uploadedFile = state.uploadedPdfRawFile;
+      await runDigitization();
+    }
+  }
+
+  async function handleUploadedImageOrPdf(file) {
+    if (!file) return;
+    const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+    if (!isPdf) {
+      state.uploadedPdfDoc = null;
+      state.uploadedPdfRawFile = null;
+      state.uploadedPdfPage = 1;
+      if (el.selectPdfPage) el.selectPdfPage.hidden = true;
+      state.uploadedFile = file;
+      el.exampleDescription.textContent = `Загружен файл: ${file.name} (${(file.size / 1024).toFixed(1)} КБ)`;
+      el.selectLayout.value = "auto";
+      await runDigitization();
+      return;
+    }
+
+    state.uploadedPdfRawFile = file;
+    state.uploadedPdfPage = 1;
+    setStatus(`Чтение PDF файла ${file.name}...`, "busy");
+
+    if (window.pdfjsLib) {
+      try {
+        if (!window.pdfjsLib.GlobalWorkerOptions.workerSrc) {
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+            "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+        }
+        const ab = await file.arrayBuffer();
+        const pdfDoc = await window.pdfjsLib.getDocument({ data: new Uint8Array(ab) }).promise;
+        state.uploadedPdfDoc = pdfDoc;
+
+        if (el.selectPdfPage) {
+          el.selectPdfPage.innerHTML = "";
+          for (let p = 1; p <= pdfDoc.numPages; p++) {
+            const opt = document.createElement("option");
+            opt.value = String(p);
+            opt.textContent = `Стр. ${p}/${pdfDoc.numPages}`;
+            el.selectPdfPage.appendChild(opt);
+          }
+          el.selectPdfPage.value = "1";
+          el.selectPdfPage.hidden = false;
+        }
+        await renderUploadedPdfPage(1);
+        return;
+      } catch (pdfErr) {
+        console.warn("PDF.js fallback to server-side PyMuPDF:", pdfErr);
+      }
+    }
+
+    // Fallback to direct backend PyMuPDF PDF decoding
+    if (el.selectPdfPage) el.selectPdfPage.hidden = true;
+    state.uploadedFile = file;
+    el.exampleDescription.textContent = `Загружен PDF: ${file.name} (${(file.size / 1024).toFixed(1)} КБ)`;
+    el.selectLayout.value = "auto";
+    await runDigitization();
+  }
+
   function bindUIEvents() {
     // Example selection
     el.selectExample.addEventListener("change", () => {
       state.uploadedFile = null;
+      state.uploadedPdfDoc = null;
+      state.uploadedPdfRawFile = null;
+      if (el.selectPdfPage) el.selectPdfPage.hidden = true;
       const fname = el.selectExample.value;
       const ex = (state.config && state.config.examples || []).find((e) => e.filename === fname);
       if (ex) applyExamplePreset(ex);
       runDigitization();
     });
 
-    // Custom file upload
+    if (el.selectPdfPage) {
+      el.selectPdfPage.addEventListener("change", () => {
+        const p = parseInt(el.selectPdfPage.value, 10) || 1;
+        renderUploadedPdfPage(p);
+      });
+    }
+
+    // Custom file upload (image or PDF)
     el.fileUploadInput.addEventListener("change", (evt) => {
       const f = evt.target.files && evt.target.files[0];
       if (f) {
-        state.uploadedFile = f;
-        el.exampleDescription.textContent = `Загружен файл: ${f.name} (${(f.size / 1024).toFixed(1)} КБ)`;
-        el.selectLayout.value = "auto";
-        runDigitization();
+        handleUploadedImageOrPdf(f);
       }
     });
 
-    // Drag and drop image onto page
+    // Drag and drop image or PDF onto page
     window.addEventListener("dragover", (evt) => evt.preventDefault());
     window.addEventListener("drop", (evt) => {
       evt.preventDefault();
       const f = evt.dataTransfer && evt.dataTransfer.files && evt.dataTransfer.files[0];
-      if (f && f.type.startsWith("image/")) {
-        state.uploadedFile = f;
-        el.exampleDescription.textContent = `Загружен файл: ${f.name}`;
-        el.selectLayout.value = "auto";
-        runDigitization();
+      if (f && (f.type.startsWith("image/") || f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf"))) {
+        handleUploadedImageOrPdf(f);
       }
     });
 

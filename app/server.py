@@ -192,15 +192,36 @@ async def api_digitize_ecg(
     rotate_deg: int = Form(default=0),
     custom_px_per_mm: Optional[float] = Form(default=None),
     custom_roi_json: Optional[str] = Form(default=None),
+    pdf_page: int = Form(default=1),
 ) -> JSONResponse:
     img_bgr: Optional[np.ndarray] = None
     source_name = "uploaded_ecg.jpg"
 
     if file is not None and file.filename:
         raw_bytes = await file.read()
-        arr = np.frombuffer(raw_bytes, dtype=np.uint8)
-        img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        source_name = file.filename
+        is_pdf = file.filename.lower().endswith(".pdf") or raw_bytes[:4] == b"%PDF"
+        if is_pdf:
+            try:
+                import fitz  # PyMuPDF
+
+                doc = fitz.open(stream=raw_bytes, filetype="pdf")
+                if len(doc) == 0:
+                    raise ValueError("PDF не содержит страниц")
+                p_idx = max(0, min(len(doc) - 1, int(pdf_page) - 1))
+                page = doc[p_idx]
+                pix = page.get_pixmap(dpi=250, alpha=False)
+                if pix.n != 3:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                rgb_arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3).copy()
+                img_bgr = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
+                source_name = f"{file.filename} (стр. {p_idx + 1}/{len(doc)})"
+                doc.close()
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Ошибка чтения PDF ЭКГ: {exc}") from exc
+        else:
+            arr = np.frombuffer(raw_bytes, dtype=np.uint8)
+            img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            source_name = file.filename
     elif example_name:
         safe_name = os.path.basename(example_name)
         fpath = os.path.join(EXAMPLES_DIR, safe_name)
