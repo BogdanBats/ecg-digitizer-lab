@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ECG Digitizer &amp; Caliper Workstation — Оцифровка фото ЭКГ и кардиологические калиперы</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <!-- Top Clinical Instrument Header -->
+  <header class="workstation-header">
+    <div class="brand-block">
+      <div class="brand-pulse-icon" aria-hidden="true">
+        <svg viewBox="0 0 36 24" width="32" height="22">
+          <path d="M1 13 H8 L11 9 L14 14 L16 20 L19 3 L22 21 L25 13 L29 8 L32 13 H35" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div>
+        <h1 class="brand-title">ECG Photo Digitizer &amp; Caliper Lab</h1>
+        <p class="brand-subtitle">Конвертация бумажных ЭКГ в цифровой сигнал • Интерактивные калиперы P–QRS–T • Расчёт интервалов и сегментов</p>
+      </div>
+    </div>
+
+    <div class="header-actions">
+      <button type="button" id="btnExportCsv" class="btn btn-outline" disabled title="Скачать оцифрованные сигналы всех отведений в формате CSV (мВ и мкВ)">
+        Экспорт CSV (мВ / мкВ)
+      </button>
+      <button type="button" id="btnExportJson" class="btn btn-outline" disabled title="Скачать полный JSON-отчёт с сигналами, метками калиперов и расчётами">
+        Экспорт JSON
+      </button>
+      <button type="button" id="btnPrintReport" class="btn btn-outline" disabled title="Распечатать или сохранить клинический протокол ЭКГ в PDF">
+        Протокол / Печать
+      </button>
+    </div>
+  </header>
+
+  <!-- Control & Acquisition Bar -->
+  <section class="acquisition-bar" aria-label="Параметры оцифровки ЭКГ">
+    <div class="acq-group acq-source">
+      <label class="field-label" for="selectExample">Пример из папки <code>example/</code> или своё фото</label>
+      <div class="source-row">
+        <select id="selectExample" class="select-input">
+          <option value="">Загрузка списка примеров...</option>
+        </select>
+        <label class="btn btn-upload" for="fileUploadInput">
+          <span>Загрузить фото...</span>
+          <input type="file" id="fileUploadInput" accept="image/*" hidden />
+        </label>
+      </div>
+      <div id="exampleDescription" class="field-hint">Выберите пример из списка или перетащите фото ЭКГ на страницу</div>
+    </div>
+
+    <div class="acq-group">
+      <label class="field-label" for="selectMethod">Алгоритм оцифровки</label>
+      <select id="selectMethod" class="select-input"></select>
+      <div id="methodDescription" class="field-hint">Ансамбль U-Net + Hough + Viterbi DP</div>
+    </div>
+
+    <div class="acq-group">
+      <label class="field-label" for="selectLayout">Раскладка отведений</label>
+      <select id="selectLayout" class="select-input"></select>
+      <div class="field-hint">Автоопределение или ручной выбор схемы</div>
+    </div>
+
+    <div class="acq-group acq-params">
+      <div class="param-mini">
+        <label class="field-label" for="selectSpeed">Скорость</label>
+        <select id="selectSpeed" class="select-input">
+          <option value="25">25 мм/с</option>
+          <option value="50">50 мм/с</option>
+        </select>
+      </div>
+      <div class="param-mini">
+        <label class="field-label" for="selectGain">Усиление</label>
+        <select id="selectGain" class="select-input">
+          <option value="10">10 мм/мВ</option>
+          <option value="5">5 мм/мВ</option>
+          <option value="20">20 мм/мВ</option>
+        </select>
+      </div>
+      <div class="param-mini">
+        <label class="field-label" for="selectRotate">Поворот</label>
+        <select id="selectRotate" class="select-input">
+          <option value="0">0° (Авто)</option>
+          <option value="90">90°</option>
+          <option value="180">180°</option>
+          <option value="270">270°</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="acq-group acq-cta">
+      <button type="button" id="btnDigitize" class="btn btn-primary">
+        <span id="btnDigitizeText">Оцифровать ЭКГ</span>
+      </button>
+      <div id="statusBadge" class="status-badge">Готов к работе</div>
+    </div>
+  </section>
+
+  <!-- Main Workspace Grid -->
+  <main class="workspace-grid">
+    <!-- Left Column: Visual Verification & Multi-Lead Overview -->
+    <section class="panel panel-visuals" aria-label="Верификация оцифровки и мульти-канальный обзор">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">1. Верификация оцифровки фото и обзор всех отведений</h2>
+          <p class="panel-meta" id="digitizationMetaLine">Шаг сетки: — пикс/мм • Раскладка: — • Время обработки: —</p>
+        </div>
+        <div class="tab-strip" role="tablist">
+          <button type="button" class="tab-btn active" data-tab="multilead" role="tab">Все отведения (Цифровой сигнал)</button>
+          <button type="button" class="tab-btn" data-tab="overlay" role="tab">Наложение контура на фото</button>
+          <button type="button" class="tab-btn" data-tab="aligned" role="tab">Фото &amp; Калибровка сетки</button>
+          <button type="button" class="tab-btn" data-tab="heatmap" role="tab">Карта сегментации U-Net</button>
+        </div>
+      </div>
+
+      <div class="visual-stage">
+        <!-- Tab 1: Multi-lead interactive digital canvas -->
+        <div class="tab-pane active" id="tab-multilead">
+          <div class="multilead-toolbar">
+            <div class="w1-tool-group" role="group" aria-label="Режим взаимодействия в окне 1">
+              <span class="toolbar-label">Окно 1:</span>
+              <button type="button" class="w1-tool-btn active" data-w1-tool="select_move" title="Клик по каналу выбирает его; перетаскивание красной метки R двигает её">
+                Выбор / Двигать R
+              </button>
+              <button type="button" class="w1-tool-btn" data-w1-tool="r_add_del" title="Клик по сигналу добавляет метку R; клик (или ПКМ) по существующей метке R удаляет её">
+                + Добавить / ✕ Удалить R
+              </button>
+              <button type="button" class="w1-tool-btn w1-tool-artifact" data-w1-tool="artifact" title="Клик между R–R или после R до конца сигнала ставит жирную синюю линию артефакта">
+                ▬▬ Артефакт (Синяя линия)
+              </button>
+            </div>
+            <div class="multilead-controls">
+              <label class="checkbox-label" title="Синхронизировать добавление/коррекцию R и артефактов по всем синхронным каналам">
+                <input type="checkbox" id="chkSyncChannels" />
+                <span>Синхр. все каналы</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="chkShowFiducialsMulti" checked />
+                <span>Метки R и артефакты</span>
+              </label>
+            </div>
+          </div>
+          <div class="multilead-canvas-wrap" id="multileadContainer">
+            <canvas id="multileadCanvas"></canvas>
+          </div>
+        </div>
+
+        <!-- Tab 2: Digital trace overlaid on original aligned image -->
+        <div class="tab-pane" id="tab-overlay">
+          <div class="img-viewer-toolbar">
+            <span>Зелёные/голубые линии — извлечённый цифровой сигнал; оранжевая сетка в углу — проверочные квадраты 5×5 мм.</span>
+          </div>
+          <div class="img-scroll-box">
+            <img id="imgTraceOverlay" alt="Наложение цифрового сигнала на фото ЭКГ" />
+          </div>
+        </div>
+
+        <!-- Tab 3: Aligned image + interactive 2-point grid calibration & live grid overlay -->
+        <div class="tab-pane" id="tab-aligned">
+          <div class="img-viewer-toolbar cal-toolbar">
+            <div class="manual-cal-controls">
+              <label for="selectCalRefMm" class="toolbar-label">Отрезок (2 клика на фото):</label>
+              <select id="selectCalRefMm" class="select-input-sm" title="Эталонное расстояние между точками A и B при клике на фото">
+                <option value="5">1 клетка (5 мм)</option>
+                <option value="10">2 клетки (10 мм)</option>
+                <option value="25" selected>5 клеток (25 мм)</option>
+                <option value="50">10 клеток (50 мм)</option>
+              </select>
+
+              <label for="inputPxPerMm" class="toolbar-label">Пикс/мм:</label>
+              <button type="button" id="btnCalMinus" class="btn btn-xs btn-ghost" title="Уменьшить шаг сетки (-0.05 пикс/мм)">−</button>
+              <input type="number" id="inputPxPerMm" step="0.05" min="1" max="100" placeholder="Авто" class="num-input-sm" />
+              <button type="button" id="btnCalPlus" class="btn btn-xs btn-ghost" title="Увеличить шаг сетки (+0.05 пикс/мм)">+</button>
+
+              <button type="button" id="btnApplyManualCal" class="btn btn-sm btn-primary-sm">Применить масштаб</button>
+              <button type="button" id="btnResetManualCal" class="btn btn-sm btn-ghost">Сбросить (Авто)</button>
+            </div>
+            <div class="cal-overlay-toggles">
+              <label class="checkbox-label" title="Показать калибровочную сетку крупных клеток 5×5 мм поверх фото">
+                <input type="checkbox" id="chkShowCalGrid" checked />
+                <span>Сетка 5×5 мм</span>
+              </label>
+              <label class="checkbox-label" title="Показать мелкую миллиметровую сетку 1×1 мм поверх фото">
+                <input type="checkbox" id="chkShowCalMinorGrid" checked />
+                <span>1×1 мм</span>
+              </label>
+              <span id="calRulerStatus" class="cal-ruler-status">Кликните точки A и B на фото вдоль клеток сетки (ПКМ — сдвинуть фазу сетки)</span>
+            </div>
+          </div>
+          <div class="img-scroll-box" id="calScrollBox">
+            <div class="cal-stage-wrap" id="calStageWrap">
+              <img id="imgAligned" alt="Выровненное фото ЭКГ" />
+              <canvas id="calGridCanvas"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 4: U-Net Segmentation Probability Heatmap -->
+        <div class="tab-pane" id="tab-heatmap">
+          <div class="img-viewer-toolbar">
+            <span>Сегментация U-Net (Open-ECG-Digitizer): бирюзовый/зелёный — вероятностная карта сигнала ЭКГ, красный — миллиметровая сетка.</span>
+          </div>
+          <div class="img-scroll-box">
+            <img id="imgHeatmap" alt="Вероятностная карта сегментации U-Net" />
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Right/Center Column: Precision Interactive Caliper Workbench -->
+    <section class="panel panel-calipers" aria-label="Интерактивный стенд калиперов и расчётов">
+      <div class="panel-header caliper-header">
+        <div>
+          <h2 class="panel-title">2. Стенд интерактивных калиперов, коррекции R и разметки артефактов (весь сигнал канала)</h2>
+          <p class="panel-meta">Двигайте метки R и калиперы P–QRS–T мышью • Помечайте артефакты (R–R или R–конец) жирной синей линией</p>
+        </div>
+
+        <!-- Caliper Mode Switcher -->
+        <div class="caliper-mode-group" role="group" aria-label="Режим работы калиперов">
+          <button type="button" class="mode-btn active" data-mode="fiducial">Калиперы P–QRS–T и R</button>
+          <button type="button" class="mode-btn" data-mode="r_edit">Коррекция R (+ / − / двигать)</button>
+          <button type="button" class="mode-btn mode-btn-artifact" data-mode="artifact">▬▬ Метка артефакта (Синяя линия)</button>
+          <button type="button" class="mode-btn" data-mode="free">Циркуль (Δt / ΔV)</button>
+          <button type="button" class="mode-btn" data-mode="marching">Шагающий циркуль</button>
+        </div>
+      </div>
+
+      <!-- Lead Selector Pills & Beat / Zoom Controls -->
+      <div class="workbench-controls">
+        <div class="lead-pills" id="leadPillsContainer" role="tablist" aria-label="Выбор отведения"></div>
+
+        <div class="beat-zoom-controls">
+          <div class="control-inline">
+            <label for="selectBeat">Активный R:</label>
+            <select id="selectBeat" class="select-input-sm"></select>
+          </div>
+          <div class="control-inline">
+            <label for="selectZoomX">Развёртка X:</label>
+            <select id="selectZoomX" class="select-input-sm">
+              <option value="1" selected>1.0× (Весь сигнал канала)</option>
+              <option value="1.8">1.8× (Увеличение области)</option>
+              <option value="2.8">2.8× (Крупно P-QRS-T)</option>
+              <option value="4.0">4.0× (Микро-калипер)</option>
+            </select>
+          </div>
+          <div class="control-inline">
+            <label for="selectZoomY">Масштаб Y:</label>
+            <select id="selectZoomY" class="select-input-sm">
+              <option value="1" selected>1.0× (10 мм/мВ)</option>
+              <option value="1.5">1.5× (15 мм/мВ)</option>
+              <option value="2.0">2.0× (20 мм/мВ)</option>
+            </select>
+          </div>
+          <button type="button" id="btnAutoResetCalipers" class="btn btn-sm btn-ghost" title="Вернуть автоматическую расстановку меток R и калиперов">
+            Сброс авто-меток
+          </button>
+        </div>
+      </div>
+
+      <!-- Quick R-Peak & Artifact Exclusion Action Bar -->
+      <div class="r-artifact-bar" aria-label="Управление метками R и зонами артефактов">
+        <div class="r-artifact-actions">
+          <button type="button" id="btnQuickAddR" class="btn btn-xs btn-r-action" title="Перейти в режим добавления метки R кликом по сигналу (или Shift+клик в любом режиме)">
+            + Добавить R (Shift+Клик)
+          </button>
+          <button type="button" id="btnDeleteActiveR" class="btn btn-xs btn-r-del" title="Удалить текущий выбранный пик R (или ПКМ / Alt+Клик по любой метке R)">
+            ✕ Удалить тек. R
+          </button>
+          <span class="bar-sep">|</span>
+          <button type="button" id="btnArtifactRR" class="btn btn-xs btn-artifact-action" title="Не анализировать сигнал между текущим R и следующим R+1 (обозначить жирной синей горизонтальной линией)">
+            ▬▬ Артефакт: между R и R+1
+          </button>
+          <button type="button" id="btnArtifactRToEnd" class="btn btn-xs btn-artifact-action" title="Не анализировать сигнал от выбранного (или последнего) R и до конца сигнала (жирная синяя линия)">
+            ▬▬ Артефакт: от R до конца сигнала
+          </button>
+          <button type="button" id="btnArtifactStartToR" class="btn btn-xs btn-artifact-action" title="Не анализировать сигнал от начала записи до первого R1 (жирная синяя линия)">
+            ▬▬ Артефакт: от начала до R1
+          </button>
+          <button type="button" id="btnClearArtifacts" class="btn btn-xs btn-ghost" title="Удалить все синие линии артефактов на текущем канале">
+            Очистить артефакты
+          </button>
+        </div>
+        <div class="r-artifact-status" id="lblRAndArtifactStatus">
+          Метки R: — • Артефакты: нет
+        </div>
+      </div>
+
+      <!-- High-Precision Interactive Millimeter ECG Caliper Canvas -->
+      <div class="caliper-canvas-container" id="caliperCanvasContainer">
+        <canvas id="caliperCanvas"></canvas>
+      </div>
+
+      <!-- Fine Nudge & Direct Coordinate Bar for Active Calipers -->
+      <div class="caliper-readout-strip" id="caliperReadoutStrip">
+        <div class="caliper-tag tag-p">
+          <span class="tag-dot"></span>
+          <strong>P<sub>on</sub>:</strong> <input type="number" step="2" id="num_p_onset" class="cal-num" /> мс
+          <strong>P<sub>peak</sub>:</strong> <input type="number" step="2" id="num_p_peak" class="cal-num" /> мс
+          <strong>P<sub>off</sub>:</strong> <input type="number" step="2" id="num_p_offset" class="cal-num" /> мс
+        </div>
+        <div class="caliper-tag tag-qrs">
+          <span class="tag-dot"></span>
+          <strong>QRS<sub>on</sub>:</strong> <input type="number" step="2" id="num_qrs_onset" class="cal-num" /> мс
+          <strong>R<sub>peak</sub>:</strong> <input type="number" step="2" id="num_r_peak" class="cal-num" /> мс
+          <strong>J (QRS<sub>off</sub>):</strong> <input type="number" step="2" id="num_qrs_offset" class="cal-num" /> мс
+        </div>
+        <div class="caliper-tag tag-t">
+          <span class="tag-dot"></span>
+          <strong>T<sub>on</sub>:</strong> <input type="number" step="2" id="num_t_onset" class="cal-num" /> мс
+          <strong>T<sub>peak</sub>:</strong> <input type="number" step="2" id="num_t_peak" class="cal-num" /> мс
+          <strong>T<sub>off</sub>:</strong> <input type="number" step="2" id="num_t_offset" class="cal-num" /> мс
+        </div>
+        <div class="caliper-tag tag-rr">
+          <span class="tag-dot"></span>
+          <strong>R<sub>+1</sub> (RR):</strong> <input type="number" step="2" id="num_next_r_peak" class="cal-num" /> мс
+        </div>
+      </div>
+
+      <!-- Free Caliper Readout Banner (shown when free or marching caliper is active) -->
+      <div class="free-caliper-banner" id="freeCaliperBanner" hidden>
+        <div class="free-metric">
+          <span>Калипер 1 → 2 (Δt):</span>
+          <strong id="freeDeltaT">200.0 мс (5.0 мм)</strong>
+        </div>
+        <div class="free-metric">
+          <span>Эквивалентная частота:</span>
+          <strong id="freeEqBpm">300.0 уд/мин</strong>
+        </div>
+        <div class="free-metric">
+          <span>Разность потенциалов (ΔV):</span>
+          <strong id="freeDeltaV">+0.50 мВ (5.0 мм / 500 мкВ)</strong>
+        </div>
+        <div class="free-metric">
+          <span>Наклон (ΔV/Δt):</span>
+          <strong id="freeSlope">2.50 мВ/с</strong>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Bottom Clinical Telemetry & Measurements Dashboard -->
+  <section class="telemetry-dashboard" aria-label="Результаты расчётов интервалов, сегментов, амплитуд и ЭОС">
+    <!-- Card 1: Key Clinical Intervals & Segments Table -->
+    <div class="telemetry-card card-intervals">
+      <div class="card-header">
+        <h3>3. Длительности зубцов, интервалов и сегментов (активное отведение: <span id="lblActiveLead">—</span>)</h3>
+        <span class="unit-pill">Единицы: мс • мм • мВ</span>
+      </div>
+      <div class="table-wrap">
+        <table class="clinical-table" id="tableIntervals">
+          <thead>
+            <tr>
+              <th>Параметр ЭКГ</th>
+              <th>Обозначение / Границы</th>
+              <th>Значение (мс)</th>
+              <th>На бумаге (мм)</th>
+              <th>Референс (Норма)</th>
+              <th>Оценка</th>
+            </tr>
+          </thead>
+          <tbody id="tbodyIntervals">
+            <tr><td colspan="6" class="empty-cell">Выполните оцифровку для расчёта параметров</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Card 2: Amplitudes, ST-Segment Analysis & QTc Formulas -->
+    <div class="telemetry-card card-st-qtc">
+      <div class="card-header">
+        <h3>4. Сегмент ST, амплитуды зубцов и формулы QTc</h3>
+      </div>
+      <div class="qtc-grid" id="qtcFormulaGrid"></div>
+
+      <div class="st-amplitudes-box">
+        <h4>Амплитуды зубцов и смещение сегмента ST относительно изолинии PR</h4>
+        <div class="amp-badges-grid" id="ampBadgesGrid"></div>
+      </div>
+
+      <div class="clinical-flags-box" id="clinicalFlagsBox"></div>
+    </div>
+  </section>
+
+  <!-- Section 5 (Moved Below): Electrical Axis of the Heart (ЭОС) + Side-by-Side Vectorcardiogram (ВКГ / VCG) -->
+  <section class="axis-vcg-section" aria-label="Электрическая ось сердца (ЭОС) и Векторкардиограмма (ВКГ)">
+    <!-- Left Card: Hexaxial Vector Dial (Einthoven / Bailey Axis) & Hypertrophy Indices -->
+    <div class="telemetry-card card-axis">
+      <div class="card-header">
+        <h3>5. Электрическая ось сердца (ЭОС) и вольтажные индексы</h3>
+        <span class="unit-pill">Система Бейли (6 осей)</span>
+      </div>
+      <div class="axis-layout">
+        <div class="hexaxial-canvas-wrap">
+          <canvas id="hexaxialCanvas" width="240" height="240"></canvas>
+        </div>
+        <div class="axis-details" id="axisDetailsBox">
+          <div class="axis-stat">
+            <span>Угол α QRS (ЭОС):</span>
+            <strong id="valQrsAxis">—</strong>
+          </div>
+          <div class="axis-stat">
+            <span>Ось зубца P:</span>
+            <strong id="valPAxis">—</strong>
+          </div>
+          <div class="axis-stat">
+            <span>Ось зубца T:</span>
+            <strong id="valTAxis">—</strong>
+          </div>
+          <div class="axis-stat">
+            <span>Фронтальный угол QRS–T:</span>
+            <strong id="valQrsTAngle">—</strong>
+          </div>
+          <div class="axis-conclusion" id="valAxisClass">—</div>
+          <hr class="divider-line" />
+          <div class="axis-stat">
+            <span>Индекс Соколова–Лайона (S<sub>V1</sub>+R<sub>V5/V6</sub>):</span>
+            <strong id="valSokolow">—</strong>
+          </div>
+          <div class="axis-stat">
+            <span>Корнельский индекс (R<sub>aVL</sub>+S<sub>V3</sub>):</span>
+            <strong id="valCornell">—</strong>
+          </div>
+          <div class="axis-stat">
+            <span>Индекс Макруза (P / PQ<sub>сегм</sub>):</span>
+            <strong id="valMacruz">—</strong>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right Card (Side-by-Side with ЭОС): Vectorcardiogram (ВКГ / VCG Loops P, QRS, T) -->
+    <div class="telemetry-card card-vcg">
+      <div class="card-header vcg-card-header">
+        <div>
+          <h3>Векторкардиограмма (ВКГ / VCG) — Петли P, QRS и T (Ортогональная система Франка–Корса X, Y, Z)</h3>
+        </div>
+        <div class="vcg-plane-group" role="group" aria-label="Плоскость проекции ВКГ">
+          <button type="button" class="vcg-plane-btn active" data-vcg-plane="all3">Все 3 плоскости (XY + XZ + YZ)</button>
+          <button type="button" class="vcg-plane-btn" data-vcg-plane="frontal">Фронтальная (XY)</button>
+          <button type="button" class="vcg-plane-btn" data-vcg-plane="horizontal">Горизонтальная (XZ)</button>
+          <button type="button" class="vcg-plane-btn" data-vcg-plane="sagittal">Сагиттальная (YZ)</button>
+          <button type="button" class="vcg-plane-btn" data-vcg-plane="3d">3D Изометрия (XYZ)</button>
+        </div>
+      </div>
+
+      <div class="vcg-toolbar">
+        <div class="vcg-legend">
+          <span class="vcg-leg-item"><i class="leg-dot dot-p"></i> Петля P (предсердия)</span>
+          <span class="vcg-leg-item"><i class="leg-dot dot-qrs"></i> Петля QRS (желудочки, засечки 10 мс)</span>
+          <span class="vcg-leg-item"><i class="leg-dot dot-t"></i> Петля T (реполяризация)</span>
+          <span class="vcg-leg-item"><i class="leg-dot dot-j"></i> Точка J</span>
+        </div>
+        <div class="vcg-options">
+          <label class="checkbox-label">
+            <input type="checkbox" id="chkVcgVectors" checked />
+            <span>Векторы V<sub>max</sub> (QRS, T)</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" id="chkVcgArrows" checked />
+            <span>Стрелки направления (10 мс)</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="vcg-canvas-wrap" id="vcgCanvasContainer">
+        <canvas id="vcgCanvas"></canvas>
+      </div>
+
+      <div class="vcg-metrics-strip" id="vcgMetricsStrip">
+        <div class="vcg-metric-item">
+          <span>Синтез осей X,Y,Z:</span>
+          <strong id="vcgMethodLbl">Матрица Корса</strong>
+        </div>
+        <div class="vcg-metric-item">
+          <span>|V<sub>max</sub> QRS| (3D):</span>
+          <strong id="vcgMaxQrs">—</strong>
+        </div>
+        <div class="vcg-metric-item">
+          <span>|V<sub>max</sub> T| (3D):</span>
+          <strong id="vcgMaxT">—</strong>
+        </div>
+        <div class="vcg-metric-item">
+          <span>3D-угол QRS–T:</span>
+          <strong id="vcgSpatialAngle">—</strong>
+        </div>
+        <div class="vcg-metric-item">
+          <span>Градиент Вильсона (SVG):</span>
+          <strong id="vcgSvgVal">—</strong>
+        </div>
+        <div class="vcg-metric-item">
+          <span>Вращение петли QRS:</span>
+          <strong id="vcgRotationLbl">—</strong>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Summary Matrix across All Digitized Leads -->
+  <section class="all-leads-section" aria-label="Сводная таблица по всем оцифрованным отведениям">
+    <div class="telemetry-card">
+      <div class="card-header">
+        <h3>6. Сводная матрица измерений по всем оцифрованным отведениям</h3>
+        <span class="unit-pill">Нажмите на строку отведения для перехода к его калиперам</span>
+      </div>
+      <div class="table-wrap">
+        <table class="clinical-table" id="tableAllLeads">
+          <thead>
+            <tr>
+              <th>Отведение</th>
+              <th>ЧСС (уд/мин)</th>
+              <th>RR (мс)</th>
+              <th>P (мс)</th>
+              <th>PQ (мс)</th>
+              <th>QRS (мс)</th>
+              <th>QT / QTcF (мс)</th>
+              <th>P (мВ)</th>
+              <th>Q (мВ)</th>
+              <th>R (мВ)</th>
+              <th>S (мВ)</th>
+              <th>Точка J (мВ)</th>
+              <th>ST J+80 (мВ / мм)</th>
+              <th>T (мВ)</th>
+            </tr>
+          </thead>
+          <tbody id="tbodyAllLeads">
+            <tr><td colspan="14" class="empty-cell">Нет данных</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
