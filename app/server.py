@@ -111,6 +111,12 @@ class CaliperRecalcRequest(BaseModel):
     rr_ms: Optional[float] = None
 
 
+class ReanalyzeLeadsRequest(BaseModel):
+    leads_mv: Dict[str, List[float]]
+    fs: float = 500.0
+    preferred_lead: Optional[str] = None
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index_page() -> FileResponse:
     index_path = os.path.join(STATIC_DIR, "index.html")
@@ -253,3 +259,13 @@ async def api_recalculate_calipers(req: CaliperRecalcRequest) -> JSONResponse:
         rr_ms=req.rr_ms,
     )
     return JSONResponse(metrics)
+
+
+@app.post("/api/reanalyze_leads")
+async def api_reanalyze_leads(req: ReanalyzeLeadsRequest) -> JSONResponse:
+    analysis_result = analyze_all_leads(
+        leads_mv=req.leads_mv,
+        fs=req.fs,
+        preferred_lead=req.preferred_lead,
+    )
+    return JSONResponse(analysis_result)

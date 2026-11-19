@@ -451,18 +451,18 @@ body {
 .cal-stage-wrap {
   position: relative;
   display: inline-block;
-  max-width: 100%;
   line-height: 0;
+  flex-shrink: 0;
 }
 
 .cal-stage-wrap img {
   display: block;
-  max-width: 100%;
+  width: 100%;
   height: auto;
   border-radius: 3px;
 }
 
-#calGridCanvas {
+#calGridCanvas, #traceOverlayCanvas {
   position: absolute;
   top: 0;
   left: 0;
@@ -470,6 +470,29 @@ body {
   height: 100%;
   cursor: crosshair;
   border-radius: 3px;
+}
+
+.toolbar-sep {
+  color: var(--border-hairline);
+  margin: 0 2px;
+}
+
+.ov-tool-btn {
+  padding: 3px 8px;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink-secondary);
+  background: #FFFFFF;
+  border: 1px solid var(--border-hairline);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.ov-tool-btn.active {
+  background: #0F4C81;
+  color: #FFFFFF;
+  border-color: #0C3D69;
 }
 
 .multilead-canvas-wrap {

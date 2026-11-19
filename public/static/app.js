@@ -69,6 +69,16 @@
     calRulerB: null,
     calRulerHover: null,
     calPhaseDrag: null,
+    calZoom: 1.0,
+    // Interactive Trace Overlay (Zoom + Lead Rename + Auto-Trace Line Correction)
+    overlayZoom: 1.0,
+    overlayTool: "view", // 'view' | 'autotrace' | 'draw'
+    selectedTraceIdx: 0,
+    originalOverlayTraces: [],
+    overlayInkMap: null,
+    overlayBadgeHitBoxes: [],
+    overlayDrawActive: false,
+    overlayLastPt: null,
     // Vectorcardiogram (VCG) view mode
     vcgPlane: "all3", // 'all3' | 'frontal' | 'horizontal' | 'sagittal' | '3d'
   };
@@ -112,9 +122,24 @@
     btnClearArtifacts: document.getElementById("btnClearArtifacts"),
     lblRAndArtifactStatus: document.getElementById("lblRAndArtifactStatus"),
     imgTraceOverlay: document.getElementById("imgTraceOverlay"),
+    traceOverlayCanvas: document.getElementById("traceOverlayCanvas"),
+    overlayStageWrap: document.getElementById("overlayStageWrap"),
+    overlayScrollBox: document.getElementById("overlayScrollBox"),
+    selectOverlayZoom: document.getElementById("selectOverlayZoom"),
+    btnOverlayZoomOut: document.getElementById("btnOverlayZoomOut"),
+    btnOverlayZoomIn: document.getElementById("btnOverlayZoomIn"),
+    selectOverlayTraceIdx: document.getElementById("selectOverlayTraceIdx"),
+    selectOverlayLeadRename: document.getElementById("selectOverlayLeadRename"),
+    btnApplyLeadRename: document.getElementById("btnApplyLeadRename"),
+    btnAutoRetraceLead: document.getElementById("btnAutoRetraceLead"),
+    btnResetOverlayTrace: document.getElementById("btnResetOverlayTrace"),
+    overlayEditStatus: document.getElementById("overlayEditStatus"),
     imgAligned: document.getElementById("imgAligned"),
     imgHeatmap: document.getElementById("imgHeatmap"),
     calGridCanvas: document.getElementById("calGridCanvas"),
+    calStageWrap: document.getElementById("calStageWrap"),
+    calScrollBox: document.getElementById("calScrollBox"),
+    selectCalZoom: document.getElementById("selectCalZoom"),
     selectCalRefMm: document.getElementById("selectCalRefMm"),
     btnCalMinus: document.getElementById("btnCalMinus"),
     btnCalPlus: document.getElementById("btnCalPlus"),
@@ -714,9 +739,19 @@
       el.btnExportJson.disabled = false;
       el.btnPrintReport.disabled = false;
 
-      // Populate visual verification images
+      // Populate visual verification images (use clean aligned_image for interactive vector overlay)
       const vis = state.digitization.visualizations || {};
-      if (vis.trace_overlay_image) el.imgTraceOverlay.src = vis.trace_overlay_image;
+      state.originalOverlayTraces = JSON.parse(JSON.stringify(state.digitization.overlay_traces || []));
+      state.overlayInkMap = null;
+      state.selectedTraceIdx = 0;
+
+      if (vis.aligned_image || vis.trace_overlay_image) {
+        el.imgTraceOverlay.onload = () => {
+          state.overlayInkMap = null;
+          renderTraceOverlayCanvas();
+        };
+        el.imgTraceOverlay.src = vis.aligned_image || vis.trace_overlay_image;
+      }
       if (vis.aligned_image) {
         el.imgAligned.onload = () => {
           renderPhotoCalibrationCanvas();
@@ -724,6 +759,8 @@
         el.imgAligned.src = vis.aligned_image;
       }
       if (vis.segmentation_heatmap) el.imgHeatmap.src = vis.segmentation_heatmap;
+
+      populateOverlayTraceDropdown();
 
       const sp = state.digitization.pixel_spacing || {};
       const detPxPerMm = sp.px_per_mm || 5.5;
@@ -736,7 +773,10 @@
       state.calRulerHover = null;
       el.inputPxPerMm.value = detPxPerMm.toFixed(2);
       updateDigitizationMetaBanner();
-      setTimeout(() => renderPhotoCalibrationCanvas(), 60);
+      setTimeout(() => {
+        renderPhotoCalibrationCanvas();
+        renderTraceOverlayCanvas();
+      }, 60);
 
       // Select primary lead and initialize calipers
       const availLeads = Object.keys(state.digitization.leads_mv || {});
@@ -779,6 +819,11 @@
 
     const natW = img.naturalWidth || 1000;
     const natH = img.naturalHeight || 700;
+    if (el.calStageWrap && el.calScrollBox) {
+      const boxW = Math.max(320, (el.calScrollBox.clientWidth || 600) - 20);
+      const targetW = Math.round(boxW * (state.calZoom || 1.0));
+      el.calStageWrap.style.width = `${targetW}px`;
+    }
     const rect = img.getBoundingClientRect();
     const dispW = rect.width > 20 ? rect.width : img.clientWidth || natW;
     const dispH = rect.height > 20 ? rect.height : img.clientHeight || natH;
@@ -1199,6 +1244,635 @@
         applyCalibrationScaleLive(autoVal);
         if (el.calRulerStatus) {
           el.calRulerStatus.textContent = `Восстановлен авто-масштаб сетки: ${autoVal.toFixed(2)} пикс/мм`;
+        }
+      });
+    }
+    if (el.selectCalZoom) {
+      el.selectCalZoom.addEventListener("change", () => {
+        state.calZoom = parseFloat(el.selectCalZoom.value) || 1.0;
+        renderPhotoCalibrationCanvas();
+      });
+    }
+  }
+
+  // =========================================================================
+  // Interactive Trace Overlay: Zoom + Lead Name Correction + Auto-Trace Line Correction
+  // =========================================================================
+  const OVERLAY_PALETTE = ["#00E676", "#00B0FF", "#FF4081", "#FFD740", "#7C4DFF", "#00E5FF"];
+
+  function populateOverlayTraceDropdown() {
+    if (!el.selectOverlayTraceIdx || !state.digitization) return;
+    const traces = state.digitization.overlay_traces || [];
+    el.selectOverlayTraceIdx.innerHTML = "";
+    traces.forEach((tr, idx) => {
+      const opt = document.createElement("option");
+      opt.value = String(idx);
+      opt.textContent = `#${idx + 1}: ${tr.lead}`;
+      el.selectOverlayTraceIdx.appendChild(opt);
+    });
+    if (traces.length > 0) {
+      state.selectedTraceIdx = Math.max(0, Math.min(state.selectedTraceIdx, traces.length - 1));
+      el.selectOverlayTraceIdx.value = String(state.selectedTraceIdx);
+      if (el.selectOverlayLeadRename) {
+        el.selectOverlayLeadRename.value = traces[state.selectedTraceIdx].lead;
+      }
+    }
+  }
+
+  function ensureOverlayInkMap() {
+    if (state.overlayInkMap) return state.overlayInkMap;
+    const img = el.imgTraceOverlay;
+    if (!img || !img.complete || !img.naturalWidth) return null;
+    const W = img.naturalWidth;
+    const H = img.naturalHeight;
+    const off = document.createElement("canvas");
+    off.width = W;
+    off.height = H;
+    const ctx = off.getContext("2d");
+    ctx.drawImage(img, 0, 0, W, H);
+    const data = ctx.getImageData(0, 0, W, H).data;
+    const ink = new Float32Array(W * H);
+    for (let i = 0; i < W * H; i++) {
+      const r = data[i * 4];
+      const g = data[i * 4 + 1];
+      const b = data[i * 4 + 2];
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+      const sat = Math.max(r, g, b) - Math.min(r, g, b);
+      const darkness = Math.max(0, (185 - lum) / 150.0);
+      const neutral = sat < 45 ? 1.0 : Math.max(0.1, 1.0 - (sat - 45) / 80.0);
+      ink[i] = Math.min(1.0, darkness * neutral);
+    }
+    state.overlayInkMap = { W, H, data: ink };
+    return state.overlayInkMap;
+  }
+
+  function renderTraceOverlayCanvas() {
+    const img = el.imgTraceOverlay;
+    const canvas = el.traceOverlayCanvas;
+    if (!img || !canvas || !state.digitization) return;
+
+    const natW = img.naturalWidth || 1000;
+    const natH = img.naturalHeight || 700;
+    if (el.overlayStageWrap && el.overlayScrollBox) {
+      const boxW = Math.max(320, (el.overlayScrollBox.clientWidth || 600) - 20);
+      const targetW = Math.round(boxW * (state.overlayZoom || 1.0));
+      el.overlayStageWrap.style.width = `${targetW}px`;
+    }
+
+    const rect = img.getBoundingClientRect();
+    const dispW = rect.width > 20 ? rect.width : img.clientWidth || natW;
+    const dispH = rect.height > 20 ? rect.height : img.clientHeight || natH;
+    if (dispW < 10 || dispH < 10) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(dispW * dpr);
+    canvas.height = Math.round(dispH * dpr);
+
+    const ctx = canvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, dispW, dispH);
+
+    const scaleX = dispW / natW;
+    const scaleY = dispH / natH;
+
+    // 1. Subtle 5mm verification grid in top-left corner
+    const pxPerMm = (state.digitization.pixel_spacing && state.digitization.pixel_spacing.px_per_mm) || state.activePxPerMm || 5.5;
+    const step5X = Math.max(8, 5.0 * pxPerMm * scaleX);
+    const step5Y = Math.max(8, 5.0 * pxPerMm * scaleY);
+    ctx.save();
+    ctx.strokeStyle = "rgba(255, 165, 0, 0.45)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let x = 0; x <= Math.min(dispW, 12 * step5X); x += step5X) {
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, Math.min(dispH, 8 * step5Y));
+    }
+    for (let y = 0; y <= Math.min(dispH, 8 * step5Y); y += step5Y) {
+      ctx.moveTo(0, y);
+      ctx.lineTo(Math.min(dispW, 12 * step5X), y);
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    // 2. Render all vector lead traces + interactive lead name badges
+    const traces = state.digitization.overlay_traces || [];
+    state.overlayBadgeHitBoxes = [];
+
+    traces.forEach((tr, idx) => {
+      const pts = tr.points_px || [];
+      if (pts.length < 2) return;
+      const color = OVERLAY_PALETTE[idx % OVERLAY_PALETTE.length];
+      const isSel = idx === state.selectedTraceIdx;
+
+      ctx.save();
+      if (isSel) {
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
+        ctx.lineWidth = 4.6;
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        pts.forEach((p, i) => (i === 0 ? ctx.moveTo(p[0] * scaleX, p[1] * scaleY) : ctx.lineTo(p[0] * scaleX, p[1] * scaleY)));
+        ctx.stroke();
+      }
+      ctx.strokeStyle = color;
+      ctx.lineWidth = isSel ? 2.6 : 1.75;
+      ctx.globalAlpha = isSel ? 1.0 : 0.86;
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      pts.forEach((p, i) => (i === 0 ? ctx.moveTo(p[0] * scaleX, p[1] * scaleY) : ctx.lineTo(p[0] * scaleX, p[1] * scaleY)));
+      ctx.stroke();
+      ctx.restore();
+
+      // Lead name badge at start of trace
+      const bx = pts[0][0] * scaleX + 4;
+      const by = Math.max(14, (tr.baseline_y_px || pts[0][1]) * scaleY - 12);
+      const lbl = String(tr.lead || "");
+      ctx.save();
+      ctx.font = isSel ? "700 12px 'IBM Plex Mono', monospace" : "600 11px 'IBM Plex Mono', monospace";
+      const tw = ctx.measureText(lbl).width + 10;
+      const th = 17;
+      ctx.fillStyle = isSel ? "#0F172A" : "rgba(15, 23, 42, 0.78)";
+      ctx.fillRect(bx, by - 12, tw, th);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = isSel ? 1.8 : 1.0;
+      ctx.strokeRect(bx, by - 12, tw, th);
+      ctx.fillStyle = color;
+      ctx.fillText(lbl, bx + 5, by + 1);
+      ctx.restore();
+
+      state.overlayBadgeHitBoxes.push({
+        idx,
+        bx,
+        by: by - 12,
+        bw: tw,
+        bh: th,
+      });
+    });
+
+    // 3. Top-right Zoom indicator pill
+    ctx.save();
+    const zTxt = `Зум: ${(state.overlayZoom || 1.0).toFixed(1)}× • Отведение: ${traces[state.selectedTraceIdx] ? traces[state.selectedTraceIdx].lead : "—"}`;
+    ctx.font = "600 11px 'IBM Plex Mono', monospace";
+    const zw = ctx.measureText(zTxt).width + 16;
+    const zx = Math.max(6, dispW - zw - 8);
+    ctx.fillStyle = "rgba(15, 23, 42, 0.84)";
+    ctx.fillRect(zx, 6, zw, 20);
+    ctx.fillStyle = "#FFFFFF";
+    ctx.fillText(zTxt, zx + 8, 20);
+    ctx.restore();
+  }
+
+  async function syncTraceToDigitalLead(traceIdx, reanalyzeBackend = true) {
+    if (!state.digitization || !state.digitization.overlay_traces) return;
+    const tr = state.digitization.overlay_traces[traceIdx];
+    if (!tr || !tr.points_px || tr.points_px.length < 4) return;
+
+    const sp = state.digitization.pixel_spacing || {};
+    const pxPerMmX = sp.px_per_mm_x || sp.px_per_mm || state.activePxPerMm || 5.5;
+    const pxPerMmY = sp.px_per_mm_y || sp.px_per_mm || state.activePxPerMm || 5.5;
+    const speed = state.digitization.paper_speed_mm_s || 25.0;
+    const gain = state.digitization.gain_mm_mv || 10.0;
+    const fs = state.digitization.sampling_rate_hz || 500.0;
+
+    const pts = tr.points_px;
+    const baseY = tr.baseline_y_px !== undefined ? tr.baseline_y_px : pts[0][1];
+    const invertSign = String(tr.lead).startsWith("-");
+    const spanPx = Math.max(10, pts[pts.length - 1][0] - pts[0][0]);
+    const durSec = Math.max(0.5, Math.min(15.0, (spanPx / Math.max(0.5, pxPerMmX)) / Math.max(5.0, speed)));
+    const numSamples = Math.max(100, Math.round(durSec * fs));
+
+    const mvRaw = new Float64Array(pts.length);
+    for (let i = 0; i < pts.length; i++) {
+      let v = (baseY - pts[i][1]) / Math.max(0.5, pxPerMmY * gain);
+      if (invertSign) v = -v;
+      mvRaw[i] = v;
+    }
+    const sorted = Array.from(mvRaw).sort((a, b) => a - b);
+    const med = sorted[Math.floor(sorted.length / 2)] || 0;
+    const mvResampled = new Array(numSamples);
+    for (let i = 0; i < numSamples; i++) {
+      const pos = (i / Math.max(1, numSamples - 1)) * (pts.length - 1);
+      const i0 = Math.floor(pos);
+      const i1 = Math.min(pts.length - 1, i0 + 1);
+      const f = pos - i0;
+      mvResampled[i] = Number(((mvRaw[i0] * (1 - f) + mvRaw[i1] * f) - med).toFixed(4));
+    }
+
+    state.digitization.leads_mv[tr.lead] = mvResampled;
+    const cleanName = String(tr.lead).replace(/^-/, "");
+    if (invertSign && cleanName !== tr.lead) {
+      state.digitization.leads_mv[cleanName] = mvResampled.map((v) => Number((-v).toFixed(4)));
+    }
+
+    if (reanalyzeBackend && !state.staticMode) {
+      try {
+        const res = await fetch("/api/reanalyze_leads", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            leads_mv: state.digitization.leads_mv,
+            fs,
+            preferred_lead: tr.lead,
+          }),
+        });
+        if (res.ok) {
+          state.analysis = await res.json();
+        }
+      } catch (_) {}
+    }
+
+    buildLeadPills(Object.keys(state.digitization.leads_mv));
+    selectLead(tr.lead);
+    renderMultiLeadCanvas();
+    renderHexaxialCompass();
+    renderAllLeadsTable();
+  }
+
+  function autoTraceThroughPoint(traceIdx, natX, natY) {
+    const inkObj = ensureOverlayInkMap();
+    const traces = state.digitization && state.digitization.overlay_traces;
+    if (!inkObj || !traces || !traces[traceIdx]) return;
+
+    const tr = traces[traceIdx];
+    const pts = tr.points_px;
+    if (!pts || pts.length < 6) return;
+
+    // Locate closest point index to clicked X
+    let ci = 0;
+    let bestDx = 1e9;
+    for (let i = 0; i < pts.length; i++) {
+      const d = Math.abs(pts[i][0] - natX);
+      if (d < bestDx) {
+        bestDx = d;
+        ci = i;
+      }
+    }
+
+    const pxPerMm = (state.digitization.pixel_spacing && state.digitization.pixel_spacing.px_per_mm) || state.activePxPerMm || 5.5;
+    const halfWinIdx = Math.max(8, Math.min(Math.floor(pts.length * 0.16), Math.round((3.8 * pxPerMm) / Math.max(1, (pts[pts.length - 1][0] - pts[0][0]) / pts.length))));
+    const i0 = Math.max(0, ci - halfWinIdx);
+    const i1 = Math.min(pts.length - 1, ci + halfWinIdx);
+    if (i1 <= i0 + 2) return;
+
+    let minY = natY;
+    let maxY = natY;
+    for (let k = i0; k <= i1; k++) {
+      if (pts[k][1] < minY) minY = pts[k][1];
+      if (pts[k][1] > maxY) maxY = pts[k][1];
+    }
+    const padY = Math.max(16, Math.round(2.5 * pxPerMm));
+    const yLo = Math.max(1, Math.floor(minY - padY));
+    const yHi = Math.min(inkObj.H - 2, Math.ceil(maxY + padY));
+    const H_b = yHi - yLo + 1;
+    const lenK = i1 - i0 + 1;
+
+    // Constrained 2D Viterbi DP path from pts[i0] through (natX, natY) to pts[i1]
+    const dp = new Float64Array(lenK * H_b);
+    const back = new Int32Array(lenK * H_b);
+    const maxStep = Math.max(10, Math.round(H_b * 0.45));
+    const anchorRel = Math.max(0, Math.min(H_b - 1, Math.round(natY) - yLo));
+    const startRel = Math.max(0, Math.min(H_b - 1, Math.round(pts[i0][1]) - yLo));
+    const endRel = Math.max(0, Math.min(H_b - 1, Math.round(pts[i1][1]) - yLo));
+
+    for (let r = 0; r < H_b; r++) {
+      dp[r] = -0.35 * Math.abs(r - startRel);
+    }
+
+    for (let k = 1; k < lenK; k++) {
+      const absIdx = i0 + k;
+      const x = Math.max(0, Math.min(inkObj.W - 1, Math.round(pts[absIdx][0])));
+      const isAnchor = absIdx === ci;
+      const isEnd = k === lenK - 1;
+      for (let r = 0; r < H_b; r++) {
+        const yImg = yLo + r;
+        let rew = inkObj.data[yImg * inkObj.W + x] * 2.2;
+        if (isAnchor) {
+          rew -= 1.8 * Math.abs(r - anchorRel);
+        }
+        if (isEnd) {
+          rew -= 1.5 * Math.abs(r - endRel);
+        }
+        let bestPrev = -1e9;
+        let bestR = r;
+        const rMin = Math.max(0, r - maxStep);
+        const rMax = Math.min(H_b - 1, r + maxStep);
+        for (let pr = rMin; pr <= rMax; pr++) {
+          const cand = dp[(k - 1) * H_b + pr] - 0.045 * Math.abs(r - pr);
+          if (cand > bestPrev) {
+            bestPrev = cand;
+            bestR = pr;
+          }
+        }
+        dp[k * H_b + r] = rew + bestPrev;
+        back[k * H_b + r] = bestR;
+      }
+    }
+
+    let currR = endRel;
+    let bestEndScore = -1e9;
+    for (let r = 0; r < H_b; r++) {
+      if (dp[(lenK - 1) * H_b + r] > bestEndScore) {
+        bestEndScore = dp[(lenK - 1) * H_b + r];
+        currR = r;
+      }
+    }
+    for (let k = lenK - 1; k >= 0; k--) {
+      pts[i0 + k][1] = Number((yLo + currR).toFixed(1));
+      if (k > 0) currR = back[k * H_b + currR];
+    }
+    pts[ci][1] = Number(natY.toFixed(1));
+
+    renderTraceOverlayCanvas();
+  }
+
+  function autoRetraceFullLead(traceIdx) {
+    const inkObj = ensureOverlayInkMap();
+    const traces = state.digitization && state.digitization.overlay_traces;
+    if (!inkObj || !traces || !traces[traceIdx]) return;
+    const tr = traces[traceIdx];
+    const pts = tr.points_px;
+    if (!pts || pts.length < 6) return;
+
+    const baseY = tr.baseline_y_px !== undefined ? tr.baseline_y_px : pts[0][1];
+    const pxPerMm = (state.digitization.pixel_spacing && state.digitization.pixel_spacing.px_per_mm) || state.activePxPerMm || 5.5;
+    const halfBand = Math.max(24, Math.round(11.0 * pxPerMm));
+    const yLo = Math.max(1, Math.floor(baseY - halfBand));
+    const yHi = Math.min(inkObj.H - 2, Math.ceil(baseY + halfBand));
+    const H_b = yHi - yLo + 1;
+    const lenK = pts.length;
+    const baseRel = Math.max(0, Math.min(H_b - 1, Math.round(baseY) - yLo));
+
+    const dp = new Float64Array(lenK * H_b);
+    const back = new Int32Array(lenK * H_b);
+    const maxStep = Math.max(12, Math.round(H_b * 0.32));
+
+    for (let r = 0; r < H_b; r++) {
+      dp[r] = -0.08 * Math.abs(r - baseRel);
+    }
+    for (let k = 1; k < lenK; k++) {
+      const x = Math.max(0, Math.min(inkObj.W - 1, Math.round(pts[k][0])));
+      for (let r = 0; r < H_b; r++) {
+        const rew = inkObj.data[(yLo + r) * inkObj.W + x] * 2.1 - 0.012 * Math.abs(r - baseRel);
+        let bestPrev = -1e9;
+        let bestR = r;
+        const rMin = Math.max(0, r - maxStep);
+        const rMax = Math.min(H_b - 1, r + maxStep);
+        for (let pr = rMin; pr <= rMax; pr++) {
+          const cand = dp[(k - 1) * H_b + pr] - 0.045 * Math.abs(r - pr);
+          if (cand > bestPrev) {
+            bestPrev = cand;
+            bestR = pr;
+          }
+        }
+        dp[k * H_b + r] = rew + bestPrev;
+        back[k * H_b + r] = bestR;
+      }
+    }
+    let currR = baseRel;
+    let bestEnd = -1e9;
+    for (let r = 0; r < H_b; r++) {
+      if (dp[(lenK - 1) * H_b + r] > bestEnd) {
+        bestEnd = dp[(lenK - 1) * H_b + r];
+        currR = r;
+      }
+    }
+    for (let k = lenK - 1; k >= 0; k--) {
+      pts[k][1] = Number((yLo + currR).toFixed(1));
+      if (k > 0) currR = back[k * H_b + currR];
+    }
+    renderTraceOverlayCanvas();
+    syncTraceToDigitalLead(traceIdx, true);
+    if (el.overlayEditStatus) {
+      el.overlayEditStatus.textContent = `Выполнена авто-перетрассировка канала ${tr.lead}`;
+    }
+  }
+
+  function freehandDrawTracePoint(traceIdx, ptA, ptB) {
+    const traces = state.digitization && state.digitization.overlay_traces;
+    if (!traces || !traces[traceIdx]) return;
+    const pts = traces[traceIdx].points_px;
+    if (!pts || pts.length < 2) return;
+    const xMin = Math.min(ptA.x, ptB.x);
+    const xMax = Math.max(ptA.x, ptB.x);
+    for (let i = 0; i < pts.length; i++) {
+      const px = pts[i][0];
+      if (px >= xMin - 2 && px <= xMax + 2) {
+        const t = Math.abs(ptB.x - ptA.x) > 0.5 ? Math.max(0, Math.min(1, (px - ptA.x) / (ptB.x - ptA.x))) : 1.0;
+        pts[i][1] = Number((ptA.y * (1 - t) + ptB.y * t).toFixed(1));
+      }
+    }
+    renderTraceOverlayCanvas();
+  }
+
+  async function renameOverlayTrace(traceIdx, newLeadName) {
+    if (!state.digitization || !state.digitization.overlay_traces) return;
+    const traces = state.digitization.overlay_traces;
+    if (!traces[traceIdx] || !newLeadName) return;
+    const oldName = traces[traceIdx].lead;
+    if (oldName === newLeadName) return;
+
+    // If another trace already has newLeadName, swap them cleanly
+    const otherIdx = traces.findIndex((t, i) => i !== traceIdx && t.lead === newLeadName);
+    if (otherIdx >= 0) {
+      traces[otherIdx].lead = oldName;
+    }
+    traces[traceIdx].lead = newLeadName;
+
+    // Rebuild leads_mv in the updated trace order
+    const oldMap = state.digitization.leads_mv || {};
+    const tempMap = { ...oldMap };
+    if (otherIdx >= 0 && oldMap[oldName] && oldMap[newLeadName]) {
+      tempMap[newLeadName] = oldMap[oldName];
+      tempMap[oldName] = oldMap[newLeadName];
+    } else if (oldMap[oldName]) {
+      tempMap[newLeadName] = oldMap[oldName];
+      delete tempMap[oldName];
+    }
+
+    const orderedMap = {};
+    traces.forEach((t) => {
+      if (tempMap[t.lead]) orderedMap[t.lead] = tempMap[t.lead];
+    });
+    Object.keys(tempMap).forEach((k) => {
+      if (!orderedMap[k]) orderedMap[k] = tempMap[k];
+    });
+    state.digitization.leads_mv = orderedMap;
+
+    populateOverlayTraceDropdown();
+    renderTraceOverlayCanvas();
+    await syncTraceToDigitalLead(traceIdx, true);
+
+    const msg = otherIdx >= 0 ? `Отведения ${oldName} ↔ ${newLeadName} поменяны местами` : `Отведение ${oldName} переименовано в ${newLeadName}`;
+    if (el.overlayEditStatus) el.overlayEditStatus.textContent = msg;
+    setStatus(msg, "ready");
+  }
+
+  function bindTraceOverlayEvents() {
+    const canvas = el.traceOverlayCanvas;
+    const img = el.imgTraceOverlay;
+    if (!canvas || !img) return;
+
+    const getNatPos = (evt) => {
+      const rect = canvas.getBoundingClientRect();
+      const natW = img.naturalWidth || rect.width || 1000;
+      const natH = img.naturalHeight || rect.height || 700;
+      return {
+        x: ((evt.clientX - rect.left) * natW) / Math.max(1, rect.width),
+        y: ((evt.clientY - rect.top) * natH) / Math.max(1, rect.height),
+      };
+    };
+
+    const getCssPos = (evt) => {
+      const rect = canvas.getBoundingClientRect();
+      return { x: evt.clientX - rect.left, y: evt.clientY - rect.top };
+    };
+
+    const selectTraceAtClick = (cssPos, natPos) => {
+      // 1. Check badge hitboxes first
+      const bHit = (state.overlayBadgeHitBoxes || []).find(
+        (b) => cssPos.x >= b.bx - 3 && cssPos.x <= b.bx + b.bw + 3 && cssPos.y >= b.by - 3 && cssPos.y <= b.by + b.bh + 3
+      );
+      if (bHit) return bHit.idx;
+
+      // 2. Otherwise find nearest curve
+      const traces = (state.digitization && state.digitization.overlay_traces) || [];
+      let bestIdx = -1;
+      let bestDist = 28;
+      traces.forEach((tr, idx) => {
+        const pts = tr.points_px || [];
+        for (let i = 0; i < pts.length; i += 2) {
+          const d = Math.hypot(pts[i][0] - natPos.x, pts[i][1] - natPos.y);
+          if (d < bestDist) {
+            bestDist = d;
+            bestIdx = idx;
+          }
+        }
+      });
+      return bestIdx;
+    };
+
+    canvas.addEventListener("mousedown", (evt) => {
+      const natPos = getNatPos(evt);
+      const cssPos = getCssPos(evt);
+      if (state.overlayTool === "view") {
+        const hitIdx = selectTraceAtClick(cssPos, natPos);
+        if (hitIdx >= 0) {
+          state.selectedTraceIdx = hitIdx;
+          populateOverlayTraceDropdown();
+          renderTraceOverlayCanvas();
+          const tr = state.digitization.overlay_traces[hitIdx];
+          if (tr) {
+            selectLead(tr.lead);
+            if (el.overlayEditStatus) {
+              el.overlayEditStatus.textContent = `Выбрано отведение ${tr.lead} — можно переименовать или править линию`;
+            }
+          }
+        }
+        return;
+      }
+
+      if (state.overlayTool === "autotrace") {
+        state.overlayDrawActive = true;
+        autoTraceThroughPoint(state.selectedTraceIdx, natPos.x, natPos.y);
+        return;
+      }
+
+      if (state.overlayTool === "draw") {
+        state.overlayDrawActive = true;
+        state.overlayLastPt = natPos;
+        freehandDrawTracePoint(state.selectedTraceIdx, natPos, natPos);
+      }
+    });
+
+    canvas.addEventListener("mousemove", (evt) => {
+      if (!state.overlayDrawActive) return;
+      const natPos = getNatPos(evt);
+      if (state.overlayTool === "autotrace") {
+        autoTraceThroughPoint(state.selectedTraceIdx, natPos.x, natPos.y);
+      } else if (state.overlayTool === "draw" && state.overlayLastPt) {
+        freehandDrawTracePoint(state.selectedTraceIdx, state.overlayLastPt, natPos);
+        state.overlayLastPt = natPos;
+      }
+    });
+
+    window.addEventListener("mouseup", () => {
+      if (state.overlayDrawActive) {
+        state.overlayDrawActive = false;
+        state.overlayLastPt = null;
+        syncTraceToDigitalLead(state.selectedTraceIdx, true);
+        const tr = state.digitization && state.digitization.overlay_traces && state.digitization.overlay_traces[state.selectedTraceIdx];
+        if (tr && el.overlayEditStatus) {
+          el.overlayEditStatus.textContent = `Линия ${tr.lead} скорректирована и пересчитана`;
+        }
+      }
+    });
+
+    // Zoom controls
+    const setOverlayZoom = (z) => {
+      state.overlayZoom = Math.max(1.0, Math.min(4.0, z));
+      if (el.selectOverlayZoom) {
+        const opts = Array.from(el.selectOverlayZoom.options).map((o) => parseFloat(o.value));
+        const nearest = opts.reduce((a, b) => (Math.abs(b - state.overlayZoom) < Math.abs(a - state.overlayZoom) ? b : a));
+        el.selectOverlayZoom.value = String(nearest);
+      }
+      renderTraceOverlayCanvas();
+    };
+    if (el.selectOverlayZoom) {
+      el.selectOverlayZoom.addEventListener("change", () => setOverlayZoom(parseFloat(el.selectOverlayZoom.value) || 1.0));
+    }
+    if (el.btnOverlayZoomOut) {
+      el.btnOverlayZoomOut.addEventListener("click", () => setOverlayZoom((state.overlayZoom || 1.0) - 0.5));
+    }
+    if (el.btnOverlayZoomIn) {
+      el.btnOverlayZoomIn.addEventListener("click", () => setOverlayZoom((state.overlayZoom || 1.0) + 0.5));
+    }
+
+    // Tool switcher (view / autotrace / draw)
+    document.querySelectorAll(".ov-tool-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".ov-tool-btn").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        state.overlayTool = btn.getAttribute("data-ov-tool") || "view";
+        canvas.style.cursor = state.overlayTool === "view" ? "pointer" : "crosshair";
+      });
+    });
+
+    if (el.selectOverlayTraceIdx) {
+      el.selectOverlayTraceIdx.addEventListener("change", () => {
+        state.selectedTraceIdx = parseInt(el.selectOverlayTraceIdx.value, 10) || 0;
+        const tr = state.digitization && state.digitization.overlay_traces && state.digitization.overlay_traces[state.selectedTraceIdx];
+        if (tr && el.selectOverlayLeadRename) {
+          el.selectOverlayLeadRename.value = tr.lead;
+          selectLead(tr.lead);
+        }
+        renderTraceOverlayCanvas();
+      });
+    }
+
+    if (el.btnApplyLeadRename) {
+      el.btnApplyLeadRename.addEventListener("click", () => {
+        const newName = el.selectOverlayLeadRename && el.selectOverlayLeadRename.value;
+        if (newName) renameOverlayTrace(state.selectedTraceIdx, newName);
+      });
+    }
+
+    if (el.btnAutoRetraceLead) {
+      el.btnAutoRetraceLead.addEventListener("click", () => {
+        autoRetraceFullLead(state.selectedTraceIdx);
+      });
+    }
+
+    if (el.btnResetOverlayTrace) {
+      el.btnResetOverlayTrace.addEventListener("click", () => {
+        const orig = state.originalOverlayTraces && state.originalOverlayTraces[state.selectedTraceIdx];
+        const traces = state.digitization && state.digitization.overlay_traces;
+        if (orig && traces && traces[state.selectedTraceIdx]) {
+          traces[state.selectedTraceIdx] = JSON.parse(JSON.stringify(orig));
+          populateOverlayTraceDropdown();
+          renderTraceOverlayCanvas();
+          syncTraceToDigitalLead(state.selectedTraceIdx, true);
+          if (el.overlayEditStatus) {
+            el.overlayEditStatus.textContent = `Восстановлена исходная линия ${orig.lead}`;
+          }
         }
       });
     }
@@ -3935,6 +4609,8 @@
         if (pane) pane.classList.add("active");
         if (btn.getAttribute("data-tab") === "multilead") {
           renderMultiLeadCanvas();
+        } else if (btn.getAttribute("data-tab") === "overlay") {
+          setTimeout(() => renderTraceOverlayCanvas(), 20);
         } else if (btn.getAttribute("data-tab") === "aligned") {
           setTimeout(() => renderPhotoCalibrationCanvas(), 20);
         }
@@ -3951,6 +4627,7 @@
     });
 
     bindMultiLeadCanvasEvents();
+    bindTraceOverlayEvents();
     bindPhotoCalibrationEvents();
 
     el.chkShowFiducialsMulti.addEventListener("change", () => renderMultiLeadCanvas());
@@ -4103,6 +4780,7 @@
 
     window.addEventListener("resize", () => {
       renderMultiLeadCanvas();
+      renderTraceOverlayCanvas();
       renderPhotoCalibrationCanvas();
       renderCaliperWorkbenchCanvas(computeLiveMetricsClient());
       renderVectorcardiogram();

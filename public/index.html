@@ -149,13 +149,59 @@
           </div>
         </div>
 
-        <!-- Tab 2: Digital trace overlaid on original aligned image -->
+        <!-- Tab 2: Interactive Digital Trace Overlay + Zoom + Lead Rename + Auto-Trace Line Correction -->
         <div class="tab-pane" id="tab-overlay">
-          <div class="img-viewer-toolbar">
-            <span>Зелёные/голубые линии — извлечённый цифровой сигнал; оранжевая сетка в углу — проверочные квадраты 5×5 мм.</span>
+          <div class="img-viewer-toolbar cal-toolbar">
+            <div class="manual-cal-controls">
+              <span class="toolbar-label">Масштаб:</span>
+              <button type="button" id="btnOverlayZoomOut" class="btn btn-xs btn-ghost" title="Уменьшить масштаб">−</button>
+              <select id="selectOverlayZoom" class="select-input-sm" title="Масштаб просмотра фото и контуров">
+                <option value="1" selected>1.0×</option>
+                <option value="1.5">1.5×</option>
+                <option value="2">2.0×</option>
+                <option value="3">3.0×</option>
+                <option value="4">4.0×</option>
+              </select>
+              <button type="button" id="btnOverlayZoomIn" class="btn btn-xs btn-ghost" title="Увеличить масштаб">+</button>
+
+              <span class="toolbar-sep">|</span>
+              <label for="selectOverlayTraceIdx" class="toolbar-label">Отведение:</label>
+              <select id="selectOverlayTraceIdx" class="select-input-sm" title="Выбранная линия контура"></select>
+              <label for="selectOverlayLeadRename" class="toolbar-label">Название:</label>
+              <select id="selectOverlayLeadRename" class="select-input-sm" title="Исправить название выбранного отведения">
+                <option value="I">I</option>
+                <option value="II">II</option>
+                <option value="III">III</option>
+                <option value="aVR">aVR</option>
+                <option value="-aVR">-aVR</option>
+                <option value="aVL">aVL</option>
+                <option value="aVF">aVF</option>
+                <option value="V1">V1</option>
+                <option value="V2">V2</option>
+                <option value="V3">V3</option>
+                <option value="V4">V4</option>
+                <option value="V5">V5</option>
+                <option value="V6">V6</option>
+              </select>
+              <button type="button" id="btnApplyLeadRename" class="btn btn-sm btn-primary-sm" title="Применить новое название отведения">Применить имя</button>
+            </div>
+            <div class="cal-overlay-toggles">
+              <div class="w1-tool-group" role="group" aria-label="Инструмент коррекции линии">
+                <span class="toolbar-label">Линия:</span>
+                <button type="button" class="ov-tool-btn active" data-ov-tool="view" title="Клик по линии или подписи выбирает отведение">Выбор</button>
+                <button type="button" class="ov-tool-btn" data-ov-tool="autotrace" title="Кликните или потяните точку на фото — авто-трассировка привяжет линию к чернилам ЭКГ через вашу точку">Авто-трассировка (точка)</button>
+                <button type="button" class="ov-tool-btn" data-ov-tool="draw" title="Свободная коррекция линии карандашом по фото">Карандаш (вручную)</button>
+              </div>
+              <button type="button" id="btnAutoRetraceLead" class="btn btn-sm" title="Автоматически перетрассировать выбранное отведение по чернилам на фото">Авто-трасс. канала</button>
+              <button type="button" id="btnResetOverlayTrace" class="btn btn-sm btn-ghost" title="Вернуть исходную трассировку выбранного отведения">Сбросить линию</button>
+              <span id="overlayEditStatus" class="cal-ruler-status">Клик по линии выбирает отведение • Включите «Авто-трассировка» для правки зубцов</span>
+            </div>
           </div>
-          <div class="img-scroll-box">
-            <img id="imgTraceOverlay" alt="Наложение цифрового сигнала на фото ЭКГ" />
+          <div class="img-scroll-box" id="overlayScrollBox">
+            <div class="cal-stage-wrap" id="overlayStageWrap">
+              <img id="imgTraceOverlay" alt="Наложение цифрового сигнала на фото ЭКГ" />
+              <canvas id="traceOverlayCanvas"></canvas>
+            </div>
           </div>
         </div>
 
@@ -178,6 +224,14 @@
 
               <button type="button" id="btnApplyManualCal" class="btn btn-sm btn-primary-sm">Применить масштаб</button>
               <button type="button" id="btnResetManualCal" class="btn btn-sm btn-ghost">Сбросить (Авто)</button>
+              <span class="toolbar-sep">|</span>
+              <span class="toolbar-label">Зум:</span>
+              <select id="selectCalZoom" class="select-input-sm" title="Масштаб просмотра фото для точной калибровки сетки">
+                <option value="1" selected>1.0×</option>
+                <option value="1.5">1.5×</option>
+                <option value="2">2.0×</option>
+                <option value="3">3.0×</option>
+              </select>
             </div>
             <div class="cal-overlay-toggles">
               <label class="checkbox-label" title="Показать калибровочную сетку крупных клеток 5×5 мм поверх фото">
