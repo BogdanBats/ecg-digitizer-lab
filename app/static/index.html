@@ -40,27 +40,28 @@
   <!-- Control & Acquisition Bar -->
   <section class="acquisition-bar" aria-label="Параметры оцифровки ЭКГ">
     <div class="acq-group acq-source">
-      <label class="field-label" for="selectExample">Пример из папки <code>example/</code> или своё фото / PDF</label>
+      <label class="field-label" for="selectExample">Пример из папки <code>example/</code>, своё фото / PDF или цифровая запись ЭКГ / холтера</label>
       <div class="source-row">
         <select id="selectExample" class="select-input">
           <option value="">Загрузка списка примеров...</option>
         </select>
         <select id="selectPdfPage" class="select-input-sm" hidden title="Выбор страницы загруженного PDF с ЭКГ"></select>
         <label class="btn btn-upload" for="fileUploadInput">
-          <span>Загрузить фото / PDF...</span>
-          <input type="file" id="fileUploadInput" accept="image/*,.pdf,application/pdf" hidden />
+          <span>Загрузить фото / PDF / запись...</span>
+          <input type="file" id="fileUploadInput" multiple
+            accept="image/*,.pdf,application/pdf,.edf,.bdf,.rec,.ecg,.ishne,.hea,.dat,.xml,.dcm,.csv,.txt,.zip" hidden />
         </label>
       </div>
-      <div id="exampleDescription" class="field-hint">Выберите пример из списка или перетащите фото / PDF ЭКГ на страницу</div>
+      <div id="exampleDescription" class="field-hint" title="Цифровые форматы: EDF/EDF+/BDF, ISHNE (холтер), WFDB/PhysioNet (.hea + .dat или .zip), GE MUSE XML, HL7 aECG XML, DICOM ECG, CSV">Выберите пример или перетащите фото / PDF / файл электрокардиографа или холтера (EDF, ISHNE, WFDB, MUSE XML, HL7 aECG, DICOM, CSV)</div>
     </div>
 
-    <div class="acq-group">
+    <div class="acq-group photo-only">
       <label class="field-label" for="selectMethod">Алгоритм оцифровки</label>
       <select id="selectMethod" class="select-input"></select>
       <div id="methodDescription" class="field-hint">Ансамбль U-Net + Hough + Viterbi DP</div>
     </div>
 
-    <div class="acq-group">
+    <div class="acq-group photo-only">
       <label class="field-label" for="selectLayout">Раскладка отведений</label>
       <select id="selectLayout" class="select-input"></select>
       <div class="field-hint">Автоопределение или ручной выбор схемы</div>
@@ -98,6 +99,37 @@
         <span id="btnDigitizeText">Оцифровать ЭКГ</span>
       </button>
       <div id="statusBadge" class="status-badge">Готов к работе</div>
+    </div>
+  </section>
+
+  <!-- Native digital recording (electrocardiograph / Holter): no photo verification, segment navigation -->
+  <section class="signal-bar" id="signalBar" hidden aria-label="Цифровая запись ЭКГ / холтера">
+    <div class="signal-bar-row">
+      <span class="signal-badge" id="signalFormatBadge">EDF</span>
+      <span class="signal-info" id="signalInfoLine">—</span>
+      <div class="signal-nav" id="signalNav">
+        <button type="button" id="btnSignalPrev" class="btn btn-xs btn-ghost" title="Предыдущий фрагмент">◀</button>
+        <label class="toolbar-label" for="inpSignalStart">Начало</label>
+        <input type="text" id="inpSignalStart" class="text-input-sm" value="0:00" title="Начало фрагмента (ч:мм:сс, мм:сс или секунды)" />
+        <label class="toolbar-label" for="selectSignalDuration">Окно</label>
+        <select id="selectSignalDuration" class="select-input-sm" title="Длительность фрагмента для стенда калиперов и автоанализа">
+          <option value="10">10 с</option>
+          <option value="20">20 с</option>
+          <option value="30" selected>30 с</option>
+          <option value="60">60 с</option>
+          <option value="120">120 с</option>
+        </select>
+        <button type="button" id="btnSignalGo" class="btn btn-xs btn-primary-sm">Показать</button>
+        <button type="button" id="btnSignalNext" class="btn btn-xs btn-ghost" title="Следующий фрагмент">▶</button>
+      </div>
+      <label class="checkbox-label" title="Раздел 1 (верификация оцифровки фото) для цифровой записи не нужен; здесь можно показать только обзор всех отведений">
+        <input type="checkbox" id="chkSignalOverview" />
+        <span>Обзор всех отведений</span>
+      </label>
+    </div>
+    <div class="signal-trend-wrap" id="signalTrendWrap" hidden>
+      <canvas id="signalTrendCanvas" height="92"></canvas>
+      <div class="signal-trend-legend" id="signalTrendLegend"></div>
     </div>
   </section>
 
@@ -355,6 +387,7 @@
           <button type="button" class="mode-btn mode-btn-artifact" data-mode="artifact">▬▬ Метка артефакта (Синяя линия)</button>
           <button type="button" class="mode-btn" data-mode="free">Циркуль (Δt / ΔV)</button>
           <button type="button" class="mode-btn" data-mode="marching">Шагающий циркуль</button>
+          <button type="button" class="mode-btn mode-btn-compass" data-mode="rr_compass" title="Циркуль между двумя точками с проекцией на все RR канала: преждевременные / удлинённые интервалы и повторяющиеся паттерны (аллоритмии, групповые комплексы)">Циркуль RR → аритмии</button>
         </div>
       </div>
 
@@ -468,6 +501,90 @@
           <strong id="freeSlope">2.50 мВ/с</strong>
         </div>
       </div>
+
+      <!-- RR compass: span between two chosen points projected onto every RR of the channel -->
+      <div class="compass-panel" id="compassPanel" hidden>
+        <div class="compass-controls">
+          <span class="toolbar-label">Циркуль:</span>
+          <strong id="compassSpan" class="compass-span">—</strong>
+          <label class="control-inline">Проекция
+            <select id="selectCompassProjection" class="select-input-sm">
+              <option value="each_r" selected>на каждый RR (от каждого R)</option>
+              <option value="march">шагами от ножки 1 (марш)</option>
+            </select>
+          </label>
+          <label class="control-inline">Допуск
+            <select id="selectCompassTol" class="select-input-sm">
+              <option value="5">±5 %</option>
+              <option value="10" selected>±10 %</option>
+              <option value="15">±15 %</option>
+              <option value="20">±20 %</option>
+            </select>
+          </label>
+          <label class="checkbox-label" title="Ножки циркуля прилипают к ближайшей метке R (Alt при перетаскивании — без привязки)">
+            <input type="checkbox" id="chkCompassSnap" checked />
+            <span>Привязка к R</span>
+          </label>
+          <button type="button" id="btnCompassActiveRR" class="btn btn-xs btn-ghost" title="Поставить ножки на R активного комплекса и следующий R">= RR активного</button>
+          <button type="button" id="btnCompassMedianRR" class="btn btn-xs btn-ghost" title="Размах циркуля = медиана RR канала (без артефактов)">= медиана RR</button>
+          <button type="button" id="btnCompassToReport" class="btn btn-xs btn-primary-sm" title="Добавить вывод циркуля в текст заключения">В заключение</button>
+        </div>
+        <p class="compass-hint">Тяните ножки <b>1</b> и <b>2</b> (или ручку ⇔ — весь циркуль). Каждый RR сравнивается с размахом:
+          <span class="rr-chip rr-N">N</span> в допуске, <span class="rr-chip rr-S">S</span> короче (преждевременный),
+          <span class="rr-chip rr-L">L</span> длиннее (пауза), <span class="rr-chip rr-Q">?</span> артефакт. Клик по интервалу — перейти к комплексу.</p>
+        <div class="compass-seq" id="compassSeq"></div>
+        <ul class="compass-findings" id="compassFindings"></ul>
+      </div>
+
+      <!-- Automatic analysis & editable conclusion -->
+      <div class="auto-report" id="autoReportPanel">
+        <div class="auto-report-head">
+          <div>
+            <h3 class="auto-report-title">Автоанализ и заключение</h3>
+            <p class="panel-meta" id="autoAnalysisMeta">Консенсус детекторов QRS (NeuroKit2 + встроенный) • глобальная разметка зубцов по медианным комплексам • интерпретация по явным критериям</p>
+          </div>
+          <div class="auto-report-actions">
+            <button type="button" id="btnRunAutoAnalysis" class="btn btn-sm btn-primary-sm" title="Найти комплексы, разметить P–QRS–T во всех отведениях и сформировать заключение">▶ Автоанализ</button>
+            <button type="button" id="btnRefreshInterpretation" class="btn btn-sm btn-ghost" title="Пересчитать заключение по текущим меткам R и калиперам (после ручной коррекции); интервалы — по активному отведению">↻ По текущим калиперам</button>
+          </div>
+        </div>
+        <div class="auto-report-patient">
+          <label>ФИО <input type="text" id="inpPatientName" class="text-input-sm" placeholder="необязательно" autocomplete="off" /></label>
+          <label>Возраст <input type="number" id="inpPatientAge" class="text-input-sm num-input-xs" min="0" max="120" /></label>
+          <label>Пол
+            <select id="selectPatientSex" class="select-input-sm" title="Пороги: QTc (450/460 мс), подъём ST в V2–V3, Корнелл (2.8/2.0 мВ)">
+              <option value="">не указан</option>
+              <option value="male">мужской</option>
+              <option value="female">женский</option>
+            </select>
+          </label>
+          <label>ЭОС
+            <select id="selectAxisConvention" class="select-input-sm" title="Классификация положения электрической оси">
+              <option value="ru">отечественная (норма +30…+69°)</option>
+              <option value="aha">AHA (норма −30…+90°)</option>
+            </select>
+          </label>
+          <label>Врач <input type="text" id="inpDoctorName" class="text-input-sm" autocomplete="off" /></label>
+        </div>
+        <div class="auto-report-body">
+          <div class="findings-col">
+            <div class="findings-title">Находки <span class="findings-hint">снимите галочку, чтобы исключить из заключения</span></div>
+            <ul class="findings-list" id="findingsList">
+              <li class="findings-empty">Нажмите «Автоанализ», чтобы получить находки</li>
+            </ul>
+          </div>
+          <div class="conclusion-col">
+            <label for="txtConclusion" class="findings-title">Заключение <span class="findings-hint">можно редактировать</span></label>
+            <textarea id="txtConclusion" class="conclusion-text" rows="12" placeholder="Заключение появится после автоанализа; его можно написать или исправить вручную"></textarea>
+            <div class="conclusion-actions">
+              <span class="conclusion-state" id="conclusionState"></span>
+              <button type="button" id="btnRegenerateConclusion" class="btn btn-sm btn-ghost">Сформировать из отмеченных</button>
+              <button type="button" id="btnCopyConclusion" class="btn btn-sm btn-ghost">Копировать</button>
+              <button type="button" id="btnPrintConclusion" class="btn btn-sm btn-primary-sm">Печать заключения</button>
+            </div>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
 
@@ -554,18 +671,27 @@
             <strong id="valCornell">—</strong>
           </div>
           <div class="axis-stat">
-            <label for="selectPatientSex">Пол пациента (порог Корнелла):</label>
-            <select id="selectPatientSex" class="select-input-sm" title="Корнельский критерий ГЛЖ: ≥ 2.8 мВ у мужчин, ≥ 2.0 мВ у женщин">
-              <option value="">не указан</option>
-              <option value="male">мужской (≥ 2.8 мВ)</option>
-              <option value="female">женский (≥ 2.0 мВ)</option>
-            </select>
-          </div>
-          <div class="axis-stat">
             <span>Индекс Макруза (P / PQ<sub>сегм</sub>):</span>
             <strong id="valMacruz">—</strong>
           </div>
         </div>
+      </div>
+
+      <!-- Axis caliper: frontal-plane vector of any time window of the active beat (I + aVF, area method) -->
+      <div class="axis-caliper" id="axisCaliperBox">
+        <div class="axis-caliper-head">
+          <span class="toolbar-label">Калипер ЭОС — вектор окна:</span>
+          <div class="axis-cal-presets" role="group" aria-label="Окно калипера ЭОС">
+            <button type="button" class="axcal-btn active" data-axcal="qrs" title="QRS_on → J">QRS</button>
+            <button type="button" class="axcal-btn" data-axcal="qrs_i40" title="Начальные 40 мс QRS (септальный / начальный вектор)">QRS 0–40</button>
+            <button type="button" class="axcal-btn" data-axcal="qrs_t40" title="Терминальные 40 мс QRS (замедление проведения, блокады ветвей)">QRS терм. 40</button>
+            <button type="button" class="axcal-btn" data-axcal="p" title="P_on → P_off">P</button>
+            <button type="button" class="axcal-btn" data-axcal="st" title="J → J+80 мс (вектор смещения ST)">ST</button>
+            <button type="button" class="axcal-btn" data-axcal="t" title="T_on → T_off">T</button>
+          </div>
+        </div>
+        <canvas id="axisCaliperCanvas" height="132"></canvas>
+        <div class="axis-caliper-readout" id="axisCaliperReadout">Тяните ножки A / B (или окно целиком) по комплексу активного R; наведение — мгновенный вектор</div>
       </div>
     </div>
 
@@ -648,6 +774,7 @@
           <thead>
             <tr>
               <th>Отведение</th>
+              <th title="Комплекс, на котором стоят калиперы отведения: P (синий), QRS (красный), T (зелёный); время — мс от вершины R">Положение калиперов</th>
               <th>ЧСС (уд/мин)</th>
               <th>RR (мс)</th>
               <th>P (мс)</th>
@@ -664,7 +791,7 @@
             </tr>
           </thead>
           <tbody id="tbodyAllLeads">
-            <tr><td colspan="14" class="empty-cell">Нет данных</td></tr>
+            <tr><td colspan="15" class="empty-cell">Нет данных</td></tr>
           </tbody>
         </table>
       </div>

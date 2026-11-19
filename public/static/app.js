@@ -96,8 +96,20 @@
     gridNodesResult: null,
     originalAlignedDataUrl: null,
     gridNodesPanState: null,
+    // Automatic analysis report: findings from /api/autoanalysis, which ones are included, manual-edit flag
+    report: { findings: [], included: {}, edited: false, summary: null },
     // Vectorcardiogram (VCG) view mode
     vcgPlane: "all3", // 'all3' | 'frontal' | 'horizontal' | 'sagittal' | '3d'
+    // Native digital recording (EDF / ISHNE / WFDB / XML / DICOM / CSV): segment meta + files for re-upload
+    signal: null,
+    signalFiles: null,
+    // RR compass (section 2): legs in ms, projection mode, tolerance, snapping to R
+    compass: { t1_ms: 0, t2_ms: 800, lead: null, init: false, projection: "each_r", tolPct: 10, snap: true },
+    compassDrag: null,
+    compassPanelKey: "",
+    // Axis caliper (section 5): window relative to the active R (ms), preset or custom
+    axisCal: { preset: "qrs", a: null, b: null, drag: null, hoverRel: null, result: null },
+    allLeadsTableRaf: 0,
   };
 
   const FIDUCIAL_DEFS = [
@@ -115,6 +127,19 @@
 
   // DOM Elements
   const el = {
+    signalBar: document.getElementById("signalBar"),
+    signalFormatBadge: document.getElementById("signalFormatBadge"),
+    signalInfoLine: document.getElementById("signalInfoLine"),
+    signalNav: document.getElementById("signalNav"),
+    btnSignalPrev: document.getElementById("btnSignalPrev"),
+    btnSignalNext: document.getElementById("btnSignalNext"),
+    btnSignalGo: document.getElementById("btnSignalGo"),
+    inpSignalStart: document.getElementById("inpSignalStart"),
+    selectSignalDuration: document.getElementById("selectSignalDuration"),
+    chkSignalOverview: document.getElementById("chkSignalOverview"),
+    signalTrendWrap: document.getElementById("signalTrendWrap"),
+    signalTrendCanvas: document.getElementById("signalTrendCanvas"),
+    signalTrendLegend: document.getElementById("signalTrendLegend"),
     selectExample: document.getElementById("selectExample"),
     selectPdfPage: document.getElementById("selectPdfPage"),
     fileUploadInput: document.getElementById("fileUploadInput"),
@@ -196,6 +221,18 @@
     caliperCanvas: document.getElementById("caliperCanvas"),
     caliperReadoutStrip: document.getElementById("caliperReadoutStrip"),
     freeCaliperBanner: document.getElementById("freeCaliperBanner"),
+    axisCaliperCanvas: document.getElementById("axisCaliperCanvas"),
+    axisCaliperReadout: document.getElementById("axisCaliperReadout"),
+    compassPanel: document.getElementById("compassPanel"),
+    compassSpan: document.getElementById("compassSpan"),
+    compassSeq: document.getElementById("compassSeq"),
+    compassFindings: document.getElementById("compassFindings"),
+    selectCompassProjection: document.getElementById("selectCompassProjection"),
+    selectCompassTol: document.getElementById("selectCompassTol"),
+    chkCompassSnap: document.getElementById("chkCompassSnap"),
+    btnCompassActiveRR: document.getElementById("btnCompassActiveRR"),
+    btnCompassMedianRR: document.getElementById("btnCompassMedianRR"),
+    btnCompassToReport: document.getElementById("btnCompassToReport"),
     freeDeltaT: document.getElementById("freeDeltaT"),
     freeEqBpm: document.getElementById("freeEqBpm"),
     freeDeltaV: document.getElementById("freeDeltaV"),
@@ -214,6 +251,19 @@
     valSokolow: document.getElementById("valSokolow"),
     valCornell: document.getElementById("valCornell"),
     selectPatientSex: document.getElementById("selectPatientSex"),
+    btnRunAutoAnalysis: document.getElementById("btnRunAutoAnalysis"),
+    btnRefreshInterpretation: document.getElementById("btnRefreshInterpretation"),
+    autoAnalysisMeta: document.getElementById("autoAnalysisMeta"),
+    inpPatientName: document.getElementById("inpPatientName"),
+    inpPatientAge: document.getElementById("inpPatientAge"),
+    inpDoctorName: document.getElementById("inpDoctorName"),
+    selectAxisConvention: document.getElementById("selectAxisConvention"),
+    findingsList: document.getElementById("findingsList"),
+    txtConclusion: document.getElementById("txtConclusion"),
+    conclusionState: document.getElementById("conclusionState"),
+    btnRegenerateConclusion: document.getElementById("btnRegenerateConclusion"),
+    btnCopyConclusion: document.getElementById("btnCopyConclusion"),
+    btnPrintConclusion: document.getElementById("btnPrintConclusion"),
     calPulseActions: document.getElementById("calPulseActions"),
     calPulseText: document.getElementById("calPulseText"),
     btnApplyPulseGain: document.getElementById("btnApplyPulseGain"),
@@ -698,105 +748,9 @@
       }
       // A newer digitization (another example / page / upload) was started meanwhile: drop this stale result
       if (runId !== state.digitizeRunId) return;
-      state.currentSource = data.source_name;
-      state.digitization = data.digitization;
-      state.analysis = data.analysis;
-      state.artifactsByLead = {};
-      state.originalBeatsByLead = {};
-      if (state.staticMode) {
-        // No backend: measure every lead on its own signal, then derive axes / Sokolow / Cornell
-        recomputeAllLeadMetricsClient(false);
-      }
-      if (state.analysis && state.analysis.leads) {
-        Object.keys(state.analysis.leads).forEach((ln) => {
-          state.artifactsByLead[ln] = [];
-          state.originalBeatsByLead[ln] = JSON.parse(JSON.stringify(state.analysis.leads[ln]));
-        });
-      }
-
-      // Enable exports
-      el.btnExportCsv.disabled = false;
-      el.btnExportJson.disabled = false;
-      el.btnPrintReport.disabled = false;
-
-      // Populate visual verification images (use clean aligned_image for interactive vector overlay)
-      const vis = state.digitization.visualizations || {};
-      state.originalOverlayTraces = JSON.parse(JSON.stringify(state.digitization.overlay_traces || []));
-      state.originalTraceQuality = state.originalOverlayTraces.map((tr) =>
-        state.digitization.lead_quality && state.digitization.lead_quality[tr.lead]
-          ? JSON.parse(JSON.stringify(state.digitization.lead_quality[tr.lead]))
-          : null
-      );
-      state.overlayInkMap = null;
-      state.selectedTraceIdx = 0;
-
-      if (vis.aligned_image || vis.trace_overlay_image) {
-        el.imgTraceOverlay.onload = () => {
-          state.overlayInkMap = null;
-          renderTraceOverlayCanvas();
-        };
-        el.imgTraceOverlay.src = vis.aligned_image || vis.trace_overlay_image;
-      }
-      if (vis.aligned_image) {
-        state.originalAlignedDataUrl = vis.aligned_image;
-        state.gridNodesResult = null;
-        el.imgAligned.onload = () => {
-          renderPhotoCalibrationCanvas();
-        };
-        el.imgAligned.src = vis.aligned_image;
-
-        if (el.imgGridNodesBase) {
-          el.imgGridNodesBase.onload = () => {
-            detectGridIntersectionsAndDeformation();
-          };
-          el.imgGridNodesBase.src = vis.aligned_image;
-        }
-      }
-      if (vis.segmentation_heatmap) el.imgHeatmap.src = vis.segmentation_heatmap;
-
-      populateOverlayTraceDropdown();
-
-      const sp = state.digitization.pixel_spacing || {};
-      const detPxPerMm = sp.px_per_mm || 5.5;
-      if (!customPxPerMm) {
-        state.autoPxPerMm = detPxPerMm;
-      }
-      state.activePxPerMm = detPxPerMm;
-      // Pristine per-lead signals at the px/mm they were digitized with: manual re-calibration always
-      // resamples from these (no cumulative interpolation drift after repeated +/- clicks)
-      state.calibBase = {};
-      Object.keys(state.digitization.leads_mv || {}).forEach((ln) => {
-        state.calibBase[ln] = { sig: state.digitization.leads_mv[ln].slice(), pxPerMm: detPxPerMm };
-      });
-      state.calRulerA = null;
-      state.calRulerB = null;
-      state.calRulerHover = null;
-      el.inputPxPerMm.value = detPxPerMm.toFixed(2);
-      updateDigitizationMetaBanner();
-      renderCalPulseActions();
-      setTimeout(() => {
-        renderPhotoCalibrationCanvas();
-        renderTraceOverlayCanvas();
-      }, 60);
-
-      // Select primary lead and initialize calipers
-      const availLeads = Object.keys(state.digitization.leads_mv || {});
-      state.activeLead = state.analysis.primary_lead && availLeads.includes(state.analysis.primary_lead)
-        ? state.analysis.primary_lead
-        : (availLeads[0] || "II");
-
-      buildLeadPills(availLeads);
-      selectLead(state.activeLead);
-      renderMultiLeadCanvas();
-      renderHexaxialCompass();
-      renderAllLeadsTable();
-
-      const warns = state.digitization.warnings || [];
-      if (warns.length > 0) {
-        setStatus(`Оцифровано с предупреждениями (${availLeads.length} отв.): ${warns[0]}`, "busy");
-      } else {
-        setStatus(`Оцифровано (${availLeads.length} отв., ${state.digitization.elapsed_sec} с)`, "ready");
-      }
+      state.signal = null;
+      state.signalFiles = null;
+      applyLoadedResult(data, customPxPerMm);
     } catch (err) {
       if (runId !== state.digitizeRunId) return;
       console.error("Digitization failed:", err);
@@ -804,13 +758,451 @@
     } finally {
       if (runId === state.digitizeRunId) {
         el.btnDigitize.disabled = false;
-        el.btnDigitizeText.textContent = "Оцифровать ЭКГ";
+        el.btnDigitizeText.textContent = state.signal ? "Перечитать фрагмент" : "Оцифровать ЭКГ";
       }
     }
   }
 
+  // Applies a digitization (/api/digitize, static CV) or a native recording (/api/load_signal, /api/signal_segment)
+  function applyLoadedResult(data, customPxPerMm = null) {
+    const sigMeta = data.digitization && data.digitization.source_type === "signal" ? data.digitization.signal : null;
+    state.signal = sigMeta;
+    // Holter segments get their own report draft (key includes the segment start)
+    state.currentSource = sigMeta ? `${data.source_name} @ ${fmtHms(sigMeta.segment_start_s)}` : data.source_name;
+    state.digitization = data.digitization;
+    state.analysis = data.analysis;
+    state.artifactsByLead = {};
+    state.originalBeatsByLead = {};
+    if (state.staticMode) {
+      // No backend: measure every lead on its own signal, then derive axes / Sokolow / Cornell
+      recomputeAllLeadMetricsClient(false);
+    }
+    if (state.analysis && state.analysis.leads) {
+      Object.keys(state.analysis.leads).forEach((ln) => {
+        state.artifactsByLead[ln] = [];
+        state.originalBeatsByLead[ln] = JSON.parse(JSON.stringify(state.analysis.leads[ln]));
+      });
+    }
+
+    // Enable exports
+    el.btnExportCsv.disabled = false;
+    el.btnExportJson.disabled = false;
+    el.btnPrintReport.disabled = false;
+
+    // Populate visual verification images (use clean aligned_image for interactive vector overlay)
+    const vis = state.digitization.visualizations || {};
+    state.originalOverlayTraces = JSON.parse(JSON.stringify(state.digitization.overlay_traces || []));
+    state.originalTraceQuality = state.originalOverlayTraces.map((tr) =>
+      state.digitization.lead_quality && state.digitization.lead_quality[tr.lead]
+        ? JSON.parse(JSON.stringify(state.digitization.lead_quality[tr.lead]))
+        : null
+    );
+    state.overlayInkMap = null;
+    state.selectedTraceIdx = 0;
+
+    if (vis.aligned_image || vis.trace_overlay_image) {
+      el.imgTraceOverlay.onload = () => {
+        state.overlayInkMap = null;
+        renderTraceOverlayCanvas();
+      };
+      el.imgTraceOverlay.src = vis.aligned_image || vis.trace_overlay_image;
+    }
+    if (vis.aligned_image) {
+      state.originalAlignedDataUrl = vis.aligned_image;
+      state.gridNodesResult = null;
+      el.imgAligned.onload = () => {
+        renderPhotoCalibrationCanvas();
+      };
+      el.imgAligned.src = vis.aligned_image;
+
+      if (el.imgGridNodesBase) {
+        el.imgGridNodesBase.onload = () => {
+          detectGridIntersectionsAndDeformation();
+        };
+        el.imgGridNodesBase.src = vis.aligned_image;
+      }
+    }
+    if (vis.segmentation_heatmap) el.imgHeatmap.src = vis.segmentation_heatmap;
+
+    populateOverlayTraceDropdown();
+
+    const sp = state.digitization.pixel_spacing || {};
+    const detPxPerMm = sp.px_per_mm || 5.5;
+    if (!customPxPerMm) {
+      state.autoPxPerMm = detPxPerMm;
+    }
+    state.activePxPerMm = detPxPerMm;
+    // Pristine per-lead signals at the px/mm they were digitized with: manual re-calibration always
+    // resamples from these (no cumulative interpolation drift after repeated +/- clicks)
+    state.calibBase = {};
+    Object.keys(state.digitization.leads_mv || {}).forEach((ln) => {
+      state.calibBase[ln] = { sig: state.digitization.leads_mv[ln].slice(), pxPerMm: detPxPerMm };
+    });
+    state.calRulerA = null;
+    state.calRulerB = null;
+    state.calRulerHover = null;
+    el.inputPxPerMm.value = detPxPerMm.toFixed(2);
+    updateDigitizationMetaBanner();
+    renderCalPulseActions();
+    state.editedCalipers = {};
+    resetReportPanel();
+    restoreReportDraft();
+    if (sigMeta) prefillPatientFromRecording(sigMeta.info || {});
+    updateSignalModeUI();
+    setTimeout(() => {
+      renderPhotoCalibrationCanvas();
+      renderTraceOverlayCanvas();
+    }, 60);
+
+    // Select primary lead and initialize calipers
+    const availLeads = Object.keys(state.digitization.leads_mv || {});
+    state.activeLead = state.analysis.primary_lead && availLeads.includes(state.analysis.primary_lead)
+      ? state.analysis.primary_lead
+      : (availLeads[0] || "II");
+
+    buildLeadPills(availLeads);
+    selectLead(state.activeLead);
+    renderMultiLeadCanvas();
+    renderHexaxialCompass();
+    renderAllLeadsTable();
+
+    const warns = state.digitization.warnings || [];
+    if (sigMeta) {
+      setStatus(
+        `Запись ${sigMeta.format}: ${availLeads.length} отв., фрагмент ${fmtHms(sigMeta.segment_start_s)}–` +
+          `${fmtHms(sigMeta.segment_start_s + sigMeta.segment_duration_s)} из ${fmtHms(sigMeta.record_duration_s)}`,
+        "ready"
+      );
+    } else if (warns.length > 0) {
+      setStatus(`Оцифровано с предупреждениями (${availLeads.length} отв.): ${warns[0]}`, "busy");
+    } else {
+      setStatus(`Оцифровано (${availLeads.length} отв., ${state.digitization.elapsed_sec} с)`, "ready");
+    }
+  }
+
+  // ------------------------------------------------------------ native digital ECG / Holter recordings
+  const SIGNAL_EXT_RE = /\.(edf|bdf|rec|ecg|ishne|hea|dat|xml|dcm|csv|txt|zip|scp)$/i;
+  function isSignalFile(f) {
+    return !!f && SIGNAL_EXT_RE.test(f.name || "");
+  }
+
+  function fmtHms(sec) {
+    const t = Math.max(0, Math.round(Number(sec) || 0));
+    const h = Math.floor(t / 3600);
+    const m = Math.floor((t % 3600) / 60);
+    const ss = String(t % 60).padStart(2, "0");
+    return h ? `${h}:${String(m).padStart(2, "0")}:${ss}` : `${m}:${ss}`;
+  }
+
+  function parseHms(str) {
+    const txt = String(str || "").trim().replace(",", ".");
+    if (!txt) return 0;
+    if (!txt.includes(":")) return Math.max(0, parseFloat(txt) || 0);
+    return txt.split(":").reduce((acc, part) => acc * 60 + (parseFloat(part) || 0), 0);
+  }
+
+  function prefillPatientFromRecording(info) {
+    let sexChanged = false;
+    if (info.sex && el.selectPatientSex && !el.selectPatientSex.value) {
+      el.selectPatientSex.value = info.sex;
+      sexChanged = el.selectPatientSex.value === info.sex;
+    }
+    const age = parseInt(info.age, 10);
+    if (Number.isFinite(age) && el.inpPatientAge && !el.inpPatientAge.value) el.inpPatientAge.value = String(age);
+    if (info.patient && el.inpPatientName && !el.inpPatientName.value) {
+      el.inpPatientName.value = String(info.patient).replace(/\^/g, " ").trim();
+    }
+    if (sexChanged) recomputeGlobalIndicesClient();
+  }
+
+  function setSignalBusy(busy, text) {
+    el.btnDigitize.disabled = busy;
+    [el.btnSignalPrev, el.btnSignalNext, el.btnSignalGo].forEach((b) => b && (b.disabled = busy));
+    const sg = state.signal;
+    if (!busy && sg) {
+      el.btnSignalPrev.disabled = sg.segment_start_s <= 0.01;
+      el.btnSignalNext.disabled = sg.segment_start_s + sg.segment_duration_s >= sg.record_duration_s - 0.01;
+    }
+    if (text) setStatus(text, busy ? "busy" : "ready");
+  }
+
+  async function postSignalFiles(files, extra) {
+    const fd = new FormData();
+    files.forEach((f) => fd.append("files", f, f.name));
+    Object.entries(extra || {}).forEach(([k, v]) => {
+      if (v !== null && v !== undefined && v !== "") fd.append(k, String(v));
+    });
+    if (el.selectPatientSex && el.selectPatientSex.value) fd.append("patient_sex", el.selectPatientSex.value);
+    const res = await fetch("/api/load_signal", { method: "POST", body: fd });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    return res.json();
+  }
+
+  async function loadSignalFiles(fileList) {
+    const files = Array.from(fileList || []).filter(Boolean);
+    if (!files.length) return;
+    if (state.staticMode) {
+      setStatus("Чтение файлов электрокардиографов и холтеров требует серверной версии (python run.py)", "error");
+      return;
+    }
+    const runId = ++state.digitizeRunId;
+    const names = files.map((f) => f.name).join(" + ");
+    const sizeMb = files.reduce((a, f) => a + f.size, 0) / (1024 * 1024);
+    setSignalBusy(true, `Чтение записи ${names} (${sizeMb.toFixed(1)} МБ)...`);
+    try {
+      const data = await postSignalFiles(files, {});
+      if (runId !== state.digitizeRunId) return;
+      state.uploadedFile = null;
+      state.sourceFile = null;
+      state.uploadedPdfDoc = null;
+      state.uploadedPdfRawFile = null;
+      if (el.selectPdfPage) el.selectPdfPage.hidden = true;
+      el.exampleDescription.textContent = `Цифровая запись: ${names} (${sizeMb.toFixed(1)} МБ)`;
+      applyLoadedResult(data, null);
+      state.signalFiles = files;
+    } catch (err) {
+      if (runId !== state.digitizeRunId) return;
+      console.error("Signal import failed:", err);
+      setStatus(`Ошибка чтения записи: ${err.message}`, "error");
+    } finally {
+      if (runId === state.digitizeRunId) setSignalBusy(false);
+    }
+  }
+
+  async function loadSignalSegment(startS) {
+    if (!state.signal) return;
+    const dur = parseFloat(el.selectSignalDuration.value) || state.signal.segment_duration_s || 30;
+    const start = Math.max(0, Math.min(Number(startS) || 0, Math.max(0, state.signal.record_duration_s - dur)));
+    const runId = ++state.digitizeRunId;
+    const files = state.signalFiles;
+    setSignalBusy(true, `Загрузка фрагмента ${fmtHms(start)}–${fmtHms(start + dur)}...`);
+    try {
+      const res = await fetch("/api/signal_segment", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          recording_id: state.signal.recording_id,
+          segment_start_s: start,
+          segment_duration_s: dur,
+          patient_sex: (el.selectPatientSex && el.selectPatientSex.value) || null,
+        }),
+      });
+      let data = null;
+      if (res.status === 404 && files) {
+        // Server restarted / cache evicted: upload the same files again at the requested segment
+        data = await postSignalFiles(files, { segment_start_s: start, segment_duration_s: dur });
+      } else if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      } else {
+        data = await res.json();
+      }
+      if (runId !== state.digitizeRunId) return;
+      if (!data.digitization.signal.trend && state.signal && state.signal.trend) {
+        data.digitization.signal.trend = state.signal.trend;
+      }
+      applyLoadedResult(data, null);
+      state.signalFiles = files;
+    } catch (err) {
+      if (runId !== state.digitizeRunId) return;
+      console.error("Signal segment failed:", err);
+      setStatus(`Ошибка загрузки фрагмента: ${err.message}`, "error");
+    } finally {
+      if (runId === state.digitizeRunId) setSignalBusy(false);
+    }
+  }
+
+  function updateSignalModeUI() {
+    const s = state.signal;
+    const on = !!s;
+    document.body.classList.toggle("signal-mode", on);
+    document.body.classList.toggle("show-overview", on && !!(el.chkSignalOverview && el.chkSignalOverview.checked));
+    if (el.signalBar) el.signalBar.hidden = !on;
+    if (el.btnDigitizeText) el.btnDigitizeText.textContent = on ? "Перечитать фрагмент" : "Оцифровать ЭКГ";
+    if (!on) return;
+    const activeTab = document.querySelector(".tab-btn.active");
+    if (activeTab && activeTab.getAttribute("data-tab") !== "multilead") {
+      const mt = document.querySelector('.tab-btn[data-tab="multilead"]');
+      if (mt) mt.click();
+    }
+    const info = s.info || {};
+    el.signalFormatBadge.textContent = s.format;
+    const sexTxt = info.sex === "male" ? "муж." : info.sex === "female" ? "жен." : "";
+    const parts = [
+      `${(s.channels || []).length} кан. → ${Object.keys(state.digitization.leads_mv || {}).length} отв.`,
+      `${Number(s.native_fs).toFixed(0)} Гц → 500 Гц`,
+      `длительность ${fmtHms(s.record_duration_s)}`,
+      `фрагмент ${fmtHms(s.segment_start_s)}–${fmtHms(s.segment_start_s + s.segment_duration_s)}`,
+    ];
+    if (info.start) parts.push(`начало записи ${info.start}`);
+    const ageN = parseInt(info.age, 10);
+    const ageTxt = Number.isFinite(ageN)
+      ? `${ageN} ${ageN % 10 === 1 && ageN % 100 !== 11 ? "год" : [2, 3, 4].includes(ageN % 10) && ![12, 13, 14].includes(ageN % 100) ? "года" : "лет"}`
+      : "";
+    const who = [info.patient ? String(info.patient).replace(/\^/g, " ").trim() : "", sexTxt, ageTxt].filter(Boolean).join(", ");
+    if (who) parts.push(who);
+    el.signalInfoLine.textContent = parts.join(" • ");
+    el.inpSignalStart.value = fmtHms(s.segment_start_s);
+    const durVal = String(Math.round(s.segment_duration_s));
+    if (!Array.from(el.selectSignalDuration.options).some((o) => o.value === durVal)) {
+      const opt = document.createElement("option");
+      opt.value = durVal;
+      opt.textContent = `${durVal} с`;
+      el.selectSignalDuration.appendChild(opt);
+    }
+    el.selectSignalDuration.value = durVal;
+    const longRecord = s.record_duration_s > s.segment_duration_s + 0.5;
+    el.signalNav.style.display = longRecord || s.record_duration_s > 12 ? "" : "none";
+    el.btnSignalPrev.disabled = s.segment_start_s <= 0.01;
+    el.btnSignalNext.disabled = s.segment_start_s + s.segment_duration_s >= s.record_duration_s - 0.01;
+    el.signalTrendWrap.hidden = !s.trend;
+    if (s.trend) requestAnimationFrame(renderSignalTrend);
+  }
+
+  // Holter overview: HR median with 5–95 % band, irregular-rhythm strip, pauses; click jumps to that time
+  function renderSignalTrend() {
+    const s = state.signal;
+    const tr = s && s.trend;
+    const canvas = el.signalTrendCanvas;
+    if (!tr || !canvas || el.signalTrendWrap.hidden) return;
+    const dpr = window.devicePixelRatio || 1;
+    const W = Math.max(300, canvas.clientWidth || 800);
+    const H = 92;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    const padL = 34, padR = 8, padT = 8, padB = 16;
+    const plotW = W - padL - padR;
+    const plotH = H - padT - padB - 6;
+    const total = Math.max(1, s.record_duration_s);
+    const xOf = (t) => padL + (t / total) * plotW;
+    const vals = tr.hr_max.concat(tr.hr_min).filter((v) => v !== null);
+    const lo = Math.max(20, Math.floor((Math.min(...vals, 60) - 5) / 10) * 10);
+    const hi = Math.min(240, Math.ceil((Math.max(...vals, 100) + 5) / 10) * 10);
+    const yOf = (hr) => padT + plotH - ((hr - lo) / Math.max(1, hi - lo)) * plotH;
+    ctx.font = "10px sans-serif";
+    ctx.fillStyle = "#64748B";
+    ctx.strokeStyle = "#E2E8F0";
+    ctx.lineWidth = 1;
+    [60, 100, 150].filter((v) => v > lo && v < hi).forEach((v) => {
+      ctx.beginPath();
+      ctx.moveTo(padL, yOf(v));
+      ctx.lineTo(W - padR, yOf(v));
+      ctx.stroke();
+      ctx.fillText(String(v), 4, yOf(v) + 3);
+    });
+    const bw = (tr.bin_s / total) * plotW;
+    tr.hr_median.forEach((m, i) => {
+      if (m === null) return;
+      const x = xOf(i * tr.bin_s);
+      ctx.fillStyle = "rgba(15, 76, 129, 0.16)";
+      ctx.fillRect(x, yOf(tr.hr_max[i]), Math.max(1, bw), Math.max(1, yOf(tr.hr_min[i]) - yOf(tr.hr_max[i])));
+      const irr = tr.irregular_fraction[i];
+      if (irr !== null && irr > 0.1) {
+        ctx.fillStyle = irr > 0.3 ? "rgba(217, 56, 30, 0.75)" : "rgba(245, 158, 11, 0.75)";
+        ctx.fillRect(x, padT + plotH + 2, Math.max(1, bw), 4);
+      }
+    });
+    ctx.strokeStyle = "#0F4C81";
+    ctx.lineWidth = 1.3;
+    ctx.beginPath();
+    let pen = false;
+    tr.hr_median.forEach((m, i) => {
+      if (m === null) {
+        pen = false;
+        return;
+      }
+      const x = xOf((i + 0.5) * tr.bin_s);
+      if (pen) ctx.lineTo(x, yOf(m));
+      else ctx.moveTo(x, yOf(m));
+      pen = true;
+    });
+    ctx.stroke();
+    ctx.fillStyle = "#D9381E";
+    (tr.pauses || []).forEach((p) => {
+      const x = xOf(p.t_s);
+      ctx.beginPath();
+      ctx.moveTo(x - 4, padT - 6);
+      ctx.lineTo(x + 4, padT - 6);
+      ctx.lineTo(x, padT + 1);
+      ctx.fill();
+    });
+    // current segment
+    const x0 = xOf(s.segment_start_s);
+    const x1 = Math.max(x0 + 2, xOf(s.segment_start_s + s.segment_duration_s));
+    ctx.fillStyle = "rgba(124, 58, 237, 0.18)";
+    ctx.fillRect(x0, padT - 2, x1 - x0, plotH + 10);
+    ctx.strokeStyle = "#7C3AED";
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(x0, padT - 2, x1 - x0, plotH + 10);
+    // time axis
+    ctx.fillStyle = "#64748B";
+    const step = total > 6 * 3600 ? 3600 : total > 3600 ? 1800 : total > 1200 ? 600 : total > 300 ? 60 : 30;
+    for (let t = 0; t <= total; t += step) {
+      const x = xOf(t);
+      ctx.fillRect(x, H - padB + 1, 1, 3);
+      if (x < W - 30) ctx.fillText(fmtHms(t), x + 2, H - 3);
+    }
+    el.signalTrendLegend.textContent =
+      `Тренд ЧСС (отв. ${tr.lead}, окна по ${tr.bin_s} с): средняя ${tr.hr_mean_bpm}, мин ${tr.hr_min_bpm ?? "—"}, ` +
+      `макс ${tr.hr_max_bpm ?? "—"} уд/мин • паузы > 2 с: ${(tr.pauses || []).length} (▼) • ` +
+      "полоса внизу: жёлтая/красная — нерегулярный ритм • клик по тренду — открыть этот фрагмент";
+  }
+
+  function bindSignalEvents() {
+    if (!el.signalBar) return;
+    const durNow = () => parseFloat(el.selectSignalDuration.value) || 30;
+    el.btnSignalGo.addEventListener("click", () => loadSignalSegment(parseHms(el.inpSignalStart.value)));
+    el.inpSignalStart.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") loadSignalSegment(parseHms(el.inpSignalStart.value));
+    });
+    el.btnSignalPrev.addEventListener("click", () => state.signal && loadSignalSegment(state.signal.segment_start_s - durNow()));
+    el.btnSignalNext.addEventListener("click", () => state.signal && loadSignalSegment(state.signal.segment_start_s + state.signal.segment_duration_s));
+    el.selectSignalDuration.addEventListener("change", () => state.signal && loadSignalSegment(state.signal.segment_start_s));
+    el.chkSignalOverview.addEventListener("change", () => {
+      updateSignalModeUI();
+      setTimeout(renderMultiLeadCanvas, 30);
+    });
+    const tAt = (evt) => {
+      const r = el.signalTrendCanvas.getBoundingClientRect();
+      const plotW = r.width - 34 - 8;
+      return ((evt.clientX - r.left - 34) / plotW) * (state.signal ? state.signal.record_duration_s : 0);
+    };
+    el.signalTrendCanvas.addEventListener("click", (evt) => {
+      if (!state.signal) return;
+      const t = tAt(evt);
+      const pause = (state.signal.trend.pauses || []).find((p) => Math.abs(p.t_s - t) < state.signal.record_duration_s / 300);
+      const center = pause ? pause.t_s + pause.rr_s / 2 : t;
+      loadSignalSegment(center - durNow() / 2);
+    });
+    el.signalTrendCanvas.addEventListener("mousemove", (evt) => {
+      const tr = state.signal && state.signal.trend;
+      if (!tr) return;
+      const t = tAt(evt);
+      const i = Math.floor(t / tr.bin_s);
+      const m = tr.hr_median[i];
+      el.signalTrendCanvas.title = m === null || m === undefined
+        ? fmtHms(t)
+        : `${fmtHms(t)}: ЧСС ${m} (${tr.hr_min[i]}–${tr.hr_max[i]}) уд/мин` +
+          (tr.irregular_fraction[i] > 0.1 ? `, нерегулярных RR ${Math.round(tr.irregular_fraction[i] * 100)}%` : "");
+    });
+  }
+
   function updateDigitizationMetaBanner() {
     if (!state.digitization) return;
+    if (state.signal) {
+      const sg = state.signal;
+      el.digitizationMetaLine.textContent =
+        `Цифровая запись: ${state.currentSource || "—"} • ${sg.format}, ${Number(sg.native_fs).toFixed(0)} Гц • ` +
+        `фрагмент ${fmtHms(sg.segment_start_s)}–${fmtHms(sg.segment_start_s + sg.segment_duration_s)}` +
+        ((state.digitization.warnings || []).length ? ` • ⚠ ${state.digitization.warnings.join(" • ⚠ ")}` : "");
+      return;
+    }
     const sp = state.digitization.pixel_spacing || {};
     const pxMm = sp.px_per_mm || state.activePxPerMm || 5.5;
     const skew = (state.digitization.alignment && state.digitization.alignment.skew_angle_deg) || 0;
@@ -3366,7 +3758,11 @@
     renderIntervalsTelemetryTable(live);
     renderQtcAndAmplitudes(live);
     renderFreeCaliperBanner();
+    renderCompassPanel();
     renderVectorcardiogram();
+    renderAxisCaliper();
+    renderHexaxialCompass();
+    scheduleAllLeadsTableRender();
   }
 
   // Recomputes metrics of EVERY lead from its own representative beat (not only the active one).
@@ -3988,6 +4384,8 @@
       drawFreeCalipers(ctx, msToX, mvToY);
     } else if (state.caliperMode === "marching") {
       drawMarchingCalipers(ctx, msToX);
+    } else if (state.caliperMode === "rr_compass") {
+      drawRRCompass(ctx, msToX);
     }
   }
 
@@ -4331,6 +4729,523 @@
     }
     ctx.restore();
   }
+
+  // ------------------------------------------------------------------ RR compass with projection on all RR
+  const COMPASS_COLORS = { N: "#0B7A53", S: "#D97706", L: "#D9381E", "?": "#94A3B8" };
+  const ALLORHYTHMIA = { 2: "бигеминия", 3: "тригеминия", 4: "квадригеминия" };
+
+  // Sorted R peaks of a lead with their index in leadAna.beats (chips select the beat by that index)
+  function leadRPeakObjs(ln) {
+    const la = state.analysis && state.analysis.leads && state.analysis.leads[ln];
+    if (!la || !la.beats) return [];
+    return la.beats
+      .map((b, idx) => ({ r: b && b.times_ms ? b.times_ms.r_peak : NaN, idx }))
+      .filter((o) => Number.isFinite(o.r))
+      .sort((a, b) => a.r - b.r);
+  }
+
+  // Pure analysis: every RR vs the compass span. N within ±tol, S shorter (premature), L longer (pause), ? artifact.
+  // Finds the smallest repeating period of the symbol sequence (allorhythmia, grouped beating, regular pauses)
+  // and checks compensatory pauses (S+L vs 2 cycles).
+  function analyzeRRAgainstSpan(rList, spanMs, tolPct, zones) {
+    const tol = Math.max(0.01, tolPct / 100);
+    const span = Math.max(1, spanMs);
+    const items = [];
+    for (let i = 0; i + 1 < rList.length; i++) {
+      const a = rList[i];
+      const b = rList[i + 1];
+      const rr = b - a;
+      const dev = (rr - span) / span;
+      const art = (zones || []).some((z) => Math.min(z.endMs, b) - Math.max(z.startMs, a) > 0.3 * rr);
+      items.push({ i, a, b, rr, dev, ratio: rr / span, sym: art ? "?" : dev < -tol ? "S" : dev > tol ? "L" : "N" });
+    }
+    const syms = items.map((x) => x.sym);
+    const counts = { N: 0, S: 0, L: 0, "?": 0 };
+    syms.forEach((c) => (counts[c] += 1));
+    const known = items.length - counts["?"];
+    const res = { items, counts, pattern: null, notes: [], regular: false, summary: "" };
+    if (known < 2) {
+      res.summary = "Недостаточно интервалов RR для анализа";
+      return res;
+    }
+
+    // 1. Smallest period p with >= 2 repetitions and >= 85 % agreement seq[k] == seq[k+p]
+    for (let p = 1; p <= Math.min(8, Math.floor(syms.length / 2)); p++) {
+      let agree = 0;
+      let total = 0;
+      for (let k = 0; k + p < syms.length; k++) {
+        if (syms[k] === "?" || syms[k + p] === "?") continue;
+        total += 1;
+        if (syms[k] === syms[k + p]) agree += 1;
+      }
+      if (total < p + 1 || agree / total < 0.85) continue;
+      const unit = [];
+      for (let ph = 0; ph < p; ph++) {
+        const cnt = {};
+        for (let k = ph; k < syms.length; k += p) if (syms[k] !== "?") cnt[syms[k]] = (cnt[syms[k]] || 0) + 1;
+        unit.push(Object.keys(cnt).sort((x, y) => cnt[y] - cnt[x])[0] || "N");
+      }
+      if (p === 1) {
+        res.regular = true;
+        if (unit[0] === "N") {
+          res.summary = `Ритм регулярный: ${counts.N} из ${known} RR в пределах ±${tolPct}% от размаха циркуля`;
+        } else {
+          const med = median(items.filter((x) => x.sym !== "?").map((x) => x.rr));
+          res.summary =
+            `Ритм регулярный, но все RR ${unit[0] === "S" ? "короче" : "длиннее"} размаха циркуля ` +
+            `(медиана ${med.toFixed(0)} мс ≈ ${(60000 / med).toFixed(0)} уд/мин) — переставьте циркуль на RR`;
+        }
+        break;
+      }
+      if (unit.every((u) => u === "N")) break;
+      // mean RR of every phase; rotate so that the longest phase is last (reads "... short long")
+      const means = [];
+      for (let ph = 0; ph < p; ph++) {
+        const v = items.filter((x, k) => k % p === ph && x.sym !== "?").map((x) => x.rr);
+        means.push(v.length ? v.reduce((a, b) => a + b, 0) / v.length : NaN);
+      }
+      const rotL = means.indexOf(Math.max(...means.filter(Number.isFinite)));
+      const order = Array.from({ length: p }, (_, j) => (rotL + 1 + j) % p);
+      res.pattern = {
+        period: p,
+        unit: order.map((ph) => unit[ph]),
+        values: order.map((ph) => means[ph]),
+        agreement: agree / total,
+        reps: Math.floor(syms.length / p),
+      };
+      break;
+    }
+
+    // 2. Name the pattern from the RR values of its phases (independent of where the compass legs stand)
+    if (res.pattern) {
+      const { period: p, unit: u, values: m, reps } = res.pattern;
+      const mx = Math.max(...m);
+      const mn = Math.min(...m);
+      const head = `Повторяющийся паттерн RR ${m.map((v) => v.toFixed(0)).join("–")} мс («${u.join("–")}» к циркулю; период ${p}, ` +
+        `${reps} повтор., совпадение ${Math.round(res.pattern.agreement * 100)}%)`;
+      // base (sinus) cycle: for p = 2 it is not visible -> mean of the pair (= cycle if the pause is fully compensatory)
+      const base = p === 2 ? (m[0] + m[1]) / 2 : median(m);
+      const isS = (v) => v < (1 - Math.max(tol, 0.1)) * base;
+      const isL = (v) => v > (1 + Math.max(tol, 0.1)) * base;
+      const sIdx = m.map((v, j) => (isS(v) ? j : -1)).filter((j) => j >= 0);
+      const lIdx = m.map((v, j) => (isL(v) ? j : -1)).filter((j) => j >= 0);
+      const pDiff = "Дифференцируйте экстрасистолию (форма QRS, преждевременный P) и групповые комплексы при СА/АВ-блокаде II ст. — пройдите зубцы P шагающим циркулем.";
+      let text;
+      if (mx / mn < 1 + tol) {
+        text = `${head}: различия RR в пределах допуска — ритм практически регулярный`;
+      } else if (p === 2 && Math.abs(mx / mn - 2) <= Math.max(2 * tol, 0.2)) {
+        text = `${head}: длинный RR ≈ 2 коротким (${(mx / mn).toFixed(2)}×) — выпадение каждого 3-го комплекса ` +
+          `(СА- или АВ-блокада II ст. 3:2) вероятнее бигеминии; основной цикл ≈ ${mn.toFixed(0)} мс. Проверьте зубцы P шагающим циркулем.`;
+      } else if (p === 2) {
+        text = `${head}: бигеминия (чередование короткий ${mn.toFixed(0)} / длинный ${mx.toFixed(0)} мс). ` +
+          `Основной цикл в ритме не виден; при полной компенсаторной паузе он ≈ ${base.toFixed(0)} мс ` +
+          `(${(60000 / base).toFixed(0)} уд/мин), интервал сцепления ${Math.round((mn / base) * 100)}%. ${pDiff}`;
+      } else if (sIdx.length === 1 && lIdx.length === 1 && lIdx[0] === sIdx[0] + 1) {
+        const name = ALLORHYTHMIA[p] || `аллоритмия (каждый ${p}-й комплекс)`;
+        const sv = m[sIdx[0]];
+        const lv = m[lIdx[0]];
+        const comp = (sv + lv - 2 * base) / base;
+        const compTxt = Math.abs(comp) <= Math.max(tol, 0.1)
+          ? "пауза полная компенсаторная (типично для желудочковой ЭС)"
+          : comp < 0
+            ? "пауза неполная компенсаторная (типично для наджелудочковой ЭС)"
+            : "пауза больше компенсаторной";
+        text = `${head}: ${name} — каждый ${p}-й комплекс преждевременный (сцепление ${sv.toFixed(0)} мс = ` +
+          `${Math.round((sv / base) * 100)}% цикла ${base.toFixed(0)} мс), ${compTxt}. ${pDiff}`;
+      } else if (lIdx.length === 1 && sIdx.length === 0) {
+        const lr = m[lIdx[0]] / base;
+        const before = m.slice(0, lIdx[0]);
+        const shortening = before.length >= 2 && before.every((v, j) => j === 0 || v < before[j - 1] - 5);
+        text = Math.abs(lr - 2) <= Math.max(2 * tol, 0.2)
+          ? `${head}: регулярные паузы ≈ 2 цикла (${lr.toFixed(2)}×) каждые ${p} RR — выпадение комплекса с периодичностью ` +
+            `${p + 1}:${p} (СА- или АВ-блокада II ст.; при неизменном PR — Мобитц II). Проверьте зубцы P шагающим циркулем.`
+          : shortening && lr < 2
+            ? `${head}: укорочение RR перед паузой < 2 циклов (${lr.toFixed(2)}×) — периодика Венкебаха ${p + 1}:${p} ` +
+              "(АВ- или СА-блокада II ст. Мобитц I). Проверьте удлинение PR шагающим циркулем."
+            : `${head}: регулярно повторяющиеся удлинённые RR (${lr.toFixed(2)}× цикла) — групповой ритм`;
+      } else if (sIdx.length >= 1 && lIdx.length === 0) {
+        text = `${head}: укороченные RR без последующей паузы — интерполированные экстрасистолы или парасистолия?`;
+      } else {
+        text = `${head}: групповой ритм`;
+      }
+      res.pattern.text = text;
+      res.summary = text;
+    }
+    // longest run of consecutive short RR (paroxysm / salvo) — computed before the irregularity verdict
+    let run = 0;
+    let bestRun = 0;
+    let runMin = Infinity;
+    items.forEach((x) => {
+      run = x.sym === "S" ? run + 1 : 0;
+      if (run > bestRun) bestRun = run;
+      if (run >= 2) runMin = Math.min(runMin, x.rr);
+    });
+    let irregular = false;
+    if (!res.pattern && !res.regular && bestRun >= 3 && counts.S - bestRun <= 1 && counts.L <= 2) {
+      res.summary = `Пробежка: ${bestRun} укороченных RR подряд (до ${runMin.toFixed(0)} мс ≈ ${(60000 / runMin).toFixed(0)} уд/мин) ` +
+        "на фоне регулярного ритма — пароксизм тахикардии / групповая экстрасистолия";
+    } else if (!res.pattern && !res.regular) {
+      const off = (counts.S + counts.L) / known;
+      irregular = off >= 0.3 && known >= 6;
+      res.summary = irregular
+        ? `Нерегулярный ритм без повторяющегося паттерна: ${Math.round(off * 100)}% RR вне ±${tolPct}% — исключите фибрилляцию предсердий / политопную экстрасистолию`
+        : `Единичные отклонения RR без периодичности: укороченных ${counts.S}, удлинённых ${counts.L}`;
+    }
+
+    // 3. Sporadic premature beats: compensatory pause (RR_before + RR_after) vs 2 compass cycles
+    if (!res.pattern && !res.regular && !irregular && !res.summary.startsWith("Пробежка")) {
+      let full = 0;
+      let incomplete = 0;
+      let longer = 0;
+      for (let k = 0; k + 1 < items.length; k++) {
+        if (items[k].sym !== "S" || items[k + 1].sym === "S" || items[k + 1].sym === "?") continue;
+        const d = (items[k].rr + items[k + 1].rr - 2 * span) / span;
+        if (Math.abs(d) <= tol) full += 1;
+        else if (d < -tol) incomplete += 1;
+        else longer += 1;
+      }
+      const ref = "относительно цикла циркуля";
+      if (full) res.notes.push(`Полная компенсаторная пауза: ${full} (сумма RR до и после ≈ 2 циклам ${ref} — типично для желудочковой ЭС)`);
+      if (incomplete) res.notes.push(`Неполная компенсаторная пауза: ${incomplete} (сумма < 2 циклов ${ref} — типично для наджелудочковой ЭС)`);
+      if (longer) res.notes.push(`Пауза больше компенсаторной: ${longer} (${ref})`);
+    }
+
+    // 4. Runs of short RR and long pauses
+    if (bestRun >= 2 && !res.regular && !irregular && !res.summary.startsWith("Пробежка") && !(res.pattern && res.pattern.period <= 2)) {
+      res.notes.push(`Подряд ${bestRun} укороченных RR (до ${runMin.toFixed(0)} мс ≈ ${(60000 / runMin).toFixed(0)} уд/мин) — пробежка / пароксизм?`);
+    }
+    if (!res.pattern && !irregular) {
+      const dbl = items.filter((x) => x.sym === "L" && Math.abs(x.ratio - 2) <= Math.max(2 * tol, 0.2));
+      if (dbl.length) {
+        res.notes.push(`Паузы ≈ 2 циклам циркуля (выпавший комплекс / блокированный P): ${dbl.length} (` +
+          `${dbl.slice(0, 4).map((x) => `R${x.i + 1}→R${x.i + 2} ${x.rr.toFixed(0)} мс`).join(", ")}${dbl.length > 4 ? ", …" : ""})`);
+      }
+    }
+    const pauses = items.filter((x) => x.sym === "L" && x.rr >= 2000);
+    if (pauses.length) {
+      const where = pauses.slice(0, 4).map((x) => `R${x.i + 1}→R${x.i + 2} ${x.rr.toFixed(0)} мс`).join(", ");
+      res.notes.push(`Паузы > 2 с: ${pauses.length} (${where}${pauses.length > 4 ? ", …" : ""})`);
+    }
+    return res;
+  }
+
+  function median(arr) {
+    if (!arr.length) return 0;
+    const v = arr.slice().sort((a, b) => a - b);
+    const m = Math.floor(v.length / 2);
+    return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
+  }
+
+  function setCompassToActiveRR() {
+    const cmp = state.compass;
+    const objs = leadRPeakObjs(state.activeLead);
+    const a = state.calipersMs.r_peak;
+    const b = state.calipersMs.next_r_peak;
+    if (Number.isFinite(a) && Number.isFinite(b) && b > a + 150) {
+      cmp.t1_ms = a;
+      cmp.t2_ms = b;
+    } else if (objs.length >= 2) {
+      cmp.t1_ms = objs[0].r;
+      cmp.t2_ms = objs[1].r;
+    } else {
+      cmp.t1_ms = 200;
+      cmp.t2_ms = 1000;
+    }
+    cmp.lead = state.activeLead;
+    cmp.init = true;
+  }
+
+  function setCompassToMedianRR() {
+    const objs = leadRPeakObjs(state.activeLead);
+    const zones = state.artifactsByLead[state.activeLead] || [];
+    const rrs = [];
+    for (let i = 0; i + 1 < objs.length; i++) {
+      const a = objs[i].r;
+      const b = objs[i + 1].r;
+      if (!zones.some((z) => Math.min(z.endMs, b) - Math.max(z.startMs, a) > 0)) rrs.push(b - a);
+    }
+    if (!rrs.length) return;
+    const cmp = state.compass;
+    cmp.t2_ms = Math.min(cmp.t1_ms, cmp.t2_ms) + median(rrs);
+    cmp.t1_ms = Math.min(cmp.t1_ms, cmp.t2_ms);
+  }
+
+  function ensureCompass() {
+    const cmp = state.compass;
+    const total = (state.viewWindow && state.viewWindow.totalSigMs) || Infinity;
+    if (!cmp.init || cmp.lead !== state.activeLead || Math.max(cmp.t1_ms, cmp.t2_ms) > total) setCompassToActiveRR();
+  }
+
+  function computeCompass() {
+    if (!state.analysis || !state.digitization) return null;
+    ensureCompass();
+    const cmp = state.compass;
+    const span = Math.abs(cmp.t2_ms - cmp.t1_ms);
+    const objs = leadRPeakObjs(state.activeLead);
+    const res = analyzeRRAgainstSpan(objs.map((o) => o.r), span, cmp.tolPct, state.artifactsByLead[state.activeLead] || []);
+    res.items.forEach((it) => (it.beatIdx = objs[it.i].idx));
+    res.span = span;
+    return res;
+  }
+
+  function snapCompassMs(ms, noSnap) {
+    if (noSnap || !state.compass.snap) return ms;
+    const vw = state.viewWindow;
+    const msPerPx = (vw.endMs - vw.startMs) / Math.max(1, vw.plotW);
+    const lim = Math.max(30, 12 * msPerPx);
+    let best = ms;
+    let bestD = lim;
+    leadRPeakObjs(state.activeLead).forEach((o) => {
+      const d = Math.abs(o.r - ms);
+      if (d < bestD) {
+        bestD = d;
+        best = o.r;
+      }
+    });
+    return best;
+  }
+
+  function moveCompass(handle, ms, noSnap) {
+    const cmp = state.compass;
+    const total = state.viewWindow.totalSigMs || ms;
+    if (handle === "cmp_1") {
+      cmp.t1_ms = Math.max(0, Math.min(total, snapCompassMs(ms, noSnap)));
+    } else if (handle === "cmp_2") {
+      cmp.t2_ms = Math.max(0, Math.min(total, snapCompassMs(ms, noSnap)));
+    } else if (handle === "cmp_body" && state.compassDrag) {
+      const d = state.compassDrag;
+      const span = d.t2 - d.t1;
+      let t1 = d.t1 + (ms - d.startMs);
+      t1 = snapCompassMs(t1, noSnap);
+      t1 = Math.max(0, Math.min(total - Math.abs(span), t1));
+      cmp.t1_ms = t1;
+      cmp.t2_ms = t1 + span;
+    }
+  }
+
+  function compassGripRect() {
+    const vw = state.viewWindow;
+    const msToX = (ms) => vw.padLeft + ((ms - vw.startMs) / Math.max(1, vw.endMs - vw.startMs)) * vw.plotW;
+    const xm = (msToX(state.compass.t1_ms) + msToX(state.compass.t2_ms)) / 2;
+    return { x: xm - 15, y: vw.padTop + vw.plotH - 34, w: 30, h: 15 };
+  }
+
+  function drawRRCompass(ctx, msToX) {
+    const vw = state.viewWindow;
+    const { padLeft, padTop, plotH, plotW, startMs, endMs } = vw;
+    const res = computeCompass();
+    if (!res) return;
+    const cmp = state.compass;
+    const span = res.span;
+    const tol = cmp.tolPct / 100;
+    const inView = (ms) => ms >= startMs && ms <= endMs;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(padLeft, padTop - 2, plotW, plotH + 4);
+    ctx.clip();
+    ctx.font = "600 9.5px 'IBM Plex Mono', monospace";
+    ctx.textAlign = "center";
+
+    if (cmp.projection === "march") {
+      // Divider walked from leg 1 across the whole channel: each step is checked against the nearest R
+      const rs = leadRPeakObjs(state.activeLead).map((o) => o.r);
+      const t0 = Math.min(cmp.t1_ms, cmp.t2_ms);
+      const kMin = Math.floor((startMs - t0) / Math.max(1, span)) - 1;
+      const kMax = Math.ceil((endMs - t0) / Math.max(1, span)) + 1;
+      for (let k = kMin; k <= kMax; k++) {
+        if (k === 0 || k === 1) continue;
+        const tk = t0 + k * span;
+        if (!inView(tk)) continue;
+        let near = Infinity;
+        rs.forEach((r) => (near = Math.min(near, Math.abs(r - tk))));
+        const hit = near <= tol * span;
+        const x = msToX(tk);
+        ctx.strokeStyle = hit ? "rgba(11, 122, 83, 0.85)" : "rgba(124, 58, 237, 0.55)";
+        ctx.lineWidth = hit ? 1.8 : 1.2;
+        ctx.setLineDash(hit ? [] : [4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(x, padTop);
+        ctx.lineTo(x, padTop + plotH);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = hit ? "#0B7A53" : "#7C3AED";
+        ctx.fillText(`${k}×`, x, padTop + 10);
+      }
+    } else {
+      // Projection of the span from every R: bracket R_i → R_i + span; the gap to the real R_i+1 is the deviation
+      res.items.forEach((it) => {
+        if (it.b < startMs || it.a > endMs) return;
+        const color = COMPASS_COLORS[it.sym];
+        const y = padTop + 16 + (it.i % 2) * 9;
+        const xa = msToX(it.a);
+        const xp = msToX(it.a + span);
+        const xb = msToX(it.b);
+        ctx.strokeStyle = "rgba(124, 58, 237, 0.75)";
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(xa, y - 3);
+        ctx.lineTo(xa, y + 3);
+        ctx.moveTo(xa, y);
+        ctx.lineTo(xp, y);
+        ctx.moveTo(xp, y - 4);
+        ctx.lineTo(xp, y + 4);
+        ctx.stroke();
+        if (it.sym !== "N" && it.sym !== "?") {
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.moveTo(xp, y);
+          ctx.lineTo(xb, y);
+          ctx.stroke();
+        }
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(xb, y, 3, 0, Math.PI * 2);
+        ctx.fill();
+        if (it.sym !== "N" && it.sym !== "?") {
+          const dms = it.rr - span;
+          ctx.fillText(`${dms > 0 ? "+" : ""}${dms.toFixed(0)}`, xb + (dms > 0 ? 14 : -14), y + 3);
+        }
+      });
+    }
+
+    // RR symbols along the bottom of the plot
+    res.items.forEach((it) => {
+      if (it.b < startMs || it.a > endMs) return;
+      const xc = msToX((it.a + it.b) / 2);
+      const y = padTop + plotH - 12;
+      ctx.fillStyle = COMPASS_COLORS[it.sym];
+      ctx.globalAlpha = it.beatIdx === state.activeBeatIdx ? 1 : 0.85;
+      ctx.fillRect(xc - 8, y - 9, 16, 13);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = "#FFFFFF";
+      ctx.fillText(it.sym, xc, y + 1);
+    });
+    ctx.restore();
+
+    // Legs + span label + grip
+    const x1 = msToX(cmp.t1_ms);
+    const x2 = msToX(cmp.t2_ms);
+    ctx.save();
+    [{ x: x1, label: "1" }, { x: x2, label: "2" }].forEach((b) => {
+      if (b.x < padLeft - 2 || b.x > padLeft + plotW + 2) return;
+      ctx.strokeStyle = "#7C3AED";
+      ctx.lineWidth = 2.2;
+      ctx.beginPath();
+      ctx.moveTo(b.x, padTop);
+      ctx.lineTo(b.x, padTop + plotH);
+      ctx.stroke();
+      ctx.fillStyle = "#7C3AED";
+      ctx.beginPath();
+      ctx.arc(b.x, padTop + plotH, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#FFFFFF";
+      ctx.font = "700 9px 'IBM Plex Mono', monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(b.label, b.x, padTop + plotH + 3);
+    });
+    const speed = (state.digitization && state.digitization.paper_speed_mm_s) || 25;
+    const label = `Δ ${span.toFixed(0)} мс • ${(span / 1000 * speed).toFixed(1)} мм • ${(60000 / Math.max(1, span)).toFixed(1)} уд/мин`;
+    ctx.font = "600 10.5px 'IBM Plex Mono', monospace";
+    const tw = ctx.measureText(label).width + 12;
+    const xm = Math.max(padLeft + tw / 2, Math.min(padLeft + plotW - tw / 2, (x1 + x2) / 2));
+    ctx.fillStyle = "#7C3AED";
+    ctx.fillRect(xm - tw / 2, 6, tw, 16);
+    ctx.fillStyle = "#FFFFFF";
+    ctx.textAlign = "center";
+    ctx.fillText(label, xm, 18);
+    const g = compassGripRect();
+    if (g.x + g.w > padLeft && g.x < padLeft + plotW) {
+      ctx.fillStyle = state.hoverHandle === "cmp_body" ? "#6D28D9" : "rgba(124, 58, 237, 0.85)";
+      ctx.fillRect(g.x, g.y, g.w, g.h);
+      ctx.fillStyle = "#FFFFFF";
+      ctx.font = "700 11px sans-serif";
+      ctx.fillText("⇔", g.x + g.w / 2, g.y + 12);
+    }
+    ctx.restore();
+  }
+
+  function renderCompassPanel() {
+    if (!el.compassPanel) return;
+    const on = state.caliperMode === "rr_compass";
+    el.compassPanel.hidden = !on;
+    if (!on || !state.digitization) return;
+    const res = computeCompass();
+    if (!res) return;
+    const speed = state.digitization.paper_speed_mm_s || 25;
+    el.compassSpan.textContent =
+      `${res.span.toFixed(0)} мс (${(res.span / 1000 * speed).toFixed(1)} мм, ${(60000 / Math.max(1, res.span)).toFixed(1)} уд/мин)`;
+    const key = `${state.activeLead}|${state.activeBeatIdx}|${res.span.toFixed(0)}|${state.compass.tolPct}|` +
+      res.items.map((it) => `${it.sym}${it.rr.toFixed(0)}`).join(",");
+    if (key === state.compassPanelKey) return;
+    state.compassPanelKey = key;
+    el.compassSeq.innerHTML = res.items
+      .map((it) => {
+        const cls = it.sym === "?" ? "rr-Q" : `rr-${it.sym}`;
+        const dev = `${it.dev > 0 ? "+" : ""}${(it.dev * 100).toFixed(0)}%`;
+        return `<button type="button" class="rr-chip ${cls}${it.beatIdx === state.activeBeatIdx ? " active" : ""}" data-beat="${it.beatIdx}" ` +
+          `title="R${it.i + 1}→R${it.i + 2}: ${it.rr.toFixed(0)} мс (${dev} от циркуля)">${it.sym} ${it.rr.toFixed(0)}</button>`;
+      })
+      .join("");
+    const c = res.counts;
+    const lines = [`<li class="pattern">${escapeHtml(res.summary)}</li>`]
+      .concat(res.notes.map((n) => `<li>${escapeHtml(n)}</li>`))
+      .concat([`<li>RR: всего ${res.items.length} • N ${c.N} • S ${c.S} • L ${c.L}${c["?"] ? ` • артефакт ${c["?"]}` : ""} (допуск ±${state.compass.tolPct}%)</li>`]);
+    el.compassFindings.innerHTML = lines.join("");
+  }
+
+  function compassReportText() {
+    const res = computeCompass();
+    if (!res) return "";
+    const parts = [`Анализ RR циркулем (отв. ${state.activeLead}, цикл ${res.span.toFixed(0)} мс, допуск ±${state.compass.tolPct}%): ${res.summary}.`];
+    res.notes.forEach((n) => parts.push(`${n}.`));
+    return parts.join(" ").replace(/\.\./g, ".");
+  }
+
+  function bindCompassEvents() {
+    if (!el.compassPanel) return;
+    el.selectCompassProjection.addEventListener("change", () => {
+      state.compass.projection = el.selectCompassProjection.value;
+      recalculateLiveMetricsAndRender();
+    });
+    el.selectCompassTol.addEventListener("change", () => {
+      state.compass.tolPct = parseFloat(el.selectCompassTol.value) || 10;
+      recalculateLiveMetricsAndRender();
+    });
+    el.chkCompassSnap.addEventListener("change", () => (state.compass.snap = el.chkCompassSnap.checked));
+    el.btnCompassActiveRR.addEventListener("click", () => {
+      setCompassToActiveRR();
+      recalculateLiveMetricsAndRender();
+    });
+    el.btnCompassMedianRR.addEventListener("click", () => {
+      setCompassToMedianRR();
+      recalculateLiveMetricsAndRender();
+    });
+    el.btnCompassToReport.addEventListener("click", () => {
+      const txt = compassReportText();
+      if (!txt || !el.txtConclusion) return;
+      el.txtConclusion.value = (el.txtConclusion.value.trim() ? `${el.txtConclusion.value.trim()}\n` : "") + txt;
+      state.report.edited = true;
+      markConclusionState("Добавлен вывод циркуля RR (текст отредактирован)");
+      saveReportDraft();
+      setStatus("Вывод циркуля RR добавлен в заключение", "ready");
+    });
+    el.compassSeq.addEventListener("click", (evt) => {
+      const chip = evt.target.closest("[data-beat]");
+      if (!chip) return;
+      const idx = parseInt(chip.getAttribute("data-beat"), 10);
+      if (!Number.isFinite(idx)) return;
+      state.activeBeatIdx = idx;
+      el.selectBeat.value = String(idx);
+      const keep = { t1: state.compass.t1_ms, t2: state.compass.t2_ms };
+      loadBeatCalipers(state.activeLead, idx);
+      state.compass.t1_ms = keep.t1;
+      state.compass.t2_ms = keep.t2;
+      recalculateLiveMetricsAndRender();
+    });
+  }
+  window.ECGCompass = { analyzeRRAgainstSpan };
 
   function renderFreeCaliperBanner() {
     const isFreeOrMarch = state.caliperMode === "free" || state.caliperMode === "marching";
@@ -4699,6 +5614,11 @@
     drawVector(axes.p_axis_deg, "#0F4C81", 0.62, "P");
     drawVector(axes.t_axis_deg, "#0B7A53", 0.74, "T");
     drawVector(axes.qrs_axis_deg, "#D9381E", 0.90, "QRS");
+    const axr = state.axisCal && state.axisCal.result;
+    if (axr && axr.areaDeg !== null) drawVector(axr.areaDeg, "#7C3AED", 0.80, "К");
+    if (axr && axr.hover && axr.hover.deg !== null && axr.peak.mag > 1e-4) {
+      drawVector(axr.hover.deg, "rgba(15, 76, 129, 0.75)", Math.max(0.15, Math.min(1, axr.hover.mag / axr.peak.mag)) * 0.95, "");
+    }
   }
 
   /**
@@ -5256,6 +6176,401 @@
     }
   }
 
+  // ------------------------------------------------------------------ Axis caliper (section 5)
+  const AXCAL_PRESETS = {
+    qrs: (c) => [c.qrs_onset, c.qrs_offset],
+    qrs_i40: (c) => [c.qrs_onset, Math.min(c.qrs_offset, c.qrs_onset + 40)],
+    qrs_t40: (c) => [Math.max(c.qrs_onset, c.qrs_offset - 40), c.qrs_offset],
+    p: (c) => [c.p_onset, c.p_offset],
+    st: (c) => [c.qrs_offset, c.qrs_offset + 80],
+    t: (c) => [Math.max(c.t_onset, c.qrs_offset), c.t_offset],
+  };
+  const AXCAL_NAMES = { qrs: "QRS", qrs_i40: "начальных 40 мс QRS", qrs_t40: "терминальных 40 мс QRS", p: "P", st: "ST (J…J+80)", t: "T", custom: "окна" };
+
+  // Window [a, b] in ms relative to the active R (presets follow the active beat's fiducials)
+  function axisCalWindowRel() {
+    const c = state.calipersMs;
+    const ac = state.axisCal;
+    if (ac.preset !== "custom" || ac.a === null || ac.b === null) {
+      const fn = AXCAL_PRESETS[ac.preset] || AXCAL_PRESETS.qrs;
+      const [a, b] = fn(c);
+      ac.a = a - c.r_peak;
+      ac.b = b - c.r_peak;
+    }
+    return { a: Math.min(ac.a, ac.b), b: Math.max(ac.a, ac.b) };
+  }
+
+  // Same physical beat in another lead when simultaneous (R within 80 ms), else the same beat index
+  function axisAnchor(ln) {
+    const leadsMap = state.digitization && state.digitization.leads_mv;
+    const sig = leadsMap && leadsMap[ln];
+    if (!sig || sig.length < 10) return null;
+    const fs = state.digitization.sampling_rate_hz || 500;
+    const cR = state.calipersMs.r_peak;
+    let rMs = cR;
+    if (ln !== state.activeLead) {
+      const la = state.analysis && state.analysis.leads && state.analysis.leads[ln];
+      if (!la || !la.beats || !la.beats.length) return null;
+      let best = null;
+      let bestD = Infinity;
+      la.beats.forEach((b) => {
+        const d = Math.abs(((b.times_ms && b.times_ms.r_peak) || 0) - cR);
+        if (d < bestD) {
+          bestD = d;
+          best = b;
+        }
+      });
+      const bb = bestD <= 80 ? best : la.beats[Math.min(state.activeBeatIdx, la.beats.length - 1)];
+      rMs = bb.times_ms.r_peak;
+    }
+    const qOnRel = state.calipersMs.qrs_onset - cR;
+    const i1 = Math.round(((rMs + qOnRel) * fs) / 1000);
+    const i0 = Math.max(0, i1 - Math.round((16 * fs) / 1000));
+    let iso = 0;
+    let n = 0;
+    for (let k = i0; k <= Math.min(sig.length - 1, i1); k++) {
+      iso += sig[k];
+      n += 1;
+    }
+    return { sig, rMs, iso: n ? iso / n : 0, fs };
+  }
+
+  function axisValueAt(an, rel) {
+    const idx = Math.max(0, Math.min(an.sig.length - 1, Math.round(((an.rMs + rel) * an.fs) / 1000)));
+    return an.sig[idx] - an.iso;
+  }
+
+  // Frontal vector of the window: area method (∫I, ∫(2/√3)·aVF) + net-deflection method + peak instantaneous vector
+  function computeAxisCaliper() {
+    if (!state.digitization || !state.analysis) return null;
+    const aI = axisAnchor("I");
+    const aF = axisAnchor("aVF");
+    const aII = axisAnchor("II");
+    if (!aI || (!aF && !aII)) return null;
+    const k = 2 / Math.sqrt(3);
+    const xAt = (rel) => axisValueAt(aI, rel);
+    const yAt = (rel) => (aF ? k * axisValueAt(aF, rel) : (2 * axisValueAt(aII, rel) - axisValueAt(aI, rel)) / Math.sqrt(3));
+    const w = axisCalWindowRel();
+    const dt = 1000 / (aI.fs || 500);
+    let sx = 0;
+    let sy = 0;
+    let xMax = -Infinity, xMin = Infinity, yMax = -Infinity, yMin = Infinity;
+    let peak = { mag: 0, rel: w.a, x: 0, y: 0 };
+    for (let rel = w.a; rel <= w.b + 1e-6; rel += dt) {
+      const x = xAt(rel);
+      const y = yAt(rel);
+      sx += x * dt;
+      sy += y * dt;
+      xMax = Math.max(xMax, x);
+      xMin = Math.min(xMin, x);
+      yMax = Math.max(yMax, y);
+      yMin = Math.min(yMin, y);
+      const m = Math.hypot(x, y);
+      if (m > peak.mag) peak = { mag: m, rel, x, y };
+    }
+    const deg = (y, x) => (Math.abs(x) + Math.abs(y) < 1e-6 ? null : (Math.atan2(y, x) * 180) / Math.PI);
+    const res = {
+      w,
+      dur: w.b - w.a,
+      areaDeg: deg(sy, sx),
+      areaMag: Math.hypot(sx, sy),
+      ampDeg: deg(yMax + yMin, xMax + xMin),
+      peakDeg: deg(peak.y, peak.x),
+      peak,
+      yLabel: aF ? "aVF" : "aVF (из II)",
+      hover: null,
+    };
+    if (state.axisCal.hoverRel !== null) {
+      const hr = state.axisCal.hoverRel;
+      const hx = xAt(hr);
+      const hy = yAt(hr);
+      res.hover = { rel: hr, deg: deg(hy, hx), mag: Math.hypot(hx, hy) };
+    }
+    res.xAt = xAt;
+    res.yAt = yAt;
+    return res;
+  }
+
+  function fmtDeg(d) {
+    return d === null || d === undefined ? "—" : `${d >= 0 ? "+" : ""}${d.toFixed(0)}°`;
+  }
+
+  function renderAxisCaliper() {
+    const canvas = el.axisCaliperCanvas;
+    if (!canvas) return;
+    const res = computeAxisCaliper();
+    state.axisCal.result = res;
+    const dpr = window.devicePixelRatio || 1;
+    const W = Math.max(260, canvas.clientWidth || 360);
+    const H = 132;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    if (!res) {
+      ctx.fillStyle = "#94A3B8";
+      ctx.font = "12px sans-serif";
+      ctx.fillText("Нужны отведения I и aVF (или II)", 10, 24);
+      el.axisCaliperReadout.textContent = "Калипер ЭОС недоступен: в записи нет отведений I и aVF / II";
+      return;
+    }
+    const c = state.calipersMs;
+    const v0 = c.p_onset - c.r_peak - 40;
+    const v1 = c.t_offset - c.r_peak + 60;
+    const padL = 34, padR = 8;
+    const plotW = W - padL - padR;
+    const xOf = (rel) => padL + ((rel - v0) / Math.max(1, v1 - v0)) * plotW;
+    const rows = [
+      { label: "I", f: res.xAt, y0: 34 },
+      { label: res.yLabel === "aVF" ? "aVF·2/√3" : "Y", f: res.yAt, y0: 92 },
+    ];
+    let amp = 0.3;
+    for (let rel = v0; rel <= v1; rel += 4) rows.forEach((r) => (amp = Math.max(amp, Math.abs(r.f(rel)))));
+    const sc = 24 / amp;
+    state.axisCal.geom = { padL, plotW, v0, v1, W, H };
+    // fiducial bands of the active beat
+    [[c.p_onset, c.p_offset, "rgba(15, 76, 129, 0.07)"], [c.qrs_onset, c.qrs_offset, "rgba(217, 56, 30, 0.08)"],
+      [c.t_onset, c.t_offset, "rgba(11, 122, 83, 0.07)"]].forEach(([a, b, col]) => {
+      ctx.fillStyle = col;
+      ctx.fillRect(xOf(a - c.r_peak), 4, Math.max(0, xOf(b - c.r_peak) - xOf(a - c.r_peak)), H - 22);
+    });
+    // window
+    const xa = xOf(res.w.a);
+    const xb = xOf(res.w.b);
+    ctx.fillStyle = "rgba(124, 58, 237, 0.13)";
+    ctx.fillRect(xa, 4, Math.max(1, xb - xa), H - 22);
+    rows.forEach((r) => {
+      ctx.strokeStyle = "rgba(74, 85, 104, 0.35)";
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(padL, r.y0);
+      ctx.lineTo(W - padR, r.y0);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.strokeStyle = "#111622";
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      for (let px = 0; px <= plotW; px++) {
+        const rel = v0 + (px / plotW) * (v1 - v0);
+        const y = r.y0 - r.f(rel) * sc;
+        if (px === 0) ctx.moveTo(padL + px, y);
+        else ctx.lineTo(padL + px, y);
+      }
+      ctx.stroke();
+      ctx.fillStyle = "#4A5568";
+      ctx.font = "600 9.5px 'IBM Plex Mono', monospace";
+      ctx.textAlign = "left";
+      ctx.fillText(r.label, 2, r.y0 + 3);
+    });
+    // blades
+    [{ x: xa, t: "A" }, { x: xb, t: "B" }].forEach((b) => {
+      ctx.strokeStyle = "#7C3AED";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(b.x, 4);
+      ctx.lineTo(b.x, H - 18);
+      ctx.stroke();
+      ctx.fillStyle = "#7C3AED";
+      ctx.fillRect(b.x - 7, H - 17, 14, 13);
+      ctx.fillStyle = "#FFFFFF";
+      ctx.font = "700 9.5px 'IBM Plex Mono', monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(b.t, b.x, H - 7);
+    });
+    // R reference + hover cursor
+    ctx.strokeStyle = "rgba(176, 35, 16, 0.6)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(xOf(0), 4);
+    ctx.lineTo(xOf(0), 10);
+    ctx.stroke();
+    if (res.hover) {
+      const xh = xOf(res.hover.rel);
+      ctx.strokeStyle = "rgba(15, 76, 129, 0.7)";
+      ctx.setLineDash([2, 2]);
+      ctx.beginPath();
+      ctx.moveTo(xh, 4);
+      ctx.lineTo(xh, H - 18);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.textAlign = "left";
+
+    const name = AXCAL_NAMES[state.axisCal.preset] || "окна";
+    const lines = [
+      `<span class="ax-main">Вектор ${name}: ${fmtDeg(res.areaDeg)}</span> (площадной, ${res.areaMag.toFixed(1)} мВ·мс) • ` +
+        `по сумме зубцов ${fmtDeg(res.ampDeg)} • макс. мгновенный ${fmtDeg(res.peakDeg)} (${res.peak.mag.toFixed(2)} мВ, ${res.peak.rel >= 0 ? "+" : ""}${res.peak.rel.toFixed(0)} мс от R)`,
+      `Окно A ${res.w.a >= 0 ? "+" : ""}${res.w.a.toFixed(0)} → B ${res.w.b >= 0 ? "+" : ""}${res.w.b.toFixed(0)} мс от R (${res.dur.toFixed(0)} мс), отв. ${state.activeLead}, комплекс R${state.activeBeatIdx + 1}`,
+    ];
+    if (res.hover) {
+      lines.push(`Мгновенный вектор ${res.hover.rel >= 0 ? "+" : ""}${res.hover.rel.toFixed(0)} мс: ${fmtDeg(res.hover.deg)}, ${res.hover.mag.toFixed(2)} мВ`);
+    }
+    el.axisCaliperReadout.innerHTML = lines.join("<br>");
+  }
+
+  function bindAxisCaliperEvents() {
+    const canvas = el.axisCaliperCanvas;
+    if (!canvas) return;
+    document.querySelectorAll(".axcal-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".axcal-btn").forEach((b) => b.classList.toggle("active", b === btn));
+        state.axisCal.preset = btn.getAttribute("data-axcal") || "qrs";
+        state.axisCal.a = null;
+        state.axisCal.b = null;
+        renderAxisCaliper();
+        renderHexaxialCompass();
+      });
+    });
+    const relAt = (evt) => {
+      const g = state.axisCal.geom;
+      if (!g) return null;
+      const r = canvas.getBoundingClientRect();
+      return g.v0 + ((evt.clientX - r.left - g.padL) / Math.max(1, g.plotW)) * (g.v1 - g.v0);
+    };
+    const hitBlade = (evt) => {
+      const g = state.axisCal.geom;
+      const res = state.axisCal.result;
+      if (!g || !res) return null;
+      const r = canvas.getBoundingClientRect();
+      const x = evt.clientX - r.left;
+      const xOf = (rel) => g.padL + ((rel - g.v0) / Math.max(1, g.v1 - g.v0)) * g.plotW;
+      if (Math.abs(x - xOf(res.w.a)) <= 7) return "a";
+      if (Math.abs(x - xOf(res.w.b)) <= 7) return "b";
+      if (x > xOf(res.w.a) && x < xOf(res.w.b)) return "body";
+      return null;
+    };
+    const toCustom = () => {
+      const w = axisCalWindowRel();
+      state.axisCal.a = w.a;
+      state.axisCal.b = w.b;
+      state.axisCal.preset = "custom";
+      document.querySelectorAll(".axcal-btn").forEach((b) => b.classList.remove("active"));
+    };
+    canvas.addEventListener("mousedown", (evt) => {
+      const rel = relAt(evt);
+      if (rel === null) return;
+      let h = hitBlade(evt);
+      toCustom();
+      if (!h) {
+        // click outside the window: move the nearer blade there
+        h = Math.abs(rel - state.axisCal.a) < Math.abs(rel - state.axisCal.b) ? "a" : "b";
+        state.axisCal[h] = rel;
+      }
+      state.axisCal.drag = { h, rel0: rel, a0: state.axisCal.a, b0: state.axisCal.b };
+      renderAxisCaliper();
+      renderHexaxialCompass();
+    });
+    window.addEventListener("mousemove", (evt) => {
+      const d = state.axisCal.drag;
+      if (!d) return;
+      const rel = relAt(evt);
+      if (rel === null) return;
+      if (d.h === "a") state.axisCal.a = rel;
+      else if (d.h === "b") state.axisCal.b = rel;
+      else {
+        state.axisCal.a = d.a0 + (rel - d.rel0);
+        state.axisCal.b = d.b0 + (rel - d.rel0);
+      }
+      renderAxisCaliper();
+      renderHexaxialCompass();
+    });
+    window.addEventListener("mouseup", () => (state.axisCal.drag = null));
+    canvas.addEventListener("mousemove", (evt) => {
+      if (state.axisCal.drag) return;
+      state.axisCal.hoverRel = relAt(evt);
+      const h = hitBlade(evt);
+      canvas.style.cursor = h === "a" || h === "b" ? "ew-resize" : h === "body" ? "move" : "crosshair";
+      renderAxisCaliper();
+      renderHexaxialCompass();
+    });
+    canvas.addEventListener("mouseleave", () => {
+      state.axisCal.hoverRel = null;
+      renderAxisCaliper();
+      renderHexaxialCompass();
+    });
+  }
+
+  // ------------------------------------------------------------------ Caliper positions in section 6
+  function scheduleAllLeadsTableRender() {
+    if (state.allLeadsTableRaf) return;
+    state.allLeadsTableRaf = requestAnimationFrame(() => {
+      state.allLeadsTableRaf = 0;
+      renderAllLeadsTable();
+    });
+  }
+
+  function leadCaliperInfo(ln) {
+    const la = state.analysis && state.analysis.leads && state.analysis.leads[ln];
+    if (!la) return null;
+    const c = ln === state.activeLead ? state.calipersMs : la.calipers_ms;
+    if (!c || !Number.isFinite(c.r_peak)) return null;
+    let beatNo = null;
+    (la.beats || []).forEach((b, i) => {
+      if (b && b.times_ms && Math.abs(b.times_ms.r_peak - c.r_peak) < 1) beatNo = i + 1;
+    });
+    const edited = state.editedCalipers && state.editedCalipers[ln] && state.editedCalipers[ln].size > 0;
+    return { c, beatNo, edited };
+  }
+
+  function drawCaliperThumb(canvas, ln) {
+    const info = leadCaliperInfo(ln);
+    const sig = state.digitization && state.digitization.leads_mv && state.digitization.leads_mv[ln];
+    if (!info || !sig) return;
+    const c = info.c;
+    const fs = state.digitization.sampling_rate_hz || 500;
+    const W = 164;
+    const H = 46;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const t0 = Math.max(0, Math.min(c.p_onset, c.r_peak - 250) - 50);
+    const t1 = Math.max(c.t_offset, c.r_peak + 300) + 60;
+    const xOf = (ms) => ((ms - t0) / Math.max(1, t1 - t0)) * W;
+    const i0 = Math.max(0, Math.floor((t0 * fs) / 1000));
+    const i1 = Math.min(sig.length - 1, Math.ceil((t1 * fs) / 1000));
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let i = i0; i <= i1; i++) {
+      lo = Math.min(lo, sig[i]);
+      hi = Math.max(hi, sig[i]);
+    }
+    if (!(hi >= lo)) return;
+    // at least 0.6 mV full scale: a near-isoelectric lead must not blow its noise up to full height
+    const mid = (hi + lo) / 2;
+    const half = Math.max(0.3, (hi - lo) / 2);
+    const yOf = (v) => H / 2 - ((v - mid) / half) * (H / 2 - 4);
+    [[c.p_onset, c.p_offset, "rgba(15, 76, 129, 0.13)"], [c.qrs_onset, c.qrs_offset, "rgba(217, 56, 30, 0.13)"],
+      [c.t_onset, c.t_offset, "rgba(11, 122, 83, 0.13)"]].forEach(([a, b, col]) => {
+      ctx.fillStyle = col;
+      ctx.fillRect(xOf(a), 0, Math.max(0, xOf(b) - xOf(a)), H);
+    });
+    ctx.strokeStyle = "#111622";
+    ctx.lineWidth = 1.1;
+    ctx.beginPath();
+    for (let i = i0; i <= i1; i++) {
+      const x = xOf((i * 1000) / fs);
+      if (i === i0) ctx.moveTo(x, yOf(sig[i]));
+      else ctx.lineTo(x, yOf(sig[i]));
+    }
+    ctx.stroke();
+    FIDUCIAL_DEFS.filter((fd) => fd.key !== "next_r_peak").forEach((fd) => {
+      const v = c[fd.key];
+      if (!Number.isFinite(v)) return;
+      const edited = state.editedCalipers && state.editedCalipers[ln] && state.editedCalipers[ln].has(fd.key);
+      ctx.strokeStyle = edited ? "#7C3AED" : fd.color;
+      ctx.lineWidth = edited ? 1.8 : fd.row === 1 ? 0.8 : 1.2;
+      ctx.setLineDash(fd.row === 1 ? [2, 2] : []);
+      ctx.beginPath();
+      ctx.moveTo(xOf(v), 0);
+      ctx.lineTo(xOf(v), H);
+      ctx.stroke();
+    });
+    ctx.setLineDash([]);
+  }
+
   function renderAllLeadsTable() {
     if (!state.analysis || !state.analysis.leads) return;
     const leads = state.analysis.leads;
@@ -5275,9 +6590,16 @@
           ? `<span class="q-badge q-${qi.level}" title="${escapeHtml(qi.title)}">${qi.level === "manual" ? "✎" : "●"}</span>`
           : "";
 
+        const ci = leadCaliperInfo(ln);
+        const rel = (k) => (ci && Number.isFinite(ci.c[k]) ? `${ci.c[k] - ci.c.r_peak >= 0 ? "+" : ""}${(ci.c[k] - ci.c.r_peak).toFixed(0)}` : "—");
+        const calTxt = ci
+          ? `${ci.beatNo ? `R${ci.beatNo}` : "R"}${ci.edited ? ' <span class="edited" title="Калиперы отредактированы вручную">✎</span>' : ""} • ` +
+            `P ${rel("p_onset")}…${rel("p_offset")} • QRS ${rel("qrs_onset")}…${rel("qrs_offset")} • T…${rel("t_offset")}`
+          : "—";
         return `
         <tr class="${isAct}" data-lead="${escapeHtml(ln)}">
           <td class="mono-val">${escapeHtml(ln)}${qBadge}</td>
+          <td class="cal-thumb-cell"><canvas class="cal-thumb" data-lead="${escapeHtml(ln)}" width="164" height="46"></canvas><span class="cal-thumb-txt">${calTxt}</span></td>
           <td class="mono-val">${(m.hr_bpm || 0).toFixed(0)}</td>
           <td class="mono-val">${(m.rr_ms || 0).toFixed(0)}</td>
           <td class="mono-val">${(dur.p_wave || 0).toFixed(0)}</td>
@@ -5301,6 +6623,7 @@
         if (ln) selectLead(ln);
       });
     });
+    Array.from(el.tbodyAllLeads.querySelectorAll("canvas.cal-thumb")).forEach((cv) => drawCaliperThumb(cv, cv.getAttribute("data-lead")));
   }
 
   // Interactive Mouse & Touch Events for Window 1 (#multileadCanvas)
@@ -5576,6 +6899,12 @@
           }
         });
         return bestKey;
+      } else if (state.caliperMode === "rr_compass") {
+        const g = compassGripRect();
+        if (pos.x >= g.x - 3 && pos.x <= g.x + g.w + 3 && pos.y >= g.y - 3 && pos.y <= g.y + g.h + 3) return "cmp_body";
+        if (Math.abs(pos.x - msToX(state.compass.t1_ms)) < 10) return "cmp_1";
+        if (Math.abs(pos.x - msToX(state.compass.t2_ms)) < 10) return "cmp_2";
+        return null;
       } else if (state.caliperMode === "free" || state.caliperMode === "marching") {
         const x1 = msToX(state.freeCalipers.t1_ms);
         const x2 = msToX(state.freeCalipers.t2_ms);
@@ -5643,6 +6972,9 @@
             loadBeatCalipers(state.activeLead, bIdx);
           }
         }
+        if (handle === "cmp_body") {
+          state.compassDrag = { startMs: clickMs, t1: state.compass.t1_ms, t2: state.compass.t2_ms };
+        }
         state.draggingHandle = handle;
         return;
       }
@@ -5671,6 +7003,8 @@
           canvas.style.cursor =
             hov && hov.startsWith("free_v")
               ? "ns-resize"
+              : hov === "cmp_body"
+              ? "move"
               : hov
               ? "ew-resize"
               : state.caliperMode === "r_edit" || state.caliperMode === "artifact"
@@ -5711,6 +7045,12 @@
         return;
       }
 
+      if (h === "cmp_1" || h === "cmp_2" || h === "cmp_body") {
+        moveCompass(h, xToMs(pos.x), evt.altKey);
+        renderCaliperWorkbenchCanvas(computeLiveMetricsClient());
+        renderCompassPanel();
+        return;
+      }
       if (h === "free_t1") {
         state.freeCalipers.t1_ms = xToMs(pos.x);
       } else if (h === "free_t2") {
@@ -5737,6 +7077,7 @@
         }
       } else if (state.calipersMs[h] !== undefined) {
         state.calipersMs[h] = currMs;
+        markCaliperEdited(h);
         syncNumericalInputsFromCalipers();
       }
       recalculateLiveMetricsAndRender();
@@ -5858,7 +7199,420 @@
     await runDigitization();
   }
 
+  // =========================================================================
+  // Automatic analysis (backend /api/autoanalysis) & editable conclusion
+  // =========================================================================
+  const REPORT_SECTIONS = ["rhythm", "axis", "intervals", "conduction", "hypertrophy", "ischemia", "repolarization", "other", "quality"];
+  const REPORT_DISCLAIMER = "Автоматическое заключение — требует проверки и подтверждения врачом.";
+  const SEVERITY_LABEL = { critical: "Срочно", abnormal: "Патология", borderline: "Погранично", normal: "Норма", info: "Инфо" };
+
+  // Which fiducials the physician actually moved on each lead (only those override the automatic analysis)
+  function markCaliperEdited(key) {
+    if (!state.editedCalipers) state.editedCalipers = {};
+    if (!state.editedCalipers[state.activeLead]) state.editedCalipers[state.activeLead] = new Set();
+    state.editedCalipers[state.activeLead].add(key);
+  }
+
+  function reportPatient() {
+    const age = parseInt((el.inpPatientAge && el.inpPatientAge.value) || "", 10);
+    return {
+      name: (el.inpPatientName && el.inpPatientName.value.trim()) || "",
+      age: Number.isFinite(age) ? age : null,
+      sex: (el.selectPatientSex && el.selectPatientSex.value) || null,
+      doctor: (el.inpDoctorName && el.inpDoctorName.value.trim()) || "",
+      axis_convention: (el.selectAxisConvention && el.selectAxisConvention.value) || "ru",
+    };
+  }
+
+  // Per-viewer draft of the conclusion (survives a page reload); never required for the app to work
+  function reportStorageKey() {
+    return `ecg-report:${state.currentSource || "—"}`;
+  }
+  function saveReportDraft() {
+    try {
+      const p = reportPatient();
+      localStorage.setItem(reportStorageKey(), JSON.stringify({
+        text: el.txtConclusion.value, edited: state.report.edited, name: p.name, age: p.age, doctor: p.doctor,
+      }));
+    } catch (_) {}
+  }
+  function restoreReportDraft() {
+    let d = null;
+    try {
+      d = JSON.parse(localStorage.getItem(reportStorageKey()) || "null");
+    } catch (_) {
+      d = null;
+    }
+    if (!d) return;
+    if (el.inpPatientName && d.name) el.inpPatientName.value = d.name;
+    if (el.inpPatientAge && d.age !== null && d.age !== undefined) el.inpPatientAge.value = String(d.age);
+    if (el.inpDoctorName && d.doctor) el.inpDoctorName.value = d.doctor;
+    if (d.text) {
+      el.txtConclusion.value = d.text;
+      state.report.edited = !!d.edited;
+      markConclusionState("Восстановлен сохранённый черновик заключения");
+    }
+  }
+
+  function resetReportPanel() {
+    state.report = { findings: [], included: {}, edited: false, summary: null };
+    if (el.findingsList) {
+      el.findingsList.innerHTML = "";
+      const li = document.createElement("li");
+      li.className = "findings-empty";
+      li.textContent = state.staticMode
+        ? "Автоанализ требует Python-сервера (python run.py); заключение можно написать вручную"
+        : "Нажмите «Автоанализ», чтобы получить находки";
+      el.findingsList.appendChild(li);
+    }
+    if (el.txtConclusion) el.txtConclusion.value = "";
+    markConclusionState("");
+    [el.btnRunAutoAnalysis, el.btnRefreshInterpretation].forEach((b) => {
+      if (!b) return;
+      b.disabled = !!state.staticMode;
+      if (state.staticMode) b.title = "Требуется Python-сервер (python run.py)";
+    });
+    if (el.autoAnalysisMeta) {
+      el.autoAnalysisMeta.textContent =
+        "Консенсус детекторов QRS (NeuroKit2 + встроенный) • глобальная разметка зубцов по медианным комплексам • интерпретация по явным критериям";
+    }
+  }
+
+  function markConclusionState(text) {
+    if (el.conclusionState) el.conclusionState.textContent = text || "";
+  }
+
+  function composeConclusionClient() {
+    const chosen = (state.report.findings || []).filter((f) => state.report.included[f.code]);
+    const lines = [];
+    REPORT_SECTIONS.forEach((sec) => {
+      const texts = chosen.filter((f) => f.section === sec).map((f) => f.text);
+      if (texts.length) lines.push(texts.join(" "));
+    });
+    lines.push(REPORT_DISCLAIMER);
+    return lines.join("\n");
+  }
+
+  function setConclusionText(text, edited) {
+    el.txtConclusion.value = text;
+    state.report.edited = !!edited;
+    markConclusionState(edited ? "Текст отредактирован вручную" : "");
+    saveReportDraft();
+  }
+
+  function renderFindingsList() {
+    const list = el.findingsList;
+    if (!list) return;
+    list.innerHTML = "";
+    (state.report.findings || []).forEach((f) => {
+      const li = document.createElement("li");
+      li.className = "finding-item" + (state.report.included[f.code] ? "" : " excluded");
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = !!state.report.included[f.code];
+      cb.title = "Включить в заключение";
+      cb.addEventListener("change", () => {
+        state.report.included[f.code] = cb.checked;
+        li.classList.toggle("excluded", !cb.checked);
+        if (!state.report.edited) {
+          setConclusionText(composeConclusionClient(), false);
+        } else {
+          markConclusionState("Находки изменены, текст оставлен как есть — «Сформировать из отмеченных», чтобы обновить");
+        }
+      });
+      const sev = document.createElement("span");
+      sev.className = `finding-sev sev-${f.severity}`;
+      sev.textContent = SEVERITY_LABEL[f.severity] || f.severity;
+      const txt = document.createElement("span");
+      txt.className = "finding-text";
+      txt.textContent = f.text;
+      li.append(cb, sev, txt);
+      if (f.evidence) {
+        const ev = document.createElement("div");
+        ev.className = "finding-evidence";
+        ev.textContent = f.evidence;
+        li.appendChild(ev);
+      }
+      const leads = (f.leads || []).filter((ln) => state.digitization && state.digitization.leads_mv[ln]);
+      if (leads.length) {
+        const box = document.createElement("div");
+        box.className = "finding-leads";
+        leads.forEach((ln) => {
+          const chip = document.createElement("button");
+          chip.type = "button";
+          chip.className = "finding-lead-chip";
+          chip.textContent = ln;
+          chip.title = `Открыть отведение ${ln} в стенде калиперов`;
+          chip.addEventListener("click", () => selectLead(ln));
+          box.appendChild(chip);
+        });
+        li.appendChild(box);
+      }
+      list.appendChild(li);
+    });
+  }
+
+  function setReportFindings(findings) {
+    state.report.findings = findings || [];
+    state.report.included = {};
+    state.report.findings.forEach((f) => {
+      state.report.included[f.code] = f.default !== false;
+    });
+    renderFindingsList();
+    const fresh = composeConclusionClient();
+    if (state.report.edited && el.txtConclusion.value.trim()) {
+      if (window.confirm("Заменить отредактированное вручную заключение новым автоматическим текстом?")) {
+        setConclusionText(fresh, false);
+      } else {
+        markConclusionState("Находки обновлены, ваш текст сохранён без изменений");
+      }
+    } else {
+      setConclusionText(fresh, false);
+    }
+  }
+
+  // Simultaneously recorded lead groups = traces sharing the same horizontal strip (x-range) of the sheet
+  function leadGroupsForAnalysis() {
+    const leadsMap = state.digitization.leads_mv || {};
+    const groups = {};
+    (state.digitization.overlay_traces || []).forEach((tr) => {
+      const key = Array.isArray(tr.x_range_px) ? tr.x_range_px.join("-") : `trace-${tr.lead}`;
+      (groups[key] = groups[key] || []).push(tr.lead);
+    });
+    const covered = new Set(Object.values(groups).flat());
+    Object.keys(leadsMap).forEach((ln) => {
+      if (covered.has(ln)) return;
+      const parentKey = Object.keys(groups).find((k) => groups[k].includes(`-${ln}`));
+      const key = parentKey || `len-${leadsMap[ln].length}`;
+      (groups[key] = groups[key] || []).push(ln);
+    });
+    return Object.values(groups)
+      .map((g) => g.filter((ln) => leadsMap[ln]))
+      .filter((g) => g.length);
+  }
+
+  function buildAutoAnalysisPayload(useWorkbench) {
+    const lq = {};
+    Object.entries(state.digitization.lead_quality || {}).forEach(([ln, q]) => {
+      lq[ln] = q && q.level === "manual" ? "ok" : (q && q.level) || "ok";
+    });
+    const artifacts = {};
+    Object.entries(state.artifactsByLead || {}).forEach(([ln, zones]) => {
+      if (zones && zones.length) artifacts[ln] = zones.map((z) => [z.startMs, z.endMs]);
+    });
+    const p = reportPatient();
+    const payload = {
+      leads_mv: state.digitization.leads_mv,
+      fs: state.digitization.sampling_rate_hz || 500,
+      groups: leadGroupsForAnalysis(),
+      lead_quality: lq,
+      artifacts_ms: artifacts,
+      patient: { sex: p.sex, age: p.age },
+      options: { axis_convention: p.axis_convention },
+    };
+    if (useWorkbench && state.analysis && state.analysis.leads) {
+      const cal = {};
+      const rp = {};
+      Object.entries(state.analysis.leads).forEach(([ln, la]) => {
+        if (!state.digitization.leads_mv[ln] || !la) return;
+        const c = ln === state.activeLead ? state.calipersMs : la.calipers_ms;
+        if (c) cal[ln] = { ...c };
+        if (Array.isArray(la.r_peaks_ms) && la.r_peaks_ms.length) rp[ln] = la.r_peaks_ms.slice();
+      });
+      payload.calipers_ms = cal;
+      payload.r_peaks_ms = rp;
+      payload.reference_lead = state.activeLead;
+      payload.reference_edited = Array.from((state.editedCalipers && state.editedCalipers[state.activeLead]) || []);
+    }
+    return payload;
+  }
+
+  function applyAutoAnalysisToWorkbench(analysis) {
+    state.editedCalipers = {};
+    const keepArtifacts = state.artifactsByLead || {};
+    state.analysis = analysis;
+    state.originalBeatsByLead = {};
+    Object.keys(analysis.leads || {}).forEach((ln) => {
+      state.originalBeatsByLead[ln] = JSON.parse(JSON.stringify(analysis.leads[ln]));
+      if (!keepArtifacts[ln]) keepArtifacts[ln] = [];
+    });
+    state.artifactsByLead = keepArtifacts;
+    recomputeGlobalIndicesClient();
+    const leadNames = Object.keys(state.digitization.leads_mv || {});
+    const target = analysis.leads[state.activeLead] ? state.activeLead : analysis.primary_lead || leadNames[0];
+    buildLeadPills(leadNames);
+    selectLead(target);
+    renderMultiLeadCanvas();
+    renderHexaxialCompass();
+    renderAllLeadsTable();
+  }
+
+  function updateAutoAnalysisMeta() {
+    const s = state.report.summary;
+    if (!s || !el.autoAnalysisMeta) return;
+    const m = s.methods || {};
+    const iv = s.intervals || {};
+    const rh = s.rhythm || {};
+    const f = (v) => (v === null || v === undefined ? "—" : Math.round(v));
+    el.autoAnalysisMeta.textContent =
+      `ЧСС ${f(rh.hr_bpm)} • PQ ${f(iv.pr_ms)} • QRS ${f(iv.qrs_ms)} • QT/QTcF ${f(iv.qt_ms)}/${f(iv.qtc_fridericia_ms)} мс • ` +
+      `комплексов ${rh.n_beats || 0}, P у ${Math.round((rh.p_present_fraction || 0) * 100)}% • ` +
+      `детекторы QRS: ${(m.qrs_detectors || []).join(", ") || "—"}${m.neurokit2 ? ` (NeuroKit2 ${m.neurokit2})` : ""}`;
+  }
+
+  async function runAutoAnalysis(useWorkbench) {
+    if (!state.digitization || !state.digitization.leads_mv) return;
+    if (state.staticMode) {
+      setStatus("Автоанализ требует Python-сервера (python run.py)", "error");
+      return;
+    }
+    const buttons = [el.btnRunAutoAnalysis, el.btnRefreshInterpretation];
+    buttons.forEach((b) => b && (b.disabled = true));
+    setStatus(useWorkbench ? "Пересчёт заключения по текущим калиперам..." : "Автоанализ: детекция QRS, разметка зубцов, интерпретация...", "busy");
+    try {
+      const res = await fetch("/api/autoanalysis", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildAutoAnalysisPayload(useWorkbench)),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      if (!useWorkbench) applyAutoAnalysisToWorkbench(data.analysis);
+      state.report.summary = data.autoanalysis;
+      setReportFindings(data.interpretation.findings);
+      updateAutoAnalysisMeta();
+      const crit = data.interpretation.findings.filter((f) => f.severity === "critical").length;
+      setStatus(
+        (useWorkbench ? "Заключение пересчитано по калиперам" : "Автоанализ выполнен") +
+          ` • находок: ${data.interpretation.findings.length}` + (crit ? ` • срочных: ${crit}` : ""),
+        crit ? "error" : "ready"
+      );
+    } catch (err) {
+      console.error("Autoanalysis failed:", err);
+      setStatus(`Ошибка автоанализа: ${err.message}`, "error");
+    } finally {
+      buttons.forEach((b) => b && (b.disabled = false));
+    }
+  }
+
+  // Patient / convention changes only alter thresholds & wording: re-interpret the current marks
+  let reportRefreshTimer = null;
+  function scheduleReportRefresh() {
+    saveReportDraft();
+    if (!state.report.findings.length || state.staticMode) return;
+    clearTimeout(reportRefreshTimer);
+    reportRefreshTimer = setTimeout(() => runAutoAnalysis(true), 400);
+  }
+
+  function printConclusion() {
+    const text = (el.txtConclusion && el.txtConclusion.value.trim()) || "";
+    if (!text) {
+      setStatus("Заключение пустое — выполните автоанализ или напишите текст", "error");
+      return;
+    }
+    const w = window.open("", "_blank");
+    if (!w) {
+      setStatus("Браузер заблокировал окно печати — разрешите всплывающие окна для этого сайта", "error");
+      return;
+    }
+    const p = reportPatient();
+    const s = state.report.summary || {};
+    const iv = s.intervals || {};
+    const rh = s.rhythm || {};
+    const live = computeLiveMetricsClient() || {};
+    const axes = (state.analysis && state.analysis.axes) || s.axes || {};
+    const fmt = (v, unit) => (v === null || v === undefined || Number.isNaN(v) ? "—" : `${Math.round(v)} ${unit}`);
+    const deg = (v) => (v === null || v === undefined ? "—" : `${v >= 0 ? "+" : ""}${Math.round(v)}°`);
+    const hr = rh.hr_bpm || live.hr_bpm;
+    const rows = [
+      ["ЧСС", fmt(hr, "уд/мин")],
+      ["PQ (PR)", fmt(iv.pr_ms !== undefined ? iv.pr_ms : live.intervals_ms && live.intervals_ms.pq_pr, "мс")],
+      ["QRS", fmt(iv.qrs_ms !== undefined ? iv.qrs_ms : live.durations_ms && live.durations_ms.qrs_complex, "мс")],
+      ["QT", fmt(iv.qt_ms !== undefined ? iv.qt_ms : live.intervals_ms && live.intervals_ms.qt, "мс")],
+      ["QTc Фридеричиа / Базетт", `${fmt(iv.qtc_fridericia_ms !== undefined ? iv.qtc_fridericia_ms : live.intervals_ms && live.intervals_ms.qtc_fridericia, "мс")} / ${fmt(iv.qtc_bazett_ms !== undefined ? iv.qtc_bazett_ms : live.intervals_ms && live.intervals_ms.qtc_bazett, "мс")}`],
+      ["ЭОС: QRS / P / T", `${deg(axes.qrs_axis_deg)} / ${deg(axes.p_axis_deg)} / ${deg(axes.t_axis_deg)}`],
+    ];
+    const dig = state.digitization || {};
+    let img = "";
+    try {
+      img = el.multileadCanvas ? el.multileadCanvas.toDataURL("image/png") : "";
+    } catch (_) {
+      img = "";
+    }
+    const sexTxt = { male: "мужской", female: "женский" }[p.sex] || "не указан";
+    const today = new Date().toLocaleDateString("ru-RU");
+    const html = `<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Заключение ЭКГ</title>
+<style>
+  body{font-family:'IBM Plex Sans',Arial,sans-serif;color:#141923;margin:18mm 14mm;font-size:12.5px}
+  h1{font-size:18px;margin:0 0 8px} h2{font-size:13px;margin:16px 0 6px;border-bottom:1px solid #B8C2CC;padding-bottom:3px}
+  table{border-collapse:collapse;width:100%} td{padding:3px 6px;border:1px solid #D8DEE9;vertical-align:top}
+  td.k{width:34%;color:#4A5568} .meta td{border:none;padding:2px 6px 2px 0}
+  img{max-width:100%;border:1px solid #D8DEE9} .concl{font-size:13.5px;line-height:1.55;white-space:normal}
+  .sign{margin-top:28px;display:flex;gap:40px;flex-wrap:wrap} .muted{color:#718096;font-size:11px}
+  @media print{body{margin:10mm}}
+</style></head><body>
+<h1>Электрокардиограмма — заключение</h1>
+<table class="meta">
+  <tr><td><b>Пациент:</b> ${escapeHtml(p.name || "—")}</td><td><b>Возраст:</b> ${p.age !== null ? escapeHtml(p.age) : "—"}</td><td><b>Пол:</b> ${sexTxt}</td><td><b>Дата:</b> ${today}</td></tr>
+  <tr><td colspan="4" class="muted">Источник: ${escapeHtml(state.currentSource || "—")} • ${escapeHtml(dig.layout_label || "")} • ${escapeHtml(dig.paper_speed_mm_s || "")} мм/с, ${escapeHtml(dig.gain_mm_mv || "")} мм/мВ</td></tr>
+</table>
+<h2>Измерения</h2>
+<table>${rows.map(([k, v]) => `<tr><td class="k">${escapeHtml(k)}</td><td>${escapeHtml(v)}</td></tr>`).join("")}</table>
+${img ? `<h2>Запись (оцифрованные отведения)</h2><img src="${img}" alt="ЭКГ">` : ""}
+<h2>Заключение</h2>
+<div class="concl">${escapeHtml(text).replace(/\n/g, "<br>")}</div>
+<div class="sign"><div>Врач: ${escapeHtml(p.doctor || "____________________")}</div><div>Подпись: ____________</div><div>Дата: ${today}</div></div>
+<script>window.onload=function(){window.print();};<\/script>
+</body></html>`;
+    w.document.open();
+    w.document.write(html);
+    w.document.close();
+  }
+
+  function bindReportEvents() {
+    if (el.btnRunAutoAnalysis) el.btnRunAutoAnalysis.addEventListener("click", () => runAutoAnalysis(false));
+    if (el.btnRefreshInterpretation) el.btnRefreshInterpretation.addEventListener("click", () => runAutoAnalysis(true));
+    if (el.txtConclusion) {
+      el.txtConclusion.addEventListener("input", () => {
+        state.report.edited = true;
+        markConclusionState("Текст отредактирован вручную");
+        saveReportDraft();
+      });
+    }
+    if (el.btnRegenerateConclusion) {
+      el.btnRegenerateConclusion.addEventListener("click", () => {
+        if (!state.report.findings.length) {
+          setStatus("Нет находок — сначала выполните автоанализ", "error");
+          return;
+        }
+        if (state.report.edited && !window.confirm("Заменить отредактированный текст заключением из отмеченных находок?")) return;
+        setConclusionText(composeConclusionClient(), false);
+      });
+    }
+    if (el.btnCopyConclusion) {
+      el.btnCopyConclusion.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(el.txtConclusion.value);
+          setStatus("Заключение скопировано в буфер обмена", "ready");
+        } catch (_) {
+          el.txtConclusion.select();
+          setStatus("Выделите текст и скопируйте (Ctrl+C)", "busy");
+        }
+      });
+    }
+    if (el.btnPrintConclusion) el.btnPrintConclusion.addEventListener("click", printConclusion);
+    [el.inpPatientName, el.inpDoctorName].forEach((inp) => inp && inp.addEventListener("input", saveReportDraft));
+    [el.inpPatientAge, el.selectAxisConvention].forEach((inp) => inp && inp.addEventListener("change", scheduleReportRefresh));
+  }
+
   function bindUIEvents() {
+    bindReportEvents();
+    bindSignalEvents();
+    bindCompassEvents();
+    bindAxisCaliperEvents();
     // Calibration pulse disagrees with the entered gain → re-digitize with the gain the pulse shows
     if (el.btnApplyPulseGain) {
       el.btnApplyPulseGain.addEventListener("click", () => {
@@ -5881,6 +7635,7 @@
       el.selectPatientSex.addEventListener("change", () => {
         recomputeGlobalIndicesClient();
         renderHexaxialCompass();
+        scheduleReportRefresh();
       });
     }
 
@@ -5906,17 +7661,25 @@
 
     // Custom file upload (image or PDF)
     el.fileUploadInput.addEventListener("change", (evt) => {
-      const f = evt.target.files && evt.target.files[0];
-      if (f) {
-        handleUploadedImageOrPdf(f);
+      const files = Array.from((evt.target.files || []));
+      if (files.some(isSignalFile)) {
+        loadSignalFiles(files);
+      } else if (files[0]) {
+        handleUploadedImageOrPdf(files[0]);
       }
+      evt.target.value = "";
     });
 
     // Drag and drop image or PDF onto page
     window.addEventListener("dragover", (evt) => evt.preventDefault());
     window.addEventListener("drop", (evt) => {
       evt.preventDefault();
-      const f = evt.dataTransfer && evt.dataTransfer.files && evt.dataTransfer.files[0];
+      const files = Array.from((evt.dataTransfer && evt.dataTransfer.files) || []);
+      if (files.some(isSignalFile)) {
+        loadSignalFiles(files);
+        return;
+      }
+      const f = files[0];
       if (f && (f.type.startsWith("image/") || f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf"))) {
         handleUploadedImageOrPdf(f);
       }
@@ -5928,7 +7691,7 @@
       if (m) el.methodDescription.textContent = m.description;
     });
 
-    el.btnDigitize.addEventListener("click", () => runDigitization());
+    el.btnDigitize.addEventListener("click", () => (state.signal ? loadSignalSegment(state.signal.segment_start_s) : runDigitization()));
 
     // Tabs switching
     document.querySelectorAll(".tab-btn").forEach((btn) => {
@@ -5982,6 +7745,7 @@
         document.querySelectorAll(".mode-btn").forEach((b) => b.classList.remove("active"));
         btn.classList.add("active");
         state.caliperMode = btn.getAttribute("data-mode") || "fiducial";
+        if (state.caliperMode === "rr_compass") ensureCompass();
         recalculateLiveMetricsAndRender();
       });
     });
@@ -6110,6 +7874,7 @@
         const val = parseFloat(inp.value);
         if (!isNaN(val)) {
           state.calipersMs[fd.key] = val;
+          markCaliperEdited(fd.key);
           recalculateLiveMetricsAndRender();
         }
       });
@@ -6140,6 +7905,8 @@
     el.btnPrintReport.addEventListener("click", () => window.print());
 
     window.addEventListener("resize", () => {
+      renderSignalTrend();
+      renderAxisCaliper();
       renderMultiLeadCanvas();
       renderTraceOverlayCanvas();
       renderPhotoCalibrationCanvas();
@@ -6204,6 +7971,13 @@
         visualizations: undefined, // keep JSON compact
       },
       analysis: state.analysis,
+      report: {
+        patient: reportPatient(),
+        conclusion: el.txtConclusion ? el.txtConclusion.value : "",
+        edited_manually: state.report.edited,
+        findings: (state.report.findings || []).map((f) => ({ ...f, included: !!state.report.included[f.code] })),
+        autoanalysis: state.report.summary,
+      },
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8;" });
     const url = URL.createObjectURL(blob);

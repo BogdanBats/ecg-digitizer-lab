@@ -1238,3 +1238,399 @@ body {
     background: #FFFFFF;
   }
 }
+
+/* ===================== Automatic analysis & editable conclusion (caliper workbench) ===================== */
+.auto-report {
+  margin: 12px 14px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface-panel);
+}
+.auto-report-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-hairline);
+  background: var(--surface-subtle);
+}
+.auto-report-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ink-primary);
+}
+.auto-report-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.auto-report-patient {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--ink-secondary);
+  border-bottom: 1px solid var(--border-hairline);
+}
+.auto-report-patient label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.text-input-sm {
+  padding: 4px 6px;
+  font-size: 12px;
+  color: var(--ink-primary);
+  background: #FFFFFF;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  min-width: 0;
+}
+.num-input-xs {
+  width: 64px;
+}
+.auto-report-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  padding: 10px 12px 12px;
+}
+@media (max-width: 900px) {
+  .auto-report-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.findings-title {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink-primary);
+}
+.findings-hint {
+  font-weight: 400;
+  color: var(--ink-muted);
+}
+.findings-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 360px;
+  overflow-y: auto;
+  border: 1px solid var(--border-hairline);
+  border-radius: 4px;
+}
+.findings-empty {
+  padding: 14px;
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+.finding-item {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  gap: 6px 8px;
+  align-items: start;
+  padding: 7px 8px;
+  font-size: 12.5px;
+  border-bottom: 1px solid var(--border-hairline);
+}
+.finding-item:last-child {
+  border-bottom: none;
+}
+.finding-item.excluded .finding-text {
+  color: var(--ink-muted);
+  text-decoration: line-through;
+}
+.finding-sev {
+  padding: 1px 6px;
+  font-size: 10.5px;
+  font-weight: 700;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+.finding-sev.sev-critical { background: var(--status-alert-fg); color: #FFFFFF; }
+.finding-sev.sev-abnormal { background: var(--status-alert-bg); color: var(--status-alert-fg); }
+.finding-sev.sev-borderline { background: var(--status-warn-bg); color: var(--status-warn-fg); }
+.finding-sev.sev-normal { background: var(--status-normal-bg); color: var(--status-normal-fg); }
+.finding-sev.sev-info { background: var(--surface-subtle); color: var(--ink-secondary); }
+.finding-text {
+  color: var(--ink-primary);
+}
+.finding-evidence {
+  grid-column: 3;
+  font-size: 11px;
+  color: var(--ink-muted);
+}
+.finding-leads {
+  grid-column: 3;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.finding-lead-chip {
+  padding: 0 6px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-secondary);
+  background: #FFFFFF;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.conclusion-text {
+  width: 100%;
+  min-height: 220px;
+  padding: 8px 10px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-primary);
+  background: #FFFFFF;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  resize: vertical;
+}
+.conclusion-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+.conclusion-state {
+  flex: 1 1 auto;
+  font-size: 11px;
+  color: var(--status-warn-fg);
+}
+
+/* ---------------- Native digital recording (electrocardiograph / Holter) ---------------- */
+.signal-bar {
+  margin: 10px 20px 0;
+  padding: 8px 12px;
+  background: #F0F7FF;
+  border: 1px solid #BFDBFE;
+  border-radius: 8px;
+}
+.signal-bar[hidden] {
+  display: none;
+}
+.signal-bar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  font-size: 12px;
+}
+.signal-badge {
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #FFFFFF;
+  background: #0F4C81;
+  border-radius: 10px;
+  letter-spacing: 0.02em;
+}
+.signal-info {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-secondary);
+  flex: 1 1 280px;
+  min-width: 0;
+}
+.signal-nav {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.signal-nav .text-input-sm {
+  width: 78px;
+  font-family: var(--font-mono);
+}
+.signal-trend-wrap {
+  margin-top: 6px;
+}
+.signal-trend-wrap[hidden] {
+  display: none;
+}
+#signalTrendCanvas {
+  display: block;
+  width: 100%;
+  height: 92px;
+  background: #FFFFFF;
+  border: 1px solid var(--border-hairline);
+  border-radius: 4px;
+  cursor: crosshair;
+}
+.signal-trend-legend {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--ink-secondary);
+}
+/* Section 1 (photo verification) is irrelevant for a native signal: hidden unless the overview is requested */
+body.signal-mode .workspace-grid {
+  grid-template-columns: 1fr;
+}
+body.signal-mode:not(.show-overview) .panel-visuals {
+  display: none;
+}
+body.signal-mode .panel-visuals .tab-btn:not([data-tab="multilead"]),
+body.signal-mode #calPulseActions {
+  display: none !important;
+}
+body.signal-mode .acq-group.photo-only {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+/* ---------------- RR compass (section 2) ---------------- */
+.mode-btn-compass.active {
+  background: #7C3AED;
+  border-color: #6D28D9;
+  color: #FFFFFF;
+}
+.compass-panel {
+  margin: 8px 14px 4px;
+  padding: 8px 10px;
+  background: #FAF5FF;
+  border: 1px solid #DDD6FE;
+  border-radius: 6px;
+  font-size: 12px;
+}
+.compass-panel[hidden] {
+  display: none;
+}
+.compass-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+}
+.compass-span {
+  font-family: var(--font-mono);
+  color: #6D28D9;
+}
+.compass-hint {
+  margin: 6px 0 4px;
+  color: var(--ink-secondary);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+.compass-seq {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  max-height: 108px;
+  overflow-y: auto;
+  padding: 2px 0;
+}
+.rr-chip {
+  display: inline-block;
+  padding: 1px 5px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.5;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  cursor: default;
+}
+button.rr-chip {
+  cursor: pointer;
+}
+button.rr-chip:hover,
+button.rr-chip.active {
+  outline: 2px solid #7C3AED;
+  outline-offset: 0;
+}
+.rr-N { background: #ECFDF5; color: #0B7A53; border-color: #A7F3D0; }
+.rr-S { background: #FFFBEB; color: #B45309; border-color: #FCD34D; }
+.rr-L { background: #FEF2F2; color: #B91C1C; border-color: #FECACA; }
+.rr-Q { background: #F1F5F9; color: #64748B; border-color: #CBD5E1; }
+.compass-findings {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  line-height: 1.5;
+}
+.compass-findings li.pattern {
+  font-weight: 600;
+  color: #5B21B6;
+}
+
+/* ---------------- Axis caliper (section 5) ---------------- */
+.axis-caliper {
+  margin: 4px 14px 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-hairline);
+}
+.axis-caliper-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+.axis-cal-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+.axcal-btn {
+  padding: 2px 7px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #5B21B6;
+  background: #FFFFFF;
+  border: 1px solid #DDD6FE;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.axcal-btn.active {
+  color: #FFFFFF;
+  background: #7C3AED;
+  border-color: #6D28D9;
+}
+#axisCaliperCanvas {
+  display: block;
+  width: 100%;
+  height: 132px;
+  background: #FFFDFB;
+  border: 1px solid var(--border-hairline);
+  border-radius: 4px;
+  cursor: crosshair;
+}
+.axis-caliper-readout {
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--ink-primary);
+}
+.axis-caliper-readout .ax-main {
+  color: #6D28D9;
+  font-weight: 700;
+}
+
+/* ---------------- Caliper positions in the all-leads matrix (section 6) ---------------- */
+.cal-thumb-cell {
+  min-width: 170px;
+}
+.cal-thumb {
+  display: block;
+  width: 164px;
+  height: 46px;
+}
+.cal-thumb-txt {
+  display: block;
+  font-size: 9.5px;
+  color: var(--ink-secondary);
+  white-space: nowrap;
+}
+.cal-thumb-txt .edited {
+  color: #7C3AED;
+  font-weight: 700;
+}

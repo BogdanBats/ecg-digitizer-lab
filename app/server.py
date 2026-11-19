@@ -7,6 +7,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+import time
+import uuid
+from collections import OrderedDict
 from typing import Any, Dict, List, Literal, Optional
 
 import cv2
@@ -20,12 +24,17 @@ from pydantic import BaseModel
 
 from app.core.digitizer import LAYOUT_DEFINITIONS, SUPPORTED_METHODS, deep_learning_status, digitize_ecg_image
 from app.core.ecg_analysis import analyze_all_leads, compute_intervals_from_calipers
+from app.core.ecg_autoanalysis import NEUROKIT_VERSION, analyze_ecg
+from app.core.ecg_formats import SIGNAL_EXTENSIONS, TARGET_FS, FormatError, Recording, extract_segment, hr_trend, prepare_recording
+from app.core.ecg_interpretation import interpret
 
 logger = logging.getLogger("ecg_workstation")
 
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024  # 40 MB: large phone photos / multi-page PDFs
 MAX_IMAGE_SIDE_PX = 4000  # larger inputs (48 MP photos, 600-dpi scans) are downscaled before the Viterbi tracker
 PDF_RENDER_DPI = 250
+MAX_SIGNAL_UPLOAD_BYTES = 400 * 1024 * 1024  # 24-h Holter recordings (EDF / ISHNE / WFDB)
+SIGNAL_CACHE_SIZE = 2  # parsed recordings kept in memory for segment navigation without re-upload
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 EXAMPLES_DIR = os.path.join(BASE_DIR, "example")
@@ -193,6 +202,8 @@ async def get_workstation_config() -> Dict[str, Any]:
         "methods": methods,
         "layouts": layouts,
         "deep_learning": dl_status,
+        "autoanalysis": {"available": True, "neurokit2": NEUROKIT_VERSION},
+        "signal_formats": {"extensions": list(SIGNAL_EXTENSIONS), "max_upload_mb": MAX_SIGNAL_UPLOAD_BYTES // (1024 * 1024)},
     }
 
 
@@ -328,6 +339,124 @@ async def api_digitize_ecg(
     })
 
 
+# ---------------------------------------------------------------------------------- digital ECG / Holter files
+_signal_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_signal_cache_lock = threading.Lock()
+
+
+def _cache_put(rec: Recording, trend: Optional[Dict[str, Any]], name: str) -> str:
+    rid = uuid.uuid4().hex
+    with _signal_cache_lock:
+        _signal_cache[rid] = {"rec": rec, "trend": trend, "name": name}
+        while len(_signal_cache) > SIGNAL_CACHE_SIZE:
+            _signal_cache.popitem(last=False)
+    return rid
+
+
+def _cache_get(rid: str) -> Optional[Dict[str, Any]]:
+    with _signal_cache_lock:
+        item = _signal_cache.get(rid)
+        if item is not None:
+            _signal_cache.move_to_end(rid)
+        return item
+
+
+def _signal_payload(rid: str, item: Dict[str, Any], start_s: float, dur_s: Optional[float], sex: Optional[str],
+                    t0: float) -> Dict[str, Any]:
+    rec: Recording = item["rec"]
+    seg = extract_segment(rec, start_s, dur_s)
+    analysis = analyze_all_leads(leads_mv=seg["leads_mv"], fs=TARGET_FS, sex=sex if sex in ("male", "female") else None)
+    n_leads = len(seg["leads_mv"])
+    digitization = {
+        "source_type": "signal",
+        "method": "native_signal",
+        "layout": "signal",
+        "layout_label": f"{rec.format}, {n_leads} отв., {rec.fs:g} Гц",
+        "paper_speed_mm_s": 25.0,
+        "gain_mm_mv": 10.0,
+        "sampling_rate_hz": TARGET_FS,
+        "leads_mv": seg["leads_mv"],
+        "overlay_traces": [],
+        "lead_quality": {},
+        "visualizations": {},
+        "warnings": seg["warnings"],
+        "elapsed_sec": round(time.perf_counter() - t0, 2),
+        "signal": {
+            "recording_id": rid,
+            "format": seg["format"],
+            "native_fs": seg["native_fs"],
+            "record_duration_s": seg["record_duration_s"],
+            "segment_start_s": seg["segment_start_s"],
+            "segment_duration_s": seg["segment_duration_s"],
+            "info": seg["info"],
+            "channels": list(rec.leads),
+            "trend": item["trend"],
+        },
+    }
+    return {"source_name": item["name"], "digitization": digitization, "analysis": analysis}
+
+
+@app.post("/api/load_signal")
+async def api_load_signal(
+    files: List[UploadFile] = File(...),
+    segment_start_s: float = Form(default=0.0),
+    segment_duration_s: Optional[float] = Form(default=None),
+    fs_hint: Optional[float] = Form(default=None),
+    patient_sex: Optional[str] = Form(default=None),
+) -> JSONResponse:
+    """Native digital recordings (EDF/BDF, ISHNE, WFDB, GE MUSE XML, HL7 aECG, DICOM, CSV): no image digitization."""
+    t0 = time.perf_counter()
+    blobs: Dict[str, bytes] = {}
+    total = 0
+    for f in files:
+        if not f.filename:
+            continue
+        data = await f.read()
+        total += len(data)
+        if total > MAX_SIGNAL_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"Запись слишком большая (> {MAX_SIGNAL_UPLOAD_BYTES // (1024 * 1024)} МБ)")
+        if data:
+            blobs[f.filename] = data
+    if not blobs:
+        raise HTTPException(status_code=400, detail="Файлы записи пусты")
+    if fs_hint is not None and not (50.0 <= fs_hint <= 20000.0):
+        raise HTTPException(status_code=400, detail="Частота дискретизации должна быть 50–20000 Гц")
+    name = " + ".join(sorted(blobs))
+    try:
+        rec = await run_in_threadpool(prepare_recording, blobs, fs_hint)
+        trend = await run_in_threadpool(hr_trend, rec)
+        rid = _cache_put(rec, trend, name)
+        payload = await run_in_threadpool(_signal_payload, rid, _signal_cache[rid], segment_start_s, segment_duration_s,
+                                          patient_sex, t0)
+    except FormatError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Signal import failed for %s", name)
+        raise HTTPException(status_code=400, detail=f"Не удалось прочитать запись: {type(exc).__name__}: {exc}") from exc
+    return JSONResponse(payload)
+
+
+class SignalSegmentRequest(BaseModel):
+    recording_id: str
+    segment_start_s: float = 0.0
+    segment_duration_s: Optional[float] = None
+    patient_sex: Optional[str] = None
+
+
+@app.post("/api/signal_segment")
+async def api_signal_segment(req: SignalSegmentRequest) -> JSONResponse:
+    """Another window of a cached (Holter) recording: no re-upload of the file."""
+    t0 = time.perf_counter()
+    item = _cache_get(req.recording_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Запись не найдена в памяти сервера — загрузите файл заново")
+    payload = await run_in_threadpool(_signal_payload, req.recording_id, item, req.segment_start_s, req.segment_duration_s,
+                                      req.patient_sex, t0)
+    return JSONResponse(payload)
+
+
 @app.post("/api/recalculate_calipers")
 def api_recalculate_calipers(req: CaliperRecalcRequest) -> JSONResponse:
     if not (50.0 <= req.fs <= 2000.0):
@@ -340,6 +469,68 @@ def api_recalculate_calipers(req: CaliperRecalcRequest) -> JSONResponse:
         rr_ms=req.rr_ms,
     )
     return JSONResponse(metrics)
+
+
+class AutoAnalysisRequest(BaseModel):
+    leads_mv: Dict[str, List[float]]
+    fs: float = 500.0
+    # leads recorded simultaneously (same strip/column), e.g. [["I","II",...,"V6"]] for 12x1, 4 groups for 3x4
+    groups: Optional[List[List[str]]] = None
+    lead_quality: Optional[Dict[str, str]] = None
+    artifacts_ms: Optional[Dict[str, List[List[float]]]] = None
+    # "refresh from the workbench": the physician's R marks and calipers replace the automatic ones
+    calipers_ms: Optional[Dict[str, Dict[str, float]]] = None
+    r_peaks_ms: Optional[Dict[str, List[float]]] = None
+    reference_lead: Optional[str] = None
+    # fiducials the physician moved on the reference lead (only these override the automatic values)
+    reference_edited: Optional[List[str]] = None
+    patient: Optional[Dict[str, Any]] = None
+    options: Optional[Dict[str, Any]] = None
+
+
+def _run_autoanalysis(req: AutoAnalysisRequest) -> Dict[str, Any]:
+    result = analyze_ecg(
+        req.leads_mv,
+        fs=req.fs,
+        groups=req.groups,
+        lead_quality=req.lead_quality,
+        artifacts_ms={k: [tuple(z[:2]) for z in v if len(z) >= 2] for k, v in (req.artifacts_ms or {}).items()},
+        calipers_override=req.calipers_ms,
+        r_peaks_override_ms=req.r_peaks_ms,
+        reference_lead=req.reference_lead,
+        reference_edited=req.reference_edited,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=422, detail=result.get("error", "Автоанализ не выполнен"))
+    interp = interpret(result, patient=req.patient, options=req.options)
+    axis_text = next((f["text"].rstrip(".") for f in interp["findings"] if f["code"] in ("axis", "axis_unknown")), "—")
+    analysis = {
+        "primary_lead": result["primary_lead"],
+        "global_hr_bpm": result["rhythm"]["hr_bpm"],
+        "global_rr_ms": result["intervals"]["rr_ms"],
+        "axes": {**result["axes"], "classification": axis_text},
+        "hypertrophy": {},
+        "leads": result["leads"],
+    }
+    summary = {k: result[k] for k in ("intervals", "rhythm", "axes", "methods", "groups", "simultaneous_leads", "features")}
+    return {"analysis": analysis, "autoanalysis": summary, "interpretation": interp}
+
+
+@app.post("/api/autoanalysis")
+async def api_autoanalysis(req: AutoAnalysisRequest) -> JSONResponse:
+    """Consensus QRS detection + median-beat global delineation + rule-based interpretation (see ecg_autoanalysis)."""
+    if not (50.0 <= req.fs <= 2000.0):
+        raise HTTPException(status_code=400, detail="Частота дискретизации должна быть в диапазоне 50–2000 Гц")
+    if not req.leads_mv:
+        raise HTTPException(status_code=400, detail="Нет сигналов отведений")
+    try:
+        payload = await run_in_threadpool(_run_autoanalysis, req)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Autoanalysis failed")
+        raise HTTPException(status_code=500, detail=f"Ошибка автоанализа: {type(exc).__name__}: {exc}") from exc
+    return JSONResponse(payload)
 
 
 @app.post("/api/reanalyze_leads")
