@@ -201,16 +201,29 @@ body {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  min-width: 0;
+}
+
+.acq-group > .select-input {
+  width: 100%;
+  min-width: 0;
 }
 
 .source-row {
   display: flex;
+  align-items: center;
   gap: 6px;
+  min-width: 0;
 }
 
 .source-row .select-input {
   flex: 1;
   min-width: 0;
+}
+
+.btn-upload {
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .acq-params {
