@@ -10,6 +10,12 @@
   const state = {
     config: null,
     uploadedFile: null,
+    // Original (un-rectified) user upload; `uploadedFile` may later hold a rectified / cleaned derivative of it
+    sourceFile: null,
+    // Monotonic id of the latest digitization request (stale responses are ignored)
+    digitizeRunId: 0,
+    // Per-lead pristine signal + px/mm it was produced at (calibration rescales from it, never cumulatively)
+    calibBase: {},
     uploadedPdfDoc: null,
     uploadedPdfRawFile: null,
     uploadedPdfPage: 1,
@@ -309,9 +315,13 @@
     cfg.methods.forEach((m) => {
       const opt = document.createElement("option");
       opt.value = m.id;
-      opt.textContent = m.name;
+      opt.textContent = m.unavailable ? `${m.name} — недоступно` : m.name;
+      opt.disabled = !!m.unavailable;
       el.selectMethod.appendChild(opt);
     });
+    // Without PyTorch / U-Net weights the backend only runs the classical pipeline: pre-select it
+    const firstAvail = cfg.methods.find((m) => !m.unavailable);
+    if (firstAvail) el.selectMethod.value = firstAvail.id;
 
     // Layouts
     el.selectLayout.innerHTML = "";
@@ -433,16 +443,22 @@
 
     const LAYOUT_GRID = {
       "12x1": { label: "12×1 Стандарт (12 отведений вертикально)", cols: 1, grid: [["I"],["II"],["III"],["aVR"],["aVL"],["aVF"],["V1"],["V2"],["V3"],["V4"],["V5"],["V6"]], rhythm: [] },
-      "3x4_r1": { label: "3×4 + 1 полоса ритма II", cols: 4, grid: [["I","aVR","V1","V4"],["II","aVL","V2","V5"],["III","aVF","V3","V6"]], rhythm: ["II"] },
-      "3x4_r2": { label: "3×4 + 2 полосы ритма (I, II)", cols: 4, grid: [["I","aVR","V1","V4"],["II","aVL","V2","V5"],["III","aVF","V3","V6"]], rhythm: ["I","II"] },
+      "3x4_r1": { label: "3×4 + 1 полоса ритма II", cols: 4, grid: [["I","aVR","V1","V4"],["II","aVL","V2","V5"],["III","aVF","V3","V6"]], rhythm: ["II (ритм)"] },
+      "3x4_r2": { label: "3×4 + 2 полосы ритма (I, II)", cols: 4, grid: [["I","aVR","V1","V4"],["II","aVL","V2","V5"],["III","aVF","V3","V6"]], rhythm: ["I (ритм)","II (ритм)"] },
       "3x4": { label: "3×4 Стандарт", cols: 4, grid: [["I","aVR","V1","V4"],["II","aVL","V2","V5"],["III","aVF","V3","V6"]], rhythm: [] },
       "6x2": { label: "6×2 Стандарт (I–aVF слева, V1–V6 справа)", cols: 2, grid: [["I","V1"],["II","V2"],["III","V3"],["aVR","V4"],["aVL","V5"],["aVF","V6"]], rhythm: [] },
-      "6x2_r1": { label: "6×2 + 1 полоса ритма II", cols: 2, grid: [["I","V1"],["II","V2"],["III","V3"],["aVR","V4"],["aVL","V5"],["aVF","V6"]], rhythm: ["II"] },
+      "6x2_r1": { label: "6×2 + 1 полоса ритма II", cols: 2, grid: [["I","V1"],["II","V2"],["III","V3"],["aVR","V4"],["aVL","V5"],["aVF","V6"]], rhythm: ["II (ритм)"] },
       "6x1_precordial": { label: "6×1 Грудные (V1–V6)", cols: 1, grid: [["V1"],["V2"],["V3"],["V4"],["V5"],["V6"]], rhythm: [] },
       "6x1_limb": { label: "6×1 От конечностей (I–aVF)", cols: 1, grid: [["I"],["II"],["III"],["aVR"],["aVL"],["aVF"]], rhythm: [] },
     };
 
     const chosenLayout = LAYOUT_GRID[layoutSel] ? layoutSel : "12x1";
+    const staticWarnings = [
+      "Статический режим (без Python-сервера): упрощённая браузерная оцифровка; границы P/QRS/T — шаблон от R, проверьте калиперы вручную",
+    ];
+    if (!LAYOUT_GRID[layoutSel]) {
+      staticWarnings.push(`Автоопределение раскладки недоступно в браузере — использована ${chosenLayout}; выберите раскладку вручную`);
+    }
     const lay = LAYOUT_GRID[chosenLayout];
     const nRows = lay.grid.length + lay.rhythm.length;
     const pxPerMm = customPxPerMm && customPxPerMm > 0.5 ? customPxPerMm : Math.max(3.2, Math.min(10.0, W / 210.0));
@@ -521,7 +537,7 @@
       }
 
       const widthMm = lenPx / Math.max(0.5, pxPerMm);
-      const durSec = Math.max(0.6, Math.min(15.0, widthMm / Math.max(5.0, speedMmS)));
+      const durSec = Math.max(0.2, Math.min(60.0, widthMm / Math.max(5.0, speedMmS)));
       const nSamples = Math.max(120, Math.round(durSec * fs));
       const mvRaw = new Float64Array(lenPx);
       for (let i = 0; i < lenPx; i++) {
@@ -595,105 +611,20 @@
     hCtx.putImageData(hImg, 0, 0);
     const heatUrl = heatCanvas.toDataURL("image/jpeg", 0.82);
 
-    // Client-side beat & fiducial analyzer
+    // Client-side beat analyzer (metrics, axes and LVH indices are computed after state is populated,
+    // see recomputeAllLeadMetricsClient() in runDigitization)
     const analysisLeads = {};
-    let primaryLead = leadsMv["II"] ? "II" : Object.keys(leadsMv)[0];
+    const primaryLead = leadsMv["II"] ? "II" : Object.keys(leadsMv)[0];
     Object.keys(leadsMv).forEach((ln) => {
-      const sig = leadsMv[ln];
-      const n = sig.length;
-      const totalMs = (n * 1000.0) / fs;
-      const minDist = Math.round(0.32 * fs);
-      let maxAbs = 0.05;
-      for (let i = 0; i < n; i++) {
-        if (Math.abs(sig[i]) > maxAbs) maxAbs = Math.abs(sig[i]);
-      }
-      const rIdxList = [];
-      for (let i = 10; i < n - 10; i++) {
-        if (Math.abs(sig[i]) >= 0.42 * maxAbs) {
-          let isMax = true;
-          for (let j = Math.max(0, i - 14); j <= Math.min(n - 1, i + 14); j++) {
-            if (Math.abs(sig[j]) > Math.abs(sig[i])) {
-              isMax = false;
-              break;
-            }
-          }
-          if (isMax && (rIdxList.length === 0 || i - rIdxList[rIdxList.length - 1] >= minDist)) {
-            rIdxList.push(i);
-          }
-        }
-      }
-      if (rIdxList.length === 0) rIdxList.push(Math.floor(n * 0.45));
-      const rrList = [];
-      for (let i = 1; i < rIdxList.length; i++) {
-        rrList.push(((rIdxList[i] - rIdxList[i - 1]) * 1000.0) / fs);
-      }
-      const medRR = rrList.length > 0 ? rrList[Math.floor(rrList.length / 2)] : 800;
-      const beats = rIdxList.map((ri, bIdx) => {
-        const rMs = Math.round((ri * 1000.0) / fs);
-        const nextR = bIdx + 1 < rIdxList.length ? Math.round((rIdxList[bIdx + 1] * 1000.0) / fs) : Math.min(totalMs, rMs + medRR);
-        return {
-          r_peak: ri,
-          times_ms: {
-            p_onset: Math.max(0, rMs - 155),
-            p_peak: Math.max(0, rMs - 110),
-            p_offset: Math.max(0, rMs - 65),
-            qrs_onset: Math.max(0, rMs - 40),
-            q_peak: Math.max(0, rMs - 20),
-            r_peak: rMs,
-            s_peak: Math.min(totalMs, rMs + 22),
-            qrs_offset: Math.min(totalMs, rMs + 48),
-            st_60: Math.min(totalMs, rMs + 108),
-            st_80: Math.min(totalMs, rMs + 128),
-            t_onset: Math.min(totalMs, rMs + 110),
-            t_peak: Math.min(totalMs, rMs + 190),
-            t_offset: Math.min(totalMs, rMs + 275),
-            next_r_peak: Math.round(nextR),
-          },
-        };
-      });
-      const rPeaksMs = beats.map((b) => b.times_ms.r_peak);
-      const repBeat = beats[0];
-      analysisLeads[ln] = {
-        r_peaks: rIdxList,
-        r_peaks_ms: rPeaksMs,
-        rr_intervals_ms: rrList,
-        hrv: { median_rr_ms: medRR, sdnn_ms: 0, rmssd_ms: 0 },
-        beats,
-        representative_beat_index: 0,
-        calipers_ms: { ...repBeat.times_ms },
-        metrics: {
-          hr_bpm: 60000.0 / Math.max(250, medRR),
-          rr_ms: medRR,
-          durations_ms: { p_wave: 90, qrs_complex: 88, t_wave: 165, intrinsicoid_vat: 40 },
-          intervals_ms: { pq_pr: 155, qt: 315, qtc_bazett: 352, qtc_fridericia: 339, qtc_framingham: 345, qtc_hodges: 341, jt: 227, jtc_bazett: 264, tp_te: 85, rr: medRR },
-          segments_ms: { pq_pr_segment: 65, st_segment: 62, tp_segment: Math.max(0, medRR - 430) },
-          ratios: { tpte_qt_ratio: 0.27, macruz_index: 1.38 },
-          amplitudes_mv: { isoelectric_mv: 0, p_amp_mv: 0.12, q_amp_mv: -0.05, r_amp_mv: Number(maxAbs.toFixed(2)), s_amp_mv: -0.2, j_point_mv: 0, st_60_mv: 0.02, st_80_mv: 0.04, st_slope_mv_s: 0.5, t_amp_mv: 0.25 },
-        },
-      };
+      analysisLeads[ln] = analyzeLeadClientSide(leadsMv[ln], fs);
     });
-
-    // Compute Frontal Axis (I vs aVF)
-    const ampNet = (ln) => {
-      const s = leadsMv[ln];
-      if (!s || s.length === 0) return 0;
-      let mx = -1e9, mn = 1e9;
-      for (let i = 0; i < s.length; i++) {
-        if (s[i] > mx) mx = s[i];
-        if (s[i] < mn) mn = s[i];
-      }
-      return mx + mn;
-    };
-    const netI = ampNet("I");
-    const netAvf = ampNet("aVF");
-    const qrsAxisDeg = Math.round((Math.atan2(netAvf, netI) * 180) / Math.PI);
-    const axisClass = qrsAxisDeg >= -30 && qrsAxisDeg <= 90 ? "Нормальное положение ЭОС" : qrsAxisDeg < -30 ? "Отклонение ЭОС влево" : "Отклонение ЭОС вправо";
 
     const elapsedSec = Number(((performance.now() - t0) / 1000.0).toFixed(2));
     return {
       source_name: sourceName,
       digitization: {
         method: "client_cv_static",
+        warnings: staticWarnings,
         layout: chosenLayout,
         layout_label: lay.label + " (Static Web)",
         paper_speed_mm_s: speedMmS,
@@ -709,16 +640,16 @@
       analysis: {
         primary_lead: primaryLead,
         global_rr_ms: analysisLeads[primaryLead] ? analysisLeads[primaryLead].hrv.median_rr_ms : 800,
-        global_hr_bpm: analysisLeads[primaryLead] ? analysisLeads[primaryLead].metrics.hr_bpm : 75,
-        electrical_axis: { qrs_axis_deg: qrsAxisDeg, p_axis_deg: 45, t_axis_deg: 38, qrs_t_angle_deg: Math.abs(qrsAxisDeg - 38), classification: axisClass },
-        hypertrophy_indices: { sokolow_lyon_mv: null, cornell_mv: null, sokolow_positive: false },
-        clinical_flags: ["Режим статического сайта (Firebase Hosting): оцифровка выполнена встроенным браузерным CV-движком."],
+        global_hr_bpm: analysisLeads[primaryLead] ? Math.round(60000.0 / Math.max(250, analysisLeads[primaryLead].hrv.median_rr_ms)) : 75,
+        axes: {},
+        hypertrophy: {},
         leads: analysisLeads,
       },
     };
   }
 
   async function runDigitization(customPxPerMm = null) {
+    const runId = ++state.digitizeRunId;
     try {
       el.btnDigitize.disabled = true;
       el.btnDigitizeText.textContent = state.staticMode ? "Оцифровка (Web CV)..." : "Оцифровка U-Net...";
@@ -758,11 +689,17 @@
         }
         data = await res.json();
       }
+      // A newer digitization (another example / page / upload) was started meanwhile: drop this stale result
+      if (runId !== state.digitizeRunId) return;
       state.currentSource = data.source_name;
       state.digitization = data.digitization;
       state.analysis = data.analysis;
       state.artifactsByLead = {};
       state.originalBeatsByLead = {};
+      if (state.staticMode) {
+        // No backend: measure every lead on its own signal, then derive axes / Sokolow / Cornell
+        recomputeAllLeadMetricsClient(false);
+      }
       if (state.analysis && state.analysis.leads) {
         Object.keys(state.analysis.leads).forEach((ln) => {
           state.artifactsByLead[ln] = [];
@@ -813,6 +750,12 @@
         state.autoPxPerMm = detPxPerMm;
       }
       state.activePxPerMm = detPxPerMm;
+      // Pristine per-lead signals at the px/mm they were digitized with: manual re-calibration always
+      // resamples from these (no cumulative interpolation drift after repeated +/- clicks)
+      state.calibBase = {};
+      Object.keys(state.digitization.leads_mv || {}).forEach((ln) => {
+        state.calibBase[ln] = { sig: state.digitization.leads_mv[ln].slice(), pxPerMm: detPxPerMm };
+      });
       state.calRulerA = null;
       state.calRulerB = null;
       state.calRulerHover = null;
@@ -835,13 +778,21 @@
       renderHexaxialCompass();
       renderAllLeadsTable();
 
-      setStatus(`Оцифровано (${availLeads.length} отв., ${state.digitization.elapsed_sec} с)`, "ready");
+      const warns = state.digitization.warnings || [];
+      if (warns.length > 0) {
+        setStatus(`Оцифровано с предупреждениями (${availLeads.length} отв.): ${warns[0]}`, "busy");
+      } else {
+        setStatus(`Оцифровано (${availLeads.length} отв., ${state.digitization.elapsed_sec} с)`, "ready");
+      }
     } catch (err) {
+      if (runId !== state.digitizeRunId) return;
       console.error("Digitization failed:", err);
       setStatus(`Ошибка: ${err.message}`, "error");
     } finally {
-      el.btnDigitize.disabled = false;
-      el.btnDigitizeText.textContent = "Оцифровать ЭКГ";
+      if (runId === state.digitizeRunId) {
+        el.btnDigitize.disabled = false;
+        el.btnDigitizeText.textContent = "Оцифровать ЭКГ";
+      }
     }
   }
 
@@ -853,7 +804,8 @@
     el.digitizationMetaLine.textContent =
       `Источник: ${state.currentSource || "—"} • Раскладка: ${state.digitization.layout_label} • ` +
       `Калибровка сетки: ${pxMm.toFixed(2)} пикс/мм (1 клетка 5мм = ${(pxMm * 5).toFixed(1)} пикс, угол ${skew}°) • ` +
-      `Скорость: ${state.digitization.paper_speed_mm_s} мм/с • Время: ${state.digitization.elapsed_sec} с`;
+      `Скорость: ${state.digitization.paper_speed_mm_s} мм/с • Время: ${state.digitization.elapsed_sec} с` +
+      ((state.digitization.warnings || []).length ? ` • ⚠ ${state.digitization.warnings.join(" • ⚠ ")}` : "");
   }
 
   // Interactive Photo & Grid Calibration Overlay Renderer (#calGridCanvas over #imgAligned)
@@ -1078,54 +1030,84 @@
       const fs = state.digitization.sampling_rate_hz || 500;
       const leadsMap = state.digitization.leads_mv;
 
-      // Rescale each lead's voltage (mV) and duration (number of samples at 500 Hz)
-      Object.keys(leadsMap).forEach((ln) => {
-        const oldSig = leadsMap[ln] || [];
-        if (oldSig.length < 4) return;
-        const newLen = Math.max(60, Math.min(25000, Math.round(oldSig.length * ratio)));
+      // Rescale each lead's voltage (mV) and duration (number of samples at 500 Hz).
+      // Resample from the pristine per-lead signal (`state.calibBase`) with the TOTAL ratio, so repeated
+      // +/- 0.05 clicks never accumulate interpolation smoothing / rounding drift.
+      const resampleScaled = (srcSig, r) => {
+        const newLen = Math.max(60, Math.min(30000, Math.round(srcSig.length * r)));
         const newSig = new Array(newLen);
         for (let i = 0; i < newLen; i++) {
-          const pos = (i / Math.max(1, newLen - 1)) * (oldSig.length - 1);
+          const pos = (i / Math.max(1, newLen - 1)) * (srcSig.length - 1);
           const i0 = Math.floor(pos);
-          const i1 = Math.min(oldSig.length - 1, i0 + 1);
+          const i1 = Math.min(srcSig.length - 1, i0 + 1);
           const frac = pos - i0;
-          const vOld = oldSig[i0] * (1 - frac) + oldSig[i1] * frac;
-          newSig[i] = Number((vOld * ratio).toFixed(4));
+          const vOld = srcSig[i0] * (1 - frac) + srcSig[i1] * frac;
+          newSig[i] = Number((vOld * r).toFixed(4));
         }
-        leadsMap[ln] = newSig;
+        return newSig;
+      };
+      Object.keys(leadsMap).forEach((ln) => {
+        const base = state.calibBase && state.calibBase[ln];
+        if (base && base.sig && base.sig.length >= 4 && base.pxPerMm > 0) {
+          leadsMap[ln] = resampleScaled(base.sig, base.pxPerMm / cleanPxMm);
+        } else {
+          const oldSig = leadsMap[ln] || [];
+          if (oldSig.length < 4) return;
+          leadsMap[ln] = resampleScaled(oldSig, ratio);
+        }
       });
+
+      // Rescale fiducial timestamps (0.1 ms precision, no integer-ms rounding drift) of one lead analysis
+      const scaleMs = (v) => Math.round(v * ratio * 10) / 10;
+      const rescaleLeadTimes = (lAna) => {
+        if (!lAna) return;
+        (lAna.beats || []).forEach((b) => {
+          if (b.times_ms) {
+            Object.keys(b.times_ms).forEach((k) => {
+              b.times_ms[k] = scaleMs(b.times_ms[k]);
+            });
+            b.r_peak = Math.round((b.times_ms.r_peak * fs) / 1000.0);
+          }
+        });
+        if (lAna.calipers_ms) {
+          Object.keys(lAna.calipers_ms).forEach((k) => {
+            lAna.calipers_ms[k] = scaleMs(lAna.calipers_ms[k]);
+          });
+        }
+        if (Array.isArray(lAna.r_peaks_ms)) lAna.r_peaks_ms = lAna.r_peaks_ms.map(scaleMs);
+        if (Array.isArray(lAna.r_peaks_ms)) lAna.r_peaks = lAna.r_peaks_ms.map((ms) => Math.round((ms * fs) / 1000.0));
+        if (Array.isArray(lAna.rr_intervals_ms)) lAna.rr_intervals_ms = lAna.rr_intervals_ms.map(scaleMs);
+        if (lAna.hrv) {
+          ["median_rr_ms", "sdnn_ms", "rmssd_ms"].forEach((k) => {
+            if (typeof lAna.hrv[k] === "number") lAna.hrv[k] = scaleMs(lAna.hrv[k]);
+          });
+        }
+      };
 
       // Rescale all fiducial beat timestamps and R-peaks across all leads
       if (state.analysis && state.analysis.leads) {
         Object.keys(state.analysis.leads).forEach((ln) => {
           const lAna = state.analysis.leads[ln];
           if (!lAna) return;
-          if (lAna.beats) {
-            lAna.beats.forEach((b) => {
-              if (b.times_ms) {
-                Object.keys(b.times_ms).forEach((k) => {
-                  b.times_ms[k] = Math.round(b.times_ms[k] * ratio);
-                });
-                b.r_peak = Math.round((b.times_ms.r_peak * fs) / 1000.0);
-              }
-            });
-          }
+          rescaleLeadTimes(lAna);
           if (state.artifactsByLead && state.artifactsByLead[ln]) {
             state.artifactsByLead[ln].forEach((z) => {
-              z.startMs = Math.round(z.startMs * ratio);
-              z.endMs = Math.round(z.endMs * ratio);
+              z.startMs = scaleMs(z.startMs);
+              z.endMs = scaleMs(z.endMs);
             });
           }
           syncLeadRArrayFromBeats(ln);
         });
       }
+      // Keep the "reset auto R-marks" backup on the SAME time scale as the live data
+      Object.keys(state.originalBeatsByLead || {}).forEach((ln) => rescaleLeadTimes(state.originalBeatsByLead[ln]));
 
       // Rescale active caliper positions
       Object.keys(state.calipersMs).forEach((k) => {
-        state.calipersMs[k] = Math.round(state.calipersMs[k] * ratio);
+        state.calipersMs[k] = scaleMs(state.calipersMs[k]);
       });
-      state.freeCalipers.t1_ms = Math.round(state.freeCalipers.t1_ms * ratio);
-      state.freeCalipers.t2_ms = Math.round(state.freeCalipers.t2_ms * ratio);
+      state.freeCalipers.t1_ms = scaleMs(state.freeCalipers.t1_ms);
+      state.freeCalipers.t2_ms = scaleMs(state.freeCalipers.t2_ms);
       state.freeCalipers.v1_mv = Number((state.freeCalipers.v1_mv * ratio).toFixed(3));
       state.freeCalipers.v2_mv = Number((state.freeCalipers.v2_mv * ratio).toFixed(3));
 
@@ -1134,6 +1116,9 @@
       state.digitization.pixel_spacing.px_per_mm = cleanPxMm;
       state.digitization.pixel_spacing.px_per_mm_x = cleanPxMm;
       state.digitization.pixel_spacing.px_per_mm_y = cleanPxMm;
+
+      // Durations & amplitudes of ALL leads (not only the active one) + axes / LVH indices / global HR
+      recomputeAllLeadMetricsClient(true);
     }
 
     updateDigitizationMetaBanner();
@@ -1319,7 +1304,15 @@
       state.selectedTraceIdx = Math.max(0, Math.min(state.selectedTraceIdx, traces.length - 1));
       el.selectOverlayTraceIdx.value = String(state.selectedTraceIdx);
       if (el.selectOverlayLeadRename) {
-        el.selectOverlayLeadRename.value = traces[state.selectedTraceIdx].lead;
+        const curName = traces[state.selectedTraceIdx].lead;
+        // Non-standard names (e.g. rhythm strips "II (ритм)") must exist as options, otherwise the select is blank
+        if (!Array.from(el.selectOverlayLeadRename.options).some((o) => o.value === curName)) {
+          const opt = document.createElement("option");
+          opt.value = curName;
+          opt.textContent = curName;
+          el.selectOverlayLeadRename.appendChild(opt);
+        }
+        el.selectOverlayLeadRename.value = curName;
       }
     }
   }
@@ -1482,7 +1475,7 @@
     const baseY = tr.baseline_y_px !== undefined ? tr.baseline_y_px : pts[0][1];
     const invertSign = String(tr.lead).startsWith("-");
     const spanPx = Math.max(10, pts[pts.length - 1][0] - pts[0][0]);
-    const durSec = Math.max(0.5, Math.min(15.0, (spanPx / Math.max(0.5, pxPerMmX)) / Math.max(5.0, speed)));
+    const durSec = Math.max(0.2, Math.min(60.0, (spanPx / Math.max(0.5, pxPerMmX)) / Math.max(5.0, speed)));
     const numSamples = Math.max(100, Math.round(durSec * fs));
 
     const mvRaw = new Float64Array(pts.length);
@@ -1504,25 +1497,53 @@
 
     state.digitization.leads_mv[tr.lead] = mvResampled;
     const cleanName = String(tr.lead).replace(/^-/, "");
+    const editedLeads = { [tr.lead]: mvResampled };
     if (invertSign && cleanName !== tr.lead) {
       state.digitization.leads_mv[cleanName] = mvResampled.map((v) => Number((-v).toFixed(4)));
+      editedLeads[cleanName] = state.digitization.leads_mv[cleanName];
     }
+    // The edited signal was produced at the CURRENT px/mm: it becomes this lead's new calibration base
+    Object.keys(editedLeads).forEach((ln) => {
+      state.calibBase[ln] = { sig: editedLeads[ln].slice(), pxPerMm: state.activePxPerMm || pxPerMmX };
+    });
 
-    if (reanalyzeBackend && !state.staticMode) {
-      try {
-        const res = await fetch("/api/reanalyze_leads", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            leads_mv: state.digitization.leads_mv,
-            fs,
-            preferred_lead: tr.lead,
-          }),
+    if (reanalyzeBackend) {
+      // Re-analyze ONLY the edited lead(s) and merge them: manual R-peak / caliper / artifact work on all
+      // other leads is preserved. A sequence number drops out-of-order responses from quick successive edits.
+      const seq = (state.reanalyzeSeq = (state.reanalyzeSeq || 0) + 1);
+      let newLeadsAna = null;
+      if (state.staticMode) {
+        newLeadsAna = {};
+        Object.keys(editedLeads).forEach((ln) => {
+          newLeadsAna[ln] = analyzeLeadClientSide(editedLeads[ln], fs);
         });
-        if (res.ok) {
-          state.analysis = await res.json();
+      } else {
+        try {
+          const res = await fetch("/api/reanalyze_leads", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ leads_mv: editedLeads, fs, preferred_lead: tr.lead }),
+          });
+          if (res.ok) newLeadsAna = (await res.json()).leads || null;
+        } catch (err) {
+          console.warn("Re-analysis of edited lead failed:", err);
         }
-      } catch (_) {}
+      }
+      if (seq !== state.reanalyzeSeq) return;
+      if (newLeadsAna && state.analysis) {
+        if (!state.analysis.leads) state.analysis.leads = {};
+        Object.keys(newLeadsAna).forEach((ln) => {
+          state.analysis.leads[ln] = newLeadsAna[ln];
+          state.originalBeatsByLead[ln] = JSON.parse(JSON.stringify(newLeadsAna[ln]));
+          if (!state.artifactsByLead[ln]) state.artifactsByLead[ln] = [];
+          if (state.staticMode) {
+            const lAna = state.analysis.leads[ln];
+            const m = computeLeadMetricsClient(ln, lAna.beats[lAna.representative_beat_index].times_ms);
+            if (m) lAna.metrics = m;
+          }
+        });
+        recomputeGlobalIndicesClient();
+      }
     }
 
     buildLeadPills(Object.keys(state.digitization.leads_mv));
@@ -1742,6 +1763,30 @@
     });
     state.digitization.leads_mv = orderedMap;
 
+    // Move / swap every per-lead store together with the signal, so beats, artifact zones, the
+    // "reset auto R-marks" backup and the calibration base keep following the renamed trace.
+    const migrateKey = (store) => {
+      if (!store) return;
+      const a = store[oldName];
+      const b = store[newLeadName];
+      if (otherIdx >= 0) {
+        if (b !== undefined) store[oldName] = b;
+        else delete store[oldName];
+      } else {
+        delete store[oldName];
+      }
+      if (a !== undefined) store[newLeadName] = a;
+      else delete store[newLeadName];
+    };
+    migrateKey(state.analysis && state.analysis.leads);
+    migrateKey(state.artifactsByLead);
+    migrateKey(state.originalBeatsByLead);
+    migrateKey(state.calibBase);
+    // Keep the "reset line" backup aligned with the new names too (it is indexed by trace position)
+    if (state.originalOverlayTraces[traceIdx]) state.originalOverlayTraces[traceIdx].lead = newLeadName;
+    if (otherIdx >= 0 && state.originalOverlayTraces[otherIdx]) state.originalOverlayTraces[otherIdx].lead = oldName;
+    if (state.analysis && state.analysis.primary_lead === oldName) state.analysis.primary_lead = newLeadName;
+
     populateOverlayTraceDropdown();
     renderTraceOverlayCanvas();
     await syncTraceToDigitalLead(traceIdx, true);
@@ -1911,7 +1956,10 @@
         const orig = state.originalOverlayTraces && state.originalOverlayTraces[state.selectedTraceIdx];
         const traces = state.digitization && state.digitization.overlay_traces;
         if (orig && traces && traces[state.selectedTraceIdx]) {
-          traces[state.selectedTraceIdx] = JSON.parse(JSON.stringify(orig));
+          // Restore the original LINE but keep the current (possibly corrected) lead name,
+          // otherwise the old name would be re-created as a duplicate lead
+          const currentName = traces[state.selectedTraceIdx].lead;
+          traces[state.selectedTraceIdx] = { ...JSON.parse(JSON.stringify(orig)), lead: currentName };
           populateOverlayTraceDropdown();
           renderTraceOverlayCanvas();
           syncTraceToDigitalLead(state.selectedTraceIdx, true);
@@ -2614,7 +2662,13 @@
     }
     if (el.btnResetGridRectify) {
       el.btnResetGridRectify.addEventListener("click", () => {
-        state.uploadedFile = null;
+        // Restore the ORIGINAL source (user upload or PDF page) instead of silently falling back to the example list
+        state.uploadedFile = state.sourceFile || null;
+        if (el.exampleDescription) {
+          el.exampleDescription.textContent = state.sourceFile
+            ? `Восстановлен исходный файл: ${state.sourceFile.name}`
+            : "Восстановлено исходное изображение примера";
+        }
         runDigitization(null);
       });
     }
@@ -2820,12 +2874,16 @@
     }
   }
 
+  // Moves one R peak (with its whole P-QRS-T) and returns the beat's NEW index after chronological re-sorting,
+  // so drag handlers can keep following the same beat when it is dragged past a neighbouring R.
   function moveRPeak(leadName, beatIdx, newRMs) {
     const leadAna = state.analysis && state.analysis.leads && state.analysis.leads[leadName];
-    if (!leadAna || !leadAna.beats || !leadAna.beats[beatIdx]) return;
+    if (!leadAna || !leadAna.beats || !leadAna.beats[beatIdx]) return -1;
     const totalMs = getLeadTotalMs(leadName);
     const clampedMs = Math.max(5, Math.min(totalMs - 5, Math.round(newRMs)));
     const beat = leadAna.beats[beatIdx];
+    // Remember which beat is active so dragging R_+1 (the NEXT beat) never switches the active beat
+    const activeBeatObj = leadName === state.activeLead ? leadAna.beats[state.activeBeatIdx] : null;
     const oldMs = beat.times_ms.r_peak;
     const delta = clampedMs - oldMs;
 
@@ -2840,13 +2898,16 @@
     syncLeadRArrayFromBeats(leadName);
     const newIdx = leadAna.beats.indexOf(beat);
     if (leadName === state.activeLead) {
-      if (newIdx >= 0) state.activeBeatIdx = newIdx;
+      const activeIdx = activeBeatObj ? leadAna.beats.indexOf(activeBeatObj) : -1;
+      if (activeIdx >= 0) state.activeBeatIdx = activeIdx;
+      else if (newIdx >= 0) state.activeBeatIdx = newIdx;
       populateBeatDropdown(leadName);
       loadBeatCalipers(leadName, state.activeBeatIdx);
     } else {
       renderMultiLeadCanvas();
       renderAllLeadsTable();
     }
+    return newIdx;
   }
 
   function addRPeak(leadName, clickMs) {
@@ -3076,12 +3137,18 @@
     });
   }
 
-  // Client-side 60fps real-time clinical interval & amplitude math engine
+  // Client-side 60fps real-time clinical interval & amplitude math engine (active lead + active calipers)
   function computeLiveMetricsClient() {
     if (!state.digitization) return null;
-    const sig = state.digitization.leads_mv[state.activeLead] || [];
+    return computeLeadMetricsClient(state.activeLead, state.calipersMs);
+  }
+
+  // Same math for ANY lead and any set of fiducial times (ms) — used for non-active leads, static mode,
+  // and after re-calibration so every lead in the summary table is computed the same way.
+  function computeLeadMetricsClient(leadName, c) {
+    if (!state.digitization || !c) return null;
+    const sig = state.digitization.leads_mv[leadName] || [];
     const fs = state.digitization.sampling_rate_hz || 500;
-    const c = state.calipersMs;
 
     const p_on = c.p_onset;
     const p_pk = c.p_peak;
@@ -3094,8 +3161,8 @@
     const t_off = c.t_offset;
     const next_r = c.next_r_peak;
 
-    const cleanStats = getCleanLeadRRStats(state.activeLead);
-    const currentIntervalIsArtifact = isIntervalInArtifact(state.activeLead, r_pk, next_r) || isTimeInArtifact(state.activeLead, r_pk);
+    const cleanStats = getCleanLeadRRStats(leadName);
+    const currentIntervalIsArtifact = isIntervalInArtifact(leadName, r_pk, next_r) || isTimeInArtifact(leadName, r_pk);
 
     let rr_ms =
       !currentIntervalIsArtifact && next_r > r_pk + 200
@@ -3133,16 +3200,16 @@
       return sig[idx] || 0;
     };
 
-    // Isoelectric level: median of 25ms before qrs_on
+    // Isoelectric level: MEDIAN of the 25 ms PR segment before qrs_on (same estimator as the Python backend,
+    // robust to a sample of the QRS upstroke leaking into the window)
     const idxQrsOn = Math.max(0, Math.min(n - 1, Math.round((qrs_on * fs) / 1000.0)));
     const idxIsoLo = Math.max(0, idxQrsOn - Math.round(0.025 * fs));
-    let isoSum = 0;
-    let isoCnt = 0;
-    for (let i = idxIsoLo; i <= idxQrsOn && i < n; i++) {
-      isoSum += sig[i];
-      isoCnt++;
-    }
-    const iso_mv = isoCnt > 0 ? isoSum / isoCnt : 0;
+    const isoVals = [];
+    for (let i = idxIsoLo; i <= idxQrsOn && i < n; i++) isoVals.push(sig[i]);
+    isoVals.sort((a, b) => a - b);
+    const iso_mv = isoVals.length > 0
+      ? (isoVals.length % 2 ? isoVals[(isoVals.length - 1) / 2] : 0.5 * (isoVals[isoVals.length / 2 - 1] + isoVals[isoVals.length / 2]))
+      : 0;
 
     // QRS min/max
     const idxQrsOff = Math.max(idxQrsOn, Math.min(n - 1, Math.round((qrs_off * fs) / 1000.0)));
@@ -3190,6 +3257,9 @@
         q_amp_mv: q_amp,
         r_amp_mv: r_amp,
         s_amp_mv: s_amp,
+        // Net QRS area proxy (R + deepest negative deflection), as used by the backend for the electrical axis
+        qrs_net_mv: r_amp + Math.min(q_amp, s_amp),
+        qrs_p2p_mv: r_amp - Math.min(q_amp, s_amp),
         j_point_mv: j_mv,
         st_60_mv: st60_mv,
         st_80_mv: st80_mv,
@@ -3214,6 +3284,9 @@
         ...leadAna.metrics,
         ...live,
       };
+      // Axis / Sokolow / Cornell depend on per-lead amplitudes: keep them in sync with caliper & R edits
+      recomputeGlobalIndicesClient();
+      renderHexaxialCompass();
     }
 
     updateRAndArtifactStatusBar();
@@ -3222,6 +3295,179 @@
     renderQtcAndAmplitudes(live);
     renderFreeCaliperBanner();
     renderVectorcardiogram();
+  }
+
+  // Recomputes metrics of EVERY lead from its own representative beat (not only the active one).
+  // Needed after re-calibration (all amplitudes/durations change) and in static mode (no backend).
+  function recomputeAllLeadMetricsClient(useActiveCalipers = true) {
+    if (!state.analysis || !state.analysis.leads || !state.digitization) return;
+    Object.keys(state.analysis.leads).forEach((ln) => {
+      const lAna = state.analysis.leads[ln];
+      if (!lAna || !state.digitization.leads_mv[ln]) return;
+      const isActive = useActiveCalipers && ln === state.activeLead;
+      const bIdx = isActive ? state.activeBeatIdx : Math.min(lAna.representative_beat_index || 0, Math.max(0, (lAna.beats || []).length - 1));
+      const tms = isActive ? state.calipersMs : ((lAna.beats && lAna.beats[bIdx] && lAna.beats[bIdx].times_ms) || lAna.calipers_ms);
+      const m = computeLeadMetricsClient(ln, tms);
+      if (m) lAna.metrics = { ...(lAna.metrics || {}), ...m };
+    });
+    recomputeGlobalIndicesClient();
+  }
+
+  // Client-side mirror of `analyze_all_leads` global block (ecg_analysis.py): hexaxial P/QRS/T axes,
+  // QRS–T angle, Sokolow–Lyon and Cornell indices, consensus RR / HR.
+  function recomputeGlobalIndicesClient() {
+    if (!state.analysis || !state.analysis.leads) return;
+    const leads = state.analysis.leads;
+    const amp = (ln) => (leads[ln] && leads[ln].metrics && leads[ln].metrics.amplitudes_mv) || null;
+
+    const hexaxial = (key) => {
+      const aI = amp("I");
+      if (!aI || aI[key] === undefined) return null;
+      const vI = aI[key];
+      const aAvf = amp("aVF");
+      const aII = amp("II");
+      let y = null;
+      // Goldberger aVF = (√3/2)·|E|·sin α, lead I = |E|·cos α  →  tan α = (2/√3)·aVF / I
+      if (aAvf && aAvf[key] !== undefined) y = (2.0 / Math.sqrt(3.0)) * aAvf[key];
+      else if (aII && aII[key] !== undefined) y = (2.0 * aII[key] - vI) / Math.sqrt(3.0);
+      if (y === null || Math.abs(vI) + Math.abs(y) <= 1e-4) return null;
+      return Math.round(((Math.atan2(y, vI) * 180.0) / Math.PI) * 10) / 10;
+    };
+
+    const qrsAxis = hexaxial("qrs_net_mv");
+    const pAxis = hexaxial("p_amp_mv");
+    const tAxis = hexaxial("t_amp_mv");
+    let qrsT = null;
+    if (qrsAxis !== null && tAxis !== null) {
+      const d = Math.abs(qrsAxis - tAxis) % 360;
+      qrsT = Math.round((d > 180 ? 360 - d : d) * 10) / 10;
+    }
+    let cls = "Не определяется (нет отведений от конечностей)";
+    if (qrsAxis !== null) {
+      const sgn = `${qrsAxis >= 0 ? "+" : ""}${qrsAxis.toFixed(0)}°`;
+      if (qrsAxis >= 0 && qrsAxis <= 70) cls = `Нормальное положение ЭОС (${sgn})`;
+      else if (qrsAxis >= -30 && qrsAxis < 0) cls = `Горизонтальное положение ЭОС (${sgn})`;
+      else if (qrsAxis > 70 && qrsAxis <= 90) cls = `Вертикальное положение ЭОС (${sgn})`;
+      else if (qrsAxis >= -90 && qrsAxis < -30) cls = `Отклонение ЭОС влево (${sgn})`;
+      else if (qrsAxis > 90 && qrsAxis <= 180) cls = `Отклонение ЭОС вправо (${sgn})`;
+      else cls = `Резкое отклонение ЭОС (северо-западная ось, ${sgn})`;
+    }
+    state.analysis.axes = { qrs_axis_deg: qrsAxis, p_axis_deg: pAxis, t_axis_deg: tAxis, qrs_t_angle_deg: qrsT, classification: cls };
+
+    const hyp = {};
+    // Wave height / depth only: a QS complex has R = 0 (not a negative R that would subtract from the index)
+    const rH = (a) => (a ? Math.max(0, a.r_amp_mv || 0) : 0);
+    const sD = (a) => (a ? Math.max(0, -(a.s_amp_mv || 0)) : 0);
+    const aV1 = amp("V1");
+    const aV5 = amp("V5");
+    const aV6 = amp("V6");
+    if (aV1 && (aV5 || aV6)) {
+      const sok = sD(aV1) + Math.max(rH(aV5), rH(aV6));
+      hyp.sokolow_lyon_mv = Math.round(sok * 100) / 100;
+      hyp.sokolow_lyon_mm = Math.round(sok * 100) / 10;
+      hyp.sokolow_lyon_lvh = sok >= 3.5;
+    }
+    const aAvl = amp("aVL");
+    const aV3 = amp("V3");
+    if (aAvl && aV3) {
+      const corn = rH(aAvl) + sD(aV3);
+      hyp.cornell_mv = Math.round(corn * 100) / 100;
+      hyp.cornell_mm = Math.round(corn * 100) / 10;
+      hyp.cornell_lvh = corn >= 2.8;
+    }
+    state.analysis.hypertrophy = hyp;
+
+    const rrs = Object.values(leads)
+      .map((l) => l && l.hrv && l.hrv.median_rr_ms)
+      .filter((v) => v >= 300 && v <= 2000)
+      .sort((a, b) => a - b);
+    if (rrs.length > 0) {
+      const mid = Math.floor(rrs.length / 2);
+      const rr = rrs.length % 2 ? rrs[mid] : 0.5 * (rrs[mid - 1] + rrs[mid]);
+      state.analysis.global_rr_ms = Math.round(rr * 10) / 10;
+      state.analysis.global_hr_bpm = Math.round((60000.0 / Math.max(250, rr)) * 10) / 10;
+    }
+  }
+
+  // Lightweight browser R-peak detector + template fiducials (static Firebase mode / static re-analysis).
+  // NOTE: P/QRS/T boundaries are fixed offsets from R (a template, not a delineation) — the user must
+  // verify them with the calipers; amplitudes are then measured on the real signal.
+  function analyzeLeadClientSide(sig, fs) {
+    const n = sig.length;
+    const totalMs = (n * 1000.0) / fs;
+    const minDist = Math.round(0.32 * fs);
+    let maxAbs = 0.05;
+    for (let i = 0; i < n; i++) {
+      if (Math.abs(sig[i]) > maxAbs) maxAbs = Math.abs(sig[i]);
+    }
+    const rIdxList = [];
+    for (let i = 10; i < n - 10; i++) {
+      if (Math.abs(sig[i]) >= 0.42 * maxAbs) {
+        let isMax = true;
+        for (let j = Math.max(0, i - 14); j <= Math.min(n - 1, i + 14); j++) {
+          if (Math.abs(sig[j]) > Math.abs(sig[i])) {
+            isMax = false;
+            break;
+          }
+        }
+        if (isMax && (rIdxList.length === 0 || i - rIdxList[rIdxList.length - 1] >= minDist)) {
+          rIdxList.push(i);
+        }
+      }
+    }
+    if (rIdxList.length === 0) rIdxList.push(Math.floor(n * 0.45));
+    const rrList = [];
+    for (let i = 1; i < rIdxList.length; i++) {
+      rrList.push(((rIdxList[i] - rIdxList[i - 1]) * 1000.0) / fs);
+    }
+    const rrSorted = [...rrList].sort((a, b) => a - b);
+    const medRR = rrSorted.length > 0 ? rrSorted[Math.floor(rrSorted.length / 2)] : 800;
+    const beats = rIdxList.map((ri, bIdx) => {
+      const rMs = Math.round((ri * 1000.0) / fs);
+      const nextR = bIdx + 1 < rIdxList.length ? Math.round((rIdxList[bIdx + 1] * 1000.0) / fs) : Math.min(totalMs, rMs + medRR);
+      return {
+        r_peak: ri,
+        times_ms: {
+          p_onset: Math.max(0, rMs - 155),
+          p_peak: Math.max(0, rMs - 110),
+          p_offset: Math.max(0, rMs - 65),
+          qrs_onset: Math.max(0, rMs - 40),
+          q_peak: Math.max(0, rMs - 20),
+          r_peak: rMs,
+          s_peak: Math.min(totalMs, rMs + 22),
+          qrs_offset: Math.min(totalMs, rMs + 48),
+          st_60: Math.min(totalMs, rMs + 108),
+          st_80: Math.min(totalMs, rMs + 128),
+          t_onset: Math.min(totalMs, rMs + 110),
+          t_peak: Math.min(totalMs, rMs + 190),
+          t_offset: Math.min(totalMs, rMs + 275),
+          next_r_peak: Math.round(nextR),
+        },
+      };
+    });
+    // Representative beat: a middle one (edge beats are often truncated), as on the backend
+    const repIdx = beats.length >= 3 ? Math.floor(beats.length / 2) : 0;
+    let sdnn = 0;
+    let rmssd = 0;
+    if (rrList.length >= 2) {
+      const mean = rrList.reduce((a, b) => a + b, 0) / rrList.length;
+      sdnn = Math.sqrt(rrList.reduce((a, b) => a + (b - mean) ** 2, 0) / rrList.length);
+    }
+    if (rrList.length >= 3) {
+      let acc = 0;
+      for (let i = 1; i < rrList.length; i++) acc += (rrList[i] - rrList[i - 1]) ** 2;
+      rmssd = Math.sqrt(acc / (rrList.length - 1));
+    }
+    return {
+      r_peaks: rIdxList,
+      r_peaks_ms: beats.map((b) => b.times_ms.r_peak),
+      rr_intervals_ms: rrList,
+      hrv: { median_rr_ms: medRR, sdnn_ms: Math.round(sdnn * 10) / 10, rmssd_ms: Math.round(rmssd * 10) / 10 },
+      beats,
+      representative_beat_index: repIdx,
+      calipers_ms: { ...beats[repIdx].times_ms },
+      metrics: {},
+    };
   }
 
   // Draws millimeter ECG paper grid on any 2D canvas
@@ -5089,7 +5335,8 @@
       const pos = getPos(evt);
       const { lead, beatIdx, box } = state.w1DragState;
       const newMs = posToChannelMs(box, pos.x);
-      moveRPeak(lead, beatIdx, newMs);
+      const followIdx = moveRPeak(lead, beatIdx, newMs);
+      if (followIdx >= 0) state.w1DragState.beatIdx = followIdx;
       renderMultiLeadCanvas();
     });
 
@@ -5367,7 +5614,8 @@
       if (h.startsWith("w2_r_")) {
         const bIdx = parseInt(h.replace("w2_r_", ""), 10);
         if (!isNaN(bIdx)) {
-          moveRPeak(state.activeLead, bIdx, currMs);
+          const followIdx = moveRPeak(state.activeLead, bIdx, currMs);
+          if (followIdx >= 0) state.draggingHandle = `w2_r_${followIdx}`;
           renderMultiLeadCanvas();
         }
         return;
@@ -5388,7 +5636,9 @@
       } else if (h === "next_r_peak") {
         const leadAna = state.analysis && state.analysis.leads && state.analysis.leads[state.activeLead];
         if (leadAna && leadAna.beats && state.activeBeatIdx + 1 < leadAna.beats.length) {
-          moveRPeak(state.activeLead, state.activeBeatIdx + 1, currMs);
+          // Keep R_+1 strictly after the active R so the next beat cannot be dragged over the active one
+          const activeR = state.calipersMs.r_peak || 0;
+          moveRPeak(state.activeLead, state.activeBeatIdx + 1, Math.max(activeR + 200, currMs));
           renderMultiLeadCanvas();
           return;
         } else {
@@ -5447,6 +5697,7 @@
       const baseName = state.uploadedPdfRawFile.name.replace(/\.pdf$/i, "");
       const pageFileName = `${baseName}_page_${cleanPage}.png`;
       state.uploadedFile = new File([blob], pageFileName, { type: "image/png" });
+      state.sourceFile = state.uploadedFile;
       el.exampleDescription.textContent =
         `PDF: ${state.uploadedPdfRawFile.name} (стр. ${cleanPage}/${pdfDoc.numPages}, ${canvas.width}×${canvas.height} пикс)`;
       el.selectLayout.value = "auto";
@@ -5455,6 +5706,7 @@
       console.error("PDF page render error:", err);
       // Fallback: pass raw PDF file to backend PyMuPDF if available
       state.uploadedFile = state.uploadedPdfRawFile;
+      state.sourceFile = state.uploadedFile;
       await runDigitization();
     }
   }
@@ -5468,6 +5720,7 @@
       state.uploadedPdfPage = 1;
       if (el.selectPdfPage) el.selectPdfPage.hidden = true;
       state.uploadedFile = file;
+      state.sourceFile = file;
       el.exampleDescription.textContent = `Загружен файл: ${file.name} (${(file.size / 1024).toFixed(1)} КБ)`;
       el.selectLayout.value = "auto";
       await runDigitization();
@@ -5509,6 +5762,7 @@
     // Fallback to direct backend PyMuPDF PDF decoding
     if (el.selectPdfPage) el.selectPdfPage.hidden = true;
     state.uploadedFile = file;
+    state.sourceFile = file;
     el.exampleDescription.textContent = `Загружен PDF: ${file.name} (${(file.size / 1024).toFixed(1)} КБ)`;
     el.selectLayout.value = "auto";
     await runDigitization();
@@ -5518,6 +5772,7 @@
     // Example selection
     el.selectExample.addEventListener("change", () => {
       state.uploadedFile = null;
+      state.sourceFile = null;
       state.uploadedPdfDoc = null;
       state.uploadedPdfRawFile = null;
       if (el.selectPdfPage) el.selectPdfPage.hidden = true;
@@ -5717,15 +5972,32 @@
     // Direct numerical input boxes for fiducial calipers
     FIDUCIAL_DEFS.forEach((fd) => {
       const inp = document.getElementById(`num_${fd.key}`);
-      if (inp) {
-        inp.addEventListener("input", () => {
+      if (!inp) return;
+      if (fd.key === "r_peak" || fd.key === "next_r_peak") {
+        // R / R_+1 are real beats: move them through moveRPeak so beats[], r_peaks[], RR and the
+        // neighbour's next_r_peak stay consistent (applied on commit, not on every keystroke)
+        inp.addEventListener("change", () => {
           const val = parseFloat(inp.value);
-          if (!isNaN(val)) {
+          if (isNaN(val)) return;
+          const leadAna = state.analysis && state.analysis.leads && state.analysis.leads[state.activeLead];
+          const targetIdx = fd.key === "r_peak" ? state.activeBeatIdx : state.activeBeatIdx + 1;
+          if (leadAna && leadAna.beats && leadAna.beats[targetIdx]) {
+            moveRPeak(state.activeLead, targetIdx, val);
+            renderMultiLeadCanvas();
+          } else {
             state.calipersMs[fd.key] = val;
             recalculateLiveMetricsAndRender();
           }
         });
+        return;
       }
+      inp.addEventListener("input", () => {
+        const val = parseFloat(inp.value);
+        if (!isNaN(val)) {
+          state.calipersMs[fd.key] = val;
+          recalculateLiveMetricsAndRender();
+        }
+      });
     });
 
     bindCaliperCanvasEvents();
@@ -5794,7 +6066,8 @@
       lines.push(row.join(","));
     }
 
-    const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+    // UTF-8 BOM so Excel shows Cyrillic headers ("II (ритм)_mV") correctly
+    const blob = new Blob(["﻿" + lines.join("\n")], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;

@@ -4,21 +4,28 @@ FastAPI Backend Server for the ECG Photo Digitizer & Clinical Caliper Workstatio
 
 from __future__ import annotations
 
-import io
 import json
+import logging
 import os
 from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from app.core.digitizer import LAYOUT_DEFINITIONS, digitize_ecg_image
+from app.core.digitizer import LAYOUT_DEFINITIONS, SUPPORTED_METHODS, deep_learning_status, digitize_ecg_image
 from app.core.ecg_analysis import analyze_all_leads, compute_intervals_from_calipers
+
+logger = logging.getLogger("ecg_workstation")
+
+MAX_UPLOAD_BYTES = 40 * 1024 * 1024  # 40 MB: large phone photos / multi-page PDFs
+MAX_IMAGE_SIDE_PX = 4000  # larger inputs (48 MP photos, 600-dpi scans) are downscaled before the Viterbi tracker
+PDF_RENDER_DPI = 250
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 EXAMPLES_DIR = os.path.join(BASE_DIR, "example")
@@ -142,7 +149,7 @@ async def get_workstation_config() -> Dict[str, Any]:
                     "description": preset.get("description", "Пример фото ЭКГ"),
                 })
 
-    methods = [
+    methods: List[Dict[str, Any]] = [
         {
             "id": "hybrid_ensemble",
             "name": "Hybrid Ensemble (Open-ECG U-Net + Krones Hough + Viterbi DP)",
@@ -173,11 +180,38 @@ async def get_workstation_config() -> Dict[str, Any]:
     for k, v in LAYOUT_DEFINITIONS.items():
         layouts.append({"id": k, "label": v["label"], "rows": v["rows"], "cols": v["cols"]})
 
+    dl_status = deep_learning_status()
+    if not dl_status["available"]:
+        for m in methods:
+            if m["id"] != "krones_hough_cv":
+                m["unavailable"] = True
+                m["badge"] = "Недоступно"
+
     return {
         "examples": examples,
         "methods": methods,
         "layouts": layouts,
+        "deep_learning": dl_status,
     }
+
+
+def _decode_pdf_page(raw_bytes: bytes, filename: str, pdf_page: int) -> tuple[np.ndarray, str]:
+    import fitz  # PyMuPDF
+
+    with fitz.open(stream=raw_bytes, filetype="pdf") as doc:
+        if len(doc) == 0:
+            raise ValueError("PDF не содержит страниц")
+        p_idx = max(0, min(len(doc) - 1, int(pdf_page) - 1))
+        page = doc[p_idx]
+        # Cap the render so huge-format pages (A3 / long rhythm strips) do not explode into >6000 px bitmaps
+        long_side_in = max(page.rect.width, page.rect.height) / 72.0
+        dpi = int(max(96, min(PDF_RENDER_DPI, MAX_IMAGE_SIDE_PX / max(1e-3, long_side_in))))
+        pix = page.get_pixmap(dpi=dpi, alpha=False)
+        if pix.n != 3:
+            pix = fitz.Pixmap(fitz.csRGB, pix)
+        rgb_arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3).copy()
+        name = f"{filename} (стр. {p_idx + 1}/{len(doc)})"
+    return cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR), name
 
 
 @app.post("/api/digitize")
@@ -197,25 +231,23 @@ async def api_digitize_ecg(
     img_bgr: Optional[np.ndarray] = None
     source_name = "uploaded_ecg.jpg"
 
+    if method not in SUPPORTED_METHODS:
+        raise HTTPException(status_code=400, detail=f"Неизвестный метод оцифровки: {method}")
+    if not (5.0 <= paper_speed_mm_s <= 200.0) or not (1.0 <= gain_mm_mv <= 100.0) or not (50.0 <= target_fs <= 2000.0):
+        raise HTTPException(status_code=400, detail="Недопустимые параметры: скорость 5–200 мм/с, усиление 1–100 мм/мВ, частота 50–2000 Гц")
+    if rotate_deg not in (0, 90, 180, 270):
+        raise HTTPException(status_code=400, detail="Поворот допускается только на 0, 90, 180 или 270°")
+
     if file is not None and file.filename:
         raw_bytes = await file.read()
+        if len(raw_bytes) == 0:
+            raise HTTPException(status_code=400, detail="Загруженный файл пуст")
+        if len(raw_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"Файл слишком большой (> {MAX_UPLOAD_BYTES // (1024 * 1024)} МБ)")
         is_pdf = file.filename.lower().endswith(".pdf") or raw_bytes[:4] == b"%PDF"
         if is_pdf:
             try:
-                import fitz  # PyMuPDF
-
-                doc = fitz.open(stream=raw_bytes, filetype="pdf")
-                if len(doc) == 0:
-                    raise ValueError("PDF не содержит страниц")
-                p_idx = max(0, min(len(doc) - 1, int(pdf_page) - 1))
-                page = doc[p_idx]
-                pix = page.get_pixmap(dpi=250, alpha=False)
-                if pix.n != 3:
-                    pix = fitz.Pixmap(fitz.csRGB, pix)
-                rgb_arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3).copy()
-                img_bgr = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
-                source_name = f"{file.filename} (стр. {p_idx + 1}/{len(doc)})"
-                doc.close()
+                img_bgr, source_name = await run_in_threadpool(_decode_pdf_page, raw_bytes, file.filename, pdf_page)
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=f"Ошибка чтения PDF ЭКГ: {exc}") from exc
         else:
@@ -234,6 +266,19 @@ async def api_digitize_ecg(
 
     if img_bgr is None:
         raise HTTPException(status_code=400, detail="Не удалось декодировать изображение ЭКГ")
+    if min(img_bgr.shape[:2]) < 64:
+        raise HTTPException(status_code=400, detail="Изображение слишком маленькое для оцифровки (< 64 px)")
+    pre_warnings: List[str] = []
+    long_side = max(img_bgr.shape[:2])
+    if long_side > MAX_IMAGE_SIDE_PX:
+        # Deterministic downscale: the returned aligned image, overlay coordinates, the auto-detected px/mm and any
+        # manual px/mm the user derives from it all live in this same downscaled pixel space.
+        scale = MAX_IMAGE_SIDE_PX / float(long_side)
+        new_size = (max(1, int(round(img_bgr.shape[1] * scale))), max(1, int(round(img_bgr.shape[0] * scale))))
+        pre_warnings.append(
+            f"Изображение {img_bgr.shape[1]}×{img_bgr.shape[0]} px уменьшено до {new_size[0]}×{new_size[1]} px для ускорения оцифровки"
+        )
+        img_bgr = cv2.resize(img_bgr, new_size, interpolation=cv2.INTER_AREA)
 
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
@@ -246,22 +291,32 @@ async def api_digitize_ecg(
         except Exception:
             custom_roi = None
 
-    dig_result = digitize_ecg_image(
-        img_rgb=img_rgb,
-        method=method,
-        layout=layout,
-        paper_speed_mm_s=float(paper_speed_mm_s),
-        gain_mm_mv=float(gain_mm_mv),
-        target_fs=float(target_fs),
-        rotate_deg=int(rotate_deg),
-        custom_px_per_mm=float(custom_px_per_mm) if (custom_px_per_mm and custom_px_per_mm > 0) else None,
-        custom_roi=custom_roi,
-    )
+    # CPU-heavy (U-Net + Viterbi DP, seconds per image): run off the event loop so the server stays responsive
+    try:
+        dig_result = await run_in_threadpool(
+            digitize_ecg_image,
+            img_rgb=img_rgb,
+            method=method,
+            layout=layout,
+            paper_speed_mm_s=float(paper_speed_mm_s),
+            gain_mm_mv=float(gain_mm_mv),
+            target_fs=float(target_fs),
+            rotate_deg=int(rotate_deg),
+            custom_px_per_mm=float(custom_px_per_mm) if (custom_px_per_mm and custom_px_per_mm > 0) else None,
+            custom_roi=custom_roi,
+        )
+        analysis_result = await run_in_threadpool(
+            analyze_all_leads,
+            leads_mv=dig_result["leads_mv"],
+            fs=float(target_fs),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Digitization failed for %s", source_name)
+        raise HTTPException(status_code=500, detail=f"Ошибка оцифровки ЭКГ: {type(exc).__name__}: {exc}") from exc
 
-    analysis_result = analyze_all_leads(
-        leads_mv=dig_result["leads_mv"],
-        fs=float(target_fs),
-    )
+    dig_result["warnings"] = pre_warnings + list(dig_result.get("warnings", []))
 
     return JSONResponse({
         "source_name": source_name,
@@ -271,7 +326,9 @@ async def api_digitize_ecg(
 
 
 @app.post("/api/recalculate_calipers")
-async def api_recalculate_calipers(req: CaliperRecalcRequest) -> JSONResponse:
+def api_recalculate_calipers(req: CaliperRecalcRequest) -> JSONResponse:
+    if not (50.0 <= req.fs <= 2000.0):
+        raise HTTPException(status_code=400, detail="Частота дискретизации должна быть в диапазоне 50–2000 Гц")
     sig_arr = np.asarray(req.signal_mv, dtype=np.float64) if req.signal_mv else None
     metrics = compute_intervals_from_calipers(
         calipers_ms=req.calipers_ms,
@@ -283,7 +340,10 @@ async def api_recalculate_calipers(req: CaliperRecalcRequest) -> JSONResponse:
 
 
 @app.post("/api/reanalyze_leads")
-async def api_reanalyze_leads(req: ReanalyzeLeadsRequest) -> JSONResponse:
+def api_reanalyze_leads(req: ReanalyzeLeadsRequest) -> JSONResponse:
+    # Plain `def` endpoints run in FastAPI's threadpool, so re-analysis of 12 leads never blocks the event loop
+    if not (50.0 <= req.fs <= 2000.0):
+        raise HTTPException(status_code=400, detail="Частота дискретизации должна быть в диапазоне 50–2000 Гц")
     analysis_result = analyze_all_leads(
         leads_mv=req.leads_mv,
         fs=req.fs,

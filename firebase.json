@@ -1,5 +1,6 @@
 {
   "hosting": {
+    "predeploy": ["python tools/sync_public.py --check"],
     "public": "public",
     "ignore": [
       "firebase.json",

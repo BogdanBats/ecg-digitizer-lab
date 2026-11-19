@@ -491,15 +491,17 @@ def compute_intervals_from_calipers(
     # Clinical status flags
     flags: List[Dict[str, str]] = []
     if hr_bpm < 60:
-        flags.append({"param": "ЧСС", "level": "warn", "text": f"Синусовая брадикардия / ЧСС < 60 ({hr_bpm:.0f} уд/мин)"})
+        flags.append({"param": "ЧСС", "level": "warn", "text": f"Брадикардия / ЧСС < 60 ({hr_bpm:.0f} уд/мин)"})
     elif hr_bpm > 100:
         flags.append({"param": "ЧСС", "level": "warn", "text": f"Тахикардия / ЧСС > 100 ({hr_bpm:.0f} уд/мин)"})
     else:
         flags.append({"param": "ЧСС", "level": "normal", "text": f"Нормокардия ({hr_bpm:.0f} уд/мин)"})
 
-    if pq_interval_ms > 200:
+    if pq_interval_ms <= 40:
+        flags.append({"param": "Интервал PQ", "level": "warn", "text": f"Интервал PQ не определяется ({pq_interval_ms:.0f} мс) — проверьте калиперы P_on / QRS_on"})
+    elif pq_interval_ms > 200:
         flags.append({"param": "Интервал PQ", "level": "alert", "text": f"Удлинение PQ > 200 мс ({pq_interval_ms:.0f} мс) — АВ-блокада I ст."})
-    elif pq_interval_ms < 120 and pq_interval_ms > 40:
+    elif pq_interval_ms < 120:
         flags.append({"param": "Интервал PQ", "level": "warn", "text": f"Укорочение PQ < 120 мс ({pq_interval_ms:.0f} мс) — синдром предвозбуждения / ускоренное АВ-проведение"})
     else:
         flags.append({"param": "Интервал PQ", "level": "normal", "text": f"Интервал PQ в норме ({pq_interval_ms:.0f} мс, норма 120–200 мс)"})
@@ -652,7 +654,8 @@ def analyze_all_leads(
     def calc_hexaxial_angle(val_i: float, val_avf: Optional[float], val_ii: Optional[float]) -> Optional[float]:
         if val_avf is not None and abs(val_i) + abs(val_avf) > 1e-4:
             # Standard hexaxial formula using Lead I and aVF: tan(alpha) = (2/sqrt(3)) * aVF / I
-            angle = math.degrees(math.atan2(val_avf, val_i))
+            # (Goldberger aVF = (II + III) / 2 = (sqrt(3)/2) * |E| * sin(alpha), while I = |E| * cos(alpha))
+            angle = math.degrees(math.atan2((2.0 / math.sqrt(3.0)) * val_avf, val_i))
             return round(angle, 1)
         if val_ii is not None and abs(val_i) + abs(val_ii) > 1e-4:
             # From I and II: aVF = II - 0.5*I -> y = (2*II - I) / sqrt(3)
@@ -705,18 +708,26 @@ def analyze_all_leads(
 
     # Compute hypertrophy indices (Sokolow-Lyon & Cornell)
     hypertrophy: Dict[str, Any] = {}
+    # Voltage criteria use wave HEIGHT / DEPTH: an R "amplitude" below the isoelectric line (QS complex) is 0 mm of R,
+    # and an S "amplitude" above it is 0 mm of S — never let them subtract from the sum.
+    def r_height(lead: str) -> float:
+        return max(0.0, float(per_lead_results[lead]["metrics"]["amplitudes_mv"].get("r_amp_mv", 0.0))) if lead in per_lead_results else 0.0
+
+    def s_depth(lead: str) -> float:
+        return max(0.0, -float(per_lead_results[lead]["metrics"]["amplitudes_mv"].get("s_amp_mv", 0.0))) if lead in per_lead_results else 0.0
+
     if "V1" in per_lead_results and ("V5" in per_lead_results or "V6" in per_lead_results):
-        s_v1 = abs(per_lead_results["V1"]["metrics"]["amplitudes_mv"].get("s_amp_mv", 0.0))
-        r_v5 = per_lead_results["V5"]["metrics"]["amplitudes_mv"].get("r_amp_mv", 0.0) if "V5" in per_lead_results else 0.0
-        r_v6 = per_lead_results["V6"]["metrics"]["amplitudes_mv"].get("r_amp_mv", 0.0) if "V6" in per_lead_results else 0.0
+        s_v1 = s_depth("V1")
+        r_v5 = r_height("V5")
+        r_v6 = r_height("V6")
         sokolow_mv = s_v1 + max(r_v5, r_v6)
         hypertrophy["sokolow_lyon_mv"] = round(sokolow_mv, 2)
         hypertrophy["sokolow_lyon_mm"] = round(sokolow_mv * 10.0, 1)
         hypertrophy["sokolow_lyon_lvh"] = bool(sokolow_mv >= 3.5)
 
     if "aVL" in per_lead_results and "V3" in per_lead_results:
-        r_avl = per_lead_results["aVL"]["metrics"]["amplitudes_mv"].get("r_amp_mv", 0.0)
-        s_v3 = abs(per_lead_results["V3"]["metrics"]["amplitudes_mv"].get("s_amp_mv", 0.0))
+        r_avl = r_height("aVL")
+        s_v3 = s_depth("V3")
         cornell_mv = r_avl + s_v3
         hypertrophy["cornell_mv"] = round(cornell_mv, 2)
         hypertrophy["cornell_mm"] = round(cornell_mv * 10.0, 1)

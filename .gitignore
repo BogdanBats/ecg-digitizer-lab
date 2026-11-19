@@ -18,3 +18,6 @@ vendor/Open-ECG-Digitizer/
 Thumbs.db
 .vscode/
 .idea/
+
+# Test cache
+.pytest_cache/

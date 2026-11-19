@@ -20,32 +20,54 @@ Integrates three state-of-the-art ECG digitization paradigms plus a Hybrid Ensem
 from __future__ import annotations
 
 import base64
-import io
 import math
 import os
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-import torch
-import torch.nn.functional as F
 from scipy import ndimage, signal as sp_signal
-from scipy.optimize import linear_sum_assignment
 
 VENDOR_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "vendor", "Open-ECG-Digitizer"))
 if VENDOR_DIR not in sys.path:
     sys.path.insert(0, VENDOR_DIR)
 
-from src.model.unet import UNet
-from src.model.perspective_detector import PerspectiveDetector
-from src.model.pixel_size_finder import PixelSizeFinder
+# Deep-learning stack (PyTorch + vendored Open-ECG-Digitizer) is optional: without it the server still starts
+# and every request transparently falls back to the classical `krones_hough_cv` pipeline.
+try:
+    import torch
+    import torch.nn.functional as F
+    from src.model.unet import UNet
+    from src.model.pixel_size_finder import PixelSizeFinder
+
+    _DL_IMPORT_ERROR: Optional[str] = None
+except Exception as _exc:  # pragma: no cover - depends on local installation
+    torch = None  # type: ignore[assignment]
+    F = None  # type: ignore[assignment]
+    UNet = None  # type: ignore[assignment,misc]
+    PixelSizeFinder = None  # type: ignore[assignment,misc]
+    _DL_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
 
 
 WEIGHTS_DIR = os.path.join(VENDOR_DIR, "weights")
 UNET_WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, "unet_weights_07072025.pt")
 LEAD_UNET_WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, "lead_name_unet_weights_07072025.pt")
+
+DL_METHODS = ("hybrid_ensemble", "open_ecg_unet", "dangnh_heatmap_dp")
+SUPPORTED_METHODS = DL_METHODS + ("krones_hough_cv",)
+
+
+def deep_learning_status() -> Dict[str, Any]:
+    """Reports whether the U-Net based methods can run (PyTorch + vendor code + weight files present)."""
+    if _DL_IMPORT_ERROR is not None:
+        return {"available": False, "reason": f"Не удалось импортировать PyTorch / Open-ECG-Digitizer ({_DL_IMPORT_ERROR})"}
+    missing = [os.path.basename(p) for p in (UNET_WEIGHTS_PATH, LEAD_UNET_WEIGHTS_PATH) if not os.path.isfile(p)]
+    if missing:
+        return {"available": False, "reason": f"Не найдены веса U-Net в {WEIGHTS_DIR}: {', '.join(missing)}"}
+    return {"available": True, "reason": ""}
 
 LEAD_CHANNEL_ORDER = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
 
@@ -150,14 +172,25 @@ LAYOUT_DEFINITIONS: Dict[str, Dict[str, Any]] = {
 
 
 class ModelRegistry:
-    """Lazy singleton loader for Open-ECG-Digitizer pretrained U-Net models."""
+    """Lazy, thread-safe singleton loader for Open-ECG-Digitizer pretrained U-Net models."""
 
-    _unet: Optional[UNet] = None
-    _lead_unet: Optional[UNet] = None
-    _device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    _unet: Optional[Any] = None
+    _lead_unet: Optional[Any] = None
+    _device: str = "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu"
+    _lock = threading.Lock()
 
     @classmethod
-    def get_segmentation_unet(cls) -> UNet:
+    def get_segmentation_unet(cls) -> Any:
+        with cls._lock:
+            return cls._load_segmentation_unet()
+
+    @classmethod
+    def get_lead_name_unet(cls) -> Any:
+        with cls._lock:
+            return cls._load_lead_name_unet()
+
+    @classmethod
+    def _load_segmentation_unet(cls) -> Any:
         if cls._unet is None:
             model = UNet(
                 num_in_channels=3,
@@ -175,7 +208,7 @@ class ModelRegistry:
         return cls._unet
 
     @classmethod
-    def get_lead_name_unet(cls) -> UNet:
+    def _load_lead_name_unet(cls) -> Any:
         if cls._lead_unet is None:
             model = UNet(
                 num_in_channels=1,
@@ -416,9 +449,12 @@ def estimate_pixel_spacing_mm(
     H, W = grid_prob.shape
     px_per_mm_x = 0.0
     px_per_mm_y = 0.0
+    calib_method = "pixel_size_finder"
 
     # 1. Try Open-ECG-Digitizer's PixelSizeFinder on the central cropped grid region
     try:
+        if PixelSizeFinder is None or torch is None:
+            raise RuntimeError("PixelSizeFinder unavailable")
         cy0, cy1 = int(0.1 * H), int(0.9 * H)
         cx0, cx1 = int(0.1 * W), int(0.9 * W)
         sub_grid = torch.from_numpy(grid_prob[cy0:cy1, cx0:cx1]).float()
@@ -455,6 +491,7 @@ def estimate_pixel_spacing_mm(
         fallback_px_mm = 0.5 * (W / est_paper_width_mm + H / est_paper_height_mm)
         px_per_mm_x = fallback_px_mm
         px_per_mm_y = fallback_px_mm
+        calib_method = "paper_size_fallback"
 
     avg_px_per_mm = 0.5 * (px_per_mm_x + px_per_mm_y)
     return {
@@ -463,6 +500,7 @@ def estimate_pixel_spacing_mm(
         "px_per_mm": round(float(avg_px_per_mm), 4),
         "mm_per_px_x": round(1.0 / float(px_per_mm_x), 5),
         "mm_per_px_y": round(1.0 / float(px_per_mm_y), 5),
+        "method": calib_method,
     }
 
 
@@ -1144,7 +1182,9 @@ def extract_all_leads_for_layout(
             mv_raw = -mv_raw
 
         width_mm = seg_len_px / max(1e-4, px_per_mm_x)
-        duration_sec = float(np.clip(width_mm / max(5.0, paper_speed_mm_s), 0.5, 15.0))
+        # Keep the true physical duration (a silent clip would distort the time base of every interval);
+        # only guard against absurd values caused by a failed grid calibration.
+        duration_sec = float(np.clip(width_mm / max(5.0, paper_speed_mm_s), 0.2, 60.0))
         num_samples = max(100, int(round(duration_sec * target_fs)))
 
         x_old = np.linspace(0.0, 1.0, len(mv_raw))
@@ -1329,6 +1369,17 @@ def digitize_ecg_image(
         custom_roi: Optional normalized crop box {'x': float, 'y': float, 'w': float, 'h': float}
     """
     t0 = time.time()
+    warnings: List[str] = []
+    requested_method = method
+
+    if method not in SUPPORTED_METHODS:
+        warnings.append(f"Неизвестный метод «{method}» — использован hybrid_ensemble")
+        method = "hybrid_ensemble"
+    if method in DL_METHODS:
+        dl_status = deep_learning_status()
+        if not dl_status["available"]:
+            warnings.append(f"Нейросетевой метод недоступен ({dl_status['reason']}) — использован классический krones_hough_cv")
+            method = "krones_hough_cv"
 
     if rotate_deg == 90:
         img_rgb = cv2.rotate(img_rgb, cv2.ROTATE_90_CLOCKWISE)
@@ -1395,9 +1446,24 @@ def digitize_ecg_image(
             "px_per_mm": float(custom_px_per_mm),
             "mm_per_px_x": round(1.0 / float(custom_px_per_mm), 5),
             "mm_per_px_y": round(1.0 / float(custom_px_per_mm), 5),
+            "method": "manual",
         }
     else:
         spacing = estimate_pixel_spacing_mm(aligned_grid, aligned_rgb, expected_rows=expected_total_rows)
+        if spacing.get("method") == "paper_size_fallback":
+            warnings.append(
+                "Шаг миллиметровой сетки не найден автоматически — масштаб оценён по размеру листа; "
+                "проверьте калибровку (2 точки по клеткам 5 мм) перед измерением интервалов"
+            )
+        else:
+            # Plausibility: visible paper is ~100–320 mm wide (thermal strip … A4 landscape). A grid period locked onto
+            # the 5-mm (instead of 1-mm) lines or onto texture gives absurd widths and a wrong time base.
+            visible_w_mm = aligned_rgb.shape[1] / max(1e-6, float(spacing["px_per_mm_x"]))
+            if visible_w_mm > 420.0 or visible_w_mm < 40.0:
+                warnings.append(
+                    f"Подозрительная калибровка сетки: ширина изображения ≈ {visible_w_mm:.0f} мм "
+                    f"({spacing['px_per_mm']:.2f} пикс/мм) — проверьте масштаб по клеткам 5 мм"
+                )
 
     # Stage 5: Waveform Extraction for all leads in layout
     leads_mv, overlay_traces, final_baselines = extract_all_leads_for_layout(
@@ -1426,6 +1492,8 @@ def digitize_ecg_image(
 
     return {
         "method": method,
+        "requested_method": requested_method,
+        "warnings": warnings,
         "layout": chosen_layout,
         "layout_label": layout_info["label"],
         "paper_speed_mm_s": paper_speed_mm_s,
