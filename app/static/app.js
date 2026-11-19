@@ -82,6 +82,14 @@
     overlayBadgeHitBoxes: [],
     overlayDrawActive: false,
     overlayLastPt: null,
+    // Window 1 Zoom & Panning
+    w1Zoom: 1.0,
+    w1PanState: null,
+    // Grid Intersections (+) & Paper Deformation Rectification Tab
+    gridNodesZoom: 1.0,
+    gridNodesResult: null,
+    originalAlignedDataUrl: null,
+    gridNodesPanState: null,
     // Vectorcardiogram (VCG) view mode
     vcgPlane: "all3", // 'all3' | 'frontal' | 'horizontal' | 'sagittal' | '3d'
   };
@@ -116,6 +124,11 @@
     statusBadge: document.getElementById("statusBadge"),
     digitizationMetaLine: document.getElementById("digitizationMetaLine"),
     multileadCanvas: document.getElementById("multileadCanvas"),
+    multileadContainer: document.getElementById("multileadContainer"),
+    btnW1ZoomOut: document.getElementById("btnW1ZoomOut"),
+    selectW1Zoom: document.getElementById("selectW1Zoom"),
+    btnW1ZoomIn: document.getElementById("btnW1ZoomIn"),
+    btnW1ZoomReset: document.getElementById("btnW1ZoomReset"),
     chkSyncChannels: document.getElementById("chkSyncChannels"),
     chkShowFiducialsMulti: document.getElementById("chkShowFiducialsMulti"),
     btnQuickAddR: document.getElementById("btnQuickAddR"),
@@ -153,6 +166,22 @@
     inputPxPerMm: document.getElementById("inputPxPerMm"),
     btnApplyManualCal: document.getElementById("btnApplyManualCal"),
     btnResetManualCal: document.getElementById("btnResetManualCal"),
+    selectGridColorMode: document.getElementById("selectGridColorMode"),
+    btnDetectGridCrosses: document.getElementById("btnDetectGridCrosses"),
+    btnRectifyByCrosses: document.getElementById("btnRectifyByCrosses"),
+    btnCleanGridArtifacts: document.getElementById("btnCleanGridArtifacts"),
+    btnResetGridRectify: document.getElementById("btnResetGridRectify"),
+    btnGridNodesZoomOut: document.getElementById("btnGridNodesZoomOut"),
+    selectGridNodesZoom: document.getElementById("selectGridNodesZoom"),
+    btnGridNodesZoomIn: document.getElementById("btnGridNodesZoomIn"),
+    chkShowGridCrosses: document.getElementById("chkShowGridCrosses"),
+    chkShowWarpMesh: document.getElementById("chkShowWarpMesh"),
+    chkShowWarpVectors: document.getElementById("chkShowWarpVectors"),
+    gridNodesStatus: document.getElementById("gridNodesStatus"),
+    gridNodesScrollBox: document.getElementById("gridNodesScrollBox"),
+    gridNodesStageWrap: document.getElementById("gridNodesStageWrap"),
+    imgGridNodesBase: document.getElementById("imgGridNodesBase"),
+    gridNodesCanvas: document.getElementById("gridNodesCanvas"),
     leadPillsContainer: document.getElementById("leadPillsContainer"),
     selectBeat: document.getElementById("selectBeat"),
     selectZoomX: document.getElementById("selectZoomX"),
@@ -760,10 +789,19 @@
         el.imgTraceOverlay.src = vis.aligned_image || vis.trace_overlay_image;
       }
       if (vis.aligned_image) {
+        state.originalAlignedDataUrl = vis.aligned_image;
+        state.gridNodesResult = null;
         el.imgAligned.onload = () => {
           renderPhotoCalibrationCanvas();
         };
         el.imgAligned.src = vis.aligned_image;
+
+        if (el.imgGridNodesBase) {
+          el.imgGridNodesBase.onload = () => {
+            detectGridIntersectionsAndDeformation();
+          };
+          el.imgGridNodesBase.src = vis.aligned_image;
+        }
       }
       if (vis.segmentation_heatmap) el.imgHeatmap.src = vis.segmentation_heatmap;
 
@@ -1885,6 +1923,736 @@
     }
   }
 
+  // =========================================================================
+  // Grid Intersections ('+' Crosses) Detection, 2D Paper Deformation Field,
+  // Geometric Dewarping & Grid/Lighting Artifact Removal
+  // =========================================================================
+  function detectGridIntersectionsAndDeformation() {
+    const img = el.imgGridNodesBase;
+    if (!img || !img.complete || !img.naturalWidth) return null;
+
+    const W = img.naturalWidth;
+    const H = img.naturalHeight;
+    const off = document.createElement("canvas");
+    off.width = W;
+    off.height = H;
+    const ctx = off.getContext("2d");
+    ctx.drawImage(img, 0, 0, W, H);
+    const data = ctx.getImageData(0, 0, W, H).data;
+
+    // 1. Auto-detect colored (red/pink/orange) vs grayscale/B&W (photo/PDF) grid
+    const modeSel = (el.selectGridColorMode && el.selectGridColorMode.value) || "auto";
+    let redCount = 0;
+    const sampleStep = 4;
+    let totalSamples = 0;
+    for (let y = Math.floor(H * 0.08); y < Math.floor(H * 0.92); y += sampleStep) {
+      for (let x = Math.floor(W * 0.08); x < Math.floor(W * 0.92); x += sampleStep) {
+        const idx = (y * W + x) * 4;
+        const r = data[idx];
+        const g = data[idx + 1];
+        const b = data[idx + 2];
+        if (r - Math.max(g, b) >= 12) redCount++;
+        totalSamples++;
+      }
+    }
+    const redFrac = redCount / Math.max(1, totalSamples);
+    const useRedGrid = modeSel === "color_red" ? true : modeSel === "bw_gray" ? false : redFrac >= 0.015;
+    const detectedModeLabel = useRedGrid ? "Цветная сетка (красная/розовая)" : "Ч/Б сетка (серая, фото/PDF)";
+
+    // 2. Build grid intensity map G(x, y) in [0, 1]
+    const gridMap = new Float32Array(W * H);
+    if (useRedGrid) {
+      for (let i = 0; i < W * H; i++) {
+        const r = data[i * 4];
+        const g = data[i * 4 + 1];
+        const b = data[i * 4 + 2];
+        const redEx = r - 0.52 * g - 0.48 * b;
+        // Suppress very dark neutral ECG ink (where R, G, B are all low)
+        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        if (redEx > 4.0 && lum > 55) {
+          gridMap[i] = Math.min(1.0, (redEx - 4.0) / 55.0);
+        }
+      }
+    } else {
+      // Grayscale / B&W photo or PDF: estimate local paper brightness via fast downsampled row/col background
+      const lumArr = new Float32Array(W * H);
+      for (let i = 0; i < W * H; i++) {
+        lumArr[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
+      }
+      // Fast 1D horizontal + vertical box blur (radius 14) for local paper illumination
+      const bgH = new Float32Array(W * H);
+      const radBg = 14;
+      for (let y = 0; y < H; y++) {
+        const rowOff = y * W;
+        let acc = 0;
+        let cnt = 0;
+        for (let x = 0; x <= Math.min(W - 1, radBg); x++) {
+          acc += lumArr[rowOff + x];
+          cnt++;
+        }
+        for (let x = 0; x < W; x++) {
+          bgH[rowOff + x] = acc / Math.max(1, cnt);
+          const addX = x + radBg + 1;
+          const remX = x - radBg;
+          if (addX < W) {
+            acc += lumArr[rowOff + addX];
+            cnt++;
+          }
+          if (remX >= 0) {
+            acc -= lumArr[rowOff + remX];
+            cnt--;
+          }
+        }
+      }
+      for (let i = 0; i < W * H; i++) {
+        const diff = bgH[i] - lumArr[i];
+        // Gray grid lines sit between subtle paper grain (diff > 5) and thick black ECG ink (diff < 115)
+        if (diff > 5.0 && diff < 120.0) {
+          const inkAtten = diff > 75.0 ? Math.max(0.25, 1.0 - (diff - 75.0) / 50.0) : 1.0;
+          gridMap[i] = Math.min(1.0, ((diff - 5.0) / 48.0) * inkAtten);
+        }
+      }
+    }
+
+    // 3. O(1) prefix-sum directional arm responses for '+' cross detection
+    const estPxPerMm =
+      (state.digitization && state.digitization.pixel_spacing && state.digitization.pixel_spacing.px_per_mm) ||
+      state.activePxPerMm ||
+      5.5;
+    const armLen = Math.max(6, Math.min(22, Math.round(2.1 * estPxPerMm)));
+
+    // Row prefix sums & Col prefix sums
+    const rowCum = new Float32Array((W + 1) * H);
+    for (let y = 0; y < H; y++) {
+      let s = 0;
+      const rIn = y * W;
+      const rOut = y * (W + 1);
+      rowCum[rOut] = 0;
+      for (let x = 0; x < W; x++) {
+        s += gridMap[rIn + x];
+        rowCum[rOut + x + 1] = s;
+      }
+    }
+
+    const colCum = new Float32Array(W * (H + 1));
+    for (let x = 0; x < W; x++) {
+      let s = 0;
+      colCum[x] = 0;
+      for (let y = 0; y < H; y++) {
+        s += gridMap[y * W + x];
+        colCum[(y + 1) * W + x] = s;
+      }
+    }
+
+    const crossScore = new Float32Array(W * H);
+    const colProj = new Float64Array(W);
+    const rowProj = new Float64Array(H);
+    const invArm = 1.0 / armLen;
+
+    for (let y = armLen; y < H - armLen; y++) {
+      const rOut = y * (W + 1);
+      for (let x = armLen; x < W - armLen; x++) {
+        const left = (rowCum[rOut + x] - rowCum[rOut + x - armLen]) * invArm;
+        const right = (rowCum[rOut + x + 1 + armLen] - rowCum[rOut + x + 1]) * invArm;
+        const up = (colCum[y * W + x] - colCum[(y - armLen) * W + x]) * invArm;
+        const down = (colCum[(y + 1 + armLen) * W + x] - colCum[(y + 1) * W + x]) * invArm;
+
+        const hResp = 0.5 * (left + right);
+        const vResp = 0.5 * (up + down);
+        colProj[x] += vResp;
+        rowProj[y] += hResp;
+
+        const minArm = Math.min(left, right, up, down);
+        if (hResp > 0.05 && vResp > 0.05) {
+          crossScore[y * W + x] = Math.sqrt(hResp * vResp) * (0.45 + 0.55 * Math.sqrt(Math.max(0, minArm)));
+        }
+      }
+    }
+
+    // 4. Estimate 5mm major grid period Sx, Sy via 1D autocorrelation of colProj and rowProj
+    const findPeriod = (proj, expStep) => {
+      const n = proj.length;
+      let mean = 0;
+      for (let i = 0; i < n; i++) mean += proj[i];
+      mean /= Math.max(1, n);
+      const centered = new Float64Array(n);
+      for (let i = 0; i < n; i++) centered[i] = proj[i] - mean;
+
+      const lo = Math.max(10, Math.round(expStep * 0.65));
+      const hi = Math.min(Math.floor(n * 0.25), Math.round(expStep * 1.45));
+      let bestLag = Math.round(expStep);
+      let bestAc = -1e18;
+      for (let lag = lo; lag <= hi; lag++) {
+        let sum = 0;
+        const lim = n - lag;
+        for (let i = 0; i < lim; i++) sum += centered[i] * centered[i + lag];
+        const ac = sum / Math.max(1, lim);
+        if (ac > bestAc) {
+          bestAc = ac;
+          bestLag = lag;
+        }
+      }
+      return bestLag;
+    };
+
+    const exp5mm = 5.0 * estPxPerMm;
+    const Sx = findPeriod(colProj, exp5mm);
+    const Sy = findPeriod(rowProj, exp5mm);
+
+    // Find best grid phase (x0, y0) in [0..Sx), [0..Sy)
+    const findPhase = (proj, period) => {
+      const n = proj.length;
+      let bestP = 0;
+      let bestSum = -1e18;
+      for (let p = 0; p < period; p++) {
+        let s = 0;
+        let cnt = 0;
+        for (let pos = p; pos < n; pos += period) {
+          s += proj[pos];
+          cnt++;
+        }
+        const avg = s / Math.max(1, cnt);
+        if (avg > bestSum) {
+          bestSum = avg;
+          bestP = p;
+        }
+      }
+      return bestP;
+    };
+
+    const phaseX = findPhase(colProj, Sx);
+    const phaseY = findPhase(rowProj, Sy);
+
+    // 5. Build 2D lattice (i, j) and snap each ideal intersection to the true '+' cross peak
+    const colsCount = Math.floor((W - phaseX) / Sx);
+    const rowsCount = Math.floor((H - phaseY) / Sy);
+    const searchRadX = Math.max(4, Math.round(Sx * 0.36));
+    const searchRadY = Math.max(4, Math.round(Sy * 0.36));
+
+    // Find global max crossScore for normalization
+    let maxCS = 1e-6;
+    for (let i = 0; i < crossScore.length; i++) {
+      if (crossScore[i] > maxCS) maxCS = crossScore[i];
+    }
+
+    const nodes = [];
+    const nodeGrid = Array.from({ length: rowsCount }, () => new Array(colsCount).fill(null));
+    const minScoreThr = maxCS * 0.14;
+
+    for (let i = 0; i < rowsCount; i++) {
+      const idealY = phaseY + i * Sy;
+      if (idealY < armLen + 2 || idealY > H - armLen - 3) continue;
+      for (let j = 0; j < colsCount; j++) {
+        const idealX = phaseX + j * Sx;
+        if (idealX < armLen + 2 || idealX > W - armLen - 3) continue;
+
+        let bestV = -1;
+        let bestX = idealX;
+        let bestY = idealY;
+        const y0 = Math.max(armLen, Math.round(idealY) - searchRadY);
+        const y1 = Math.min(H - armLen - 1, Math.round(idealY) + searchRadY);
+        const x0 = Math.max(armLen, Math.round(idealX) - searchRadX);
+        const x1 = Math.min(W - armLen - 1, Math.round(idealX) + searchRadX);
+
+        for (let y = y0; y <= y1; y++) {
+          const rOff = y * W;
+          for (let x = x0; x <= x1; x++) {
+            const v = crossScore[rOff + x];
+            if (v > bestV) {
+              bestV = v;
+              bestX = x;
+              bestY = y;
+            }
+          }
+        }
+
+        if (bestV >= minScoreThr) {
+          // Sub-pixel 3x3 centroid refinement
+          let numX = 0, numY = 0, den = 0;
+          for (let dy = -2; dy <= 2; dy++) {
+            for (let dx = -2; dx <= 2; dx++) {
+              const yy = bestY + dy;
+              const xx = bestX + dx;
+              if (yy >= 0 && yy < H && xx >= 0 && xx < W) {
+                const wv = crossScore[yy * W + xx];
+                numX += xx * wv;
+                numY += yy * wv;
+                den += wv;
+              }
+            }
+          }
+          const rx = den > 0 ? numX / den : bestX;
+          const ry = den > 0 ? numY / den : bestY;
+          const node = {
+            i,
+            j,
+            x: rx,
+            y: ry,
+            idealX,
+            idealY,
+            dx: rx - idealX,
+            dy: ry - idealY,
+            conf: Math.min(1.0, bestV / maxCS),
+          };
+          nodes.push(node);
+          nodeGrid[i][j] = node;
+        }
+      }
+    }
+
+    // 6. Compute recovered calibrated scale & paper deformation telemetry from detected crosses
+    const stepXs = [];
+    const stepYs = [];
+    for (let i = 0; i < rowsCount; i++) {
+      for (let j = 0; j < colsCount; j++) {
+        const cur = nodeGrid[i][j];
+        if (!cur) continue;
+        if (j + 1 < colsCount && nodeGrid[i][j + 1]) {
+          stepXs.push(nodeGrid[i][j + 1].x - cur.x);
+        }
+        if (i + 1 < rowsCount && nodeGrid[i + 1][j]) {
+          stepYs.push(nodeGrid[i + 1][j].y - cur.y);
+        }
+      }
+    }
+    const medianOf = (arr, fb) => {
+      if (!arr.length) return fb;
+      const s = arr.slice().sort((a, b) => a - b);
+      return s[Math.floor(s.length / 2)];
+    };
+    const medStepX = medianOf(stepXs, Sx);
+    const medStepY = medianOf(stepYs, Sy);
+    const pxPerMmX = medStepX / 5.0;
+    const pxPerMmY = medStepY / 5.0;
+    const pxPerMmAvg = 0.5 * (pxPerMmX + pxPerMmY);
+
+    let sumSq = 0;
+    let maxWarp = 0;
+    nodes.forEach((nd) => {
+      const mag = Math.hypot(nd.dx, nd.dy);
+      sumSq += mag * mag;
+      if (mag > maxWarp) maxWarp = mag;
+    });
+    const rmsWarpPx = nodes.length > 0 ? Math.sqrt(sumSq / nodes.length) : 0;
+    const warpPct = (rmsWarpPx / Math.max(1, 0.5 * (medStepX + medStepY))) * 100.0;
+    const anisotropyPct = (Math.abs(pxPerMmX - pxPerMmY) / Math.max(0.1, pxPerMmAvg)) * 100.0;
+
+    state.gridNodesResult = {
+      W,
+      H,
+      useRedGrid,
+      detectedModeLabel,
+      Sx: medStepX,
+      Sy: medStepY,
+      phaseX,
+      phaseY,
+      rowsCount,
+      colsCount,
+      pxPerMmX,
+      pxPerMmY,
+      pxPerMmAvg,
+      rmsWarpPx,
+      maxWarpPx: maxWarp,
+      warpPct,
+      anisotropyPct,
+      nodes,
+      nodeGrid,
+    };
+
+    if (el.gridNodesStatus) {
+      el.gridNodesStatus.textContent =
+        `${detectedModeLabel} • Крестиков: ${nodes.length} • Шаг: ${pxPerMmX.toFixed(2)}×${pxPerMmY.toFixed(2)} пикс/мм • ` +
+        `Деформация листа: RMS ${rmsWarpPx.toFixed(1)} пикс (${warpPct.toFixed(1)}%), макс ${maxWarp.toFixed(1)} пикс`;
+    }
+    renderGridNodesCanvas();
+    return state.gridNodesResult;
+  }
+
+  function renderGridNodesCanvas() {
+    const img = el.imgGridNodesBase;
+    const canvas = el.gridNodesCanvas;
+    const res = state.gridNodesResult;
+    if (!img || !canvas) return;
+
+    const natW = img.naturalWidth || (res && res.W) || 1000;
+    const natH = img.naturalHeight || (res && res.H) || 700;
+    if (el.gridNodesStageWrap && el.gridNodesScrollBox) {
+      const boxW = Math.max(320, (el.gridNodesScrollBox.clientWidth || 600) - 20);
+      const targetW = Math.round(boxW * (state.gridNodesZoom || 1.0));
+      el.gridNodesStageWrap.style.width = `${targetW}px`;
+    }
+
+    const rect = img.getBoundingClientRect();
+    const dispW = rect.width > 20 ? rect.width : img.clientWidth || natW;
+    const dispH = rect.height > 20 ? rect.height : img.clientHeight || natH;
+    if (dispW < 10 || dispH < 10) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(dispW * dpr);
+    canvas.height = Math.round(dispH * dpr);
+    const ctx = canvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, dispW, dispH);
+
+    if (!res) return;
+
+    const scaleX = dispW / natW;
+    const scaleY = dispH / natH;
+    const showCrosses = !el.chkShowGridCrosses || el.chkShowGridCrosses.checked;
+    const showMesh = !el.chkShowWarpMesh || el.chkShowWarpMesh.checked;
+    const showVecs = !el.chkShowWarpVectors || el.chkShowWarpVectors.checked;
+
+    // 1. Draw 2D Paper Deformation Mesh connecting adjacent detected crosses
+    if (showMesh && res.nodeGrid) {
+      ctx.save();
+      ctx.strokeStyle = "rgba(0, 229, 255, 0.42)";
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      for (let i = 0; i < res.rowsCount; i++) {
+        for (let j = 0; j < res.colsCount; j++) {
+          const cur = res.nodeGrid[i][j];
+          if (!cur) continue;
+          const cx = cur.x * scaleX;
+          const cy = cur.y * scaleY;
+          if (j + 1 < res.colsCount && res.nodeGrid[i][j + 1]) {
+            const nxt = res.nodeGrid[i][j + 1];
+            ctx.moveTo(cx, cy);
+            ctx.lineTo(nxt.x * scaleX, nxt.y * scaleY);
+          }
+          if (i + 1 < res.rowsCount && res.nodeGrid[i + 1][j]) {
+            const btm = res.nodeGrid[i + 1][j];
+            ctx.moveTo(cx, cy);
+            ctx.lineTo(btm.x * scaleX, btm.y * scaleY);
+          }
+        }
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // 2. Draw Displacement Vectors from ideal flat grid -> deformed cross (amplified 2.0x for visibility)
+    if (showVecs && res.nodes) {
+      ctx.save();
+      ctx.strokeStyle = "rgba(255, 64, 129, 0.85)";
+      ctx.lineWidth = 1.3;
+      ctx.beginPath();
+      res.nodes.forEach((nd) => {
+        const mag = Math.hypot(nd.dx, nd.dy);
+        if (mag < 0.8) return;
+        const ix = nd.idealX * scaleX;
+        const iy = nd.idealY * scaleY;
+        const tx = (nd.idealX + nd.dx * 2.0) * scaleX;
+        const ty = (nd.idealY + nd.dy * 2.0) * scaleY;
+        ctx.moveTo(ix, iy);
+        ctx.lineTo(tx, ty);
+      });
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // 3. Draw '+' Crosses at every detected grid intersection
+    if (showCrosses && res.nodes) {
+      ctx.save();
+      const crossR = Math.max(3.5, Math.min(7.5, 4.5 * Math.sqrt(state.gridNodesZoom || 1.0)));
+      res.nodes.forEach((nd) => {
+        const cx = nd.x * scaleX;
+        const cy = nd.y * scaleY;
+        const mag = Math.hypot(nd.dx, nd.dy);
+        ctx.strokeStyle = mag > 4.5 ? "#FF5252" : mag > 2.2 ? "#FFD740" : "#00E676";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(cx - crossR, cy);
+        ctx.lineTo(cx + crossR, cy);
+        ctx.moveTo(cx, cy - crossR);
+        ctx.lineTo(cx, cy + crossR);
+        ctx.stroke();
+      });
+      ctx.restore();
+    }
+
+    // 4. Top-right telemetry summary pill
+    ctx.save();
+    const txt = `Крестиков: ${res.nodes.length} • ${res.pxPerMmAvg.toFixed(2)} пикс/мм • RMS деформ.: ${res.rmsWarpPx.toFixed(1)} пикс (${res.warpPct.toFixed(1)}%)`;
+    ctx.font = "600 11px 'IBM Plex Mono', monospace";
+    const tw = ctx.measureText(txt).width + 16;
+    const tx = Math.max(6, dispW - tw - 8);
+    ctx.fillStyle = "rgba(15, 23, 42, 0.86)";
+    ctx.fillRect(tx, 6, tw, 22);
+    ctx.strokeStyle = "#00E676";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(tx, 6, tw, 22);
+    ctx.fillStyle = "#FFFFFF";
+    ctx.fillText(txt, tx + 8, 21);
+    ctx.restore();
+  }
+
+  // 2D Piecewise Bilinear Dewarp of the ECG photo using detected '+' grid crosses
+  async function rectifyPaperByGridCrosses() {
+    const img = el.imgGridNodesBase;
+    const res = state.gridNodesResult || detectGridIntersectionsAndDeformation();
+    if (!img || !res || res.nodes.length < 6) {
+      setStatus("Недостаточно крестиков сетки для распрямления листа", "error");
+      return;
+    }
+
+    setStatus("Выполняется 2D-распрямление деформации бумаги по крестикам сетки...", "busy");
+    const { W, H, rowsCount, colsCount, phaseX, phaseY, Sx, Sy, nodeGrid, pxPerMmAvg } = res;
+
+    // Build complete (rowsCount x colsCount) displacement lattice (dx, dy), filling gaps from nearest detected crosses
+    const dxLat = new Float32Array(rowsCount * colsCount);
+    const dyLat = new Float32Array(rowsCount * colsCount);
+    for (let i = 0; i < rowsCount; i++) {
+      for (let j = 0; j < colsCount; j++) {
+        const nd = nodeGrid[i][j];
+        if (nd) {
+          dxLat[i * colsCount + j] = nd.dx;
+          dyLat[i * colsCount + j] = nd.dy;
+        } else {
+          // Inverse-distance weighted fill from nearby detected crosses
+          let wSum = 0, sDx = 0, sDy = 0;
+          for (let k = 0; k < res.nodes.length; k++) {
+            const o = res.nodes[k];
+            const d2 = (o.i - i) * (o.i - i) + (o.j - j) * (o.j - j);
+            if (d2 <= 16) {
+              const w = 1.0 / (d2 + 0.25);
+              wSum += w;
+              sDx += o.dx * w;
+              sDy += o.dy * w;
+            }
+          }
+          dxLat[i * colsCount + j] = wSum > 0 ? sDx / wSum : 0;
+          dyLat[i * colsCount + j] = wSum > 0 ? sDy / wSum : 0;
+        }
+      }
+    }
+
+    // Read source image pixels
+    const srcCanvas = document.createElement("canvas");
+    srcCanvas.width = W;
+    srcCanvas.height = H;
+    const sCtx = srcCanvas.getContext("2d");
+    sCtx.drawImage(img, 0, 0, W, H);
+    const srcData = sCtx.getImageData(0, 0, W, H).data;
+
+    const dstCanvas = document.createElement("canvas");
+    dstCanvas.width = W;
+    dstCanvas.height = H;
+    const dCtx = dstCanvas.getContext("2d");
+    const dstImg = dCtx.createImageData(W, H);
+    const dstData = dstImg.data;
+
+    // Inverse-warp every pixel (u, v) -> sample source at (u + dx(u,v), v + dy(u,v))
+    const targetStep = 5.0 * pxPerMmAvg; // Make cells isotropic squares!
+    for (let v = 0; v < H; v++) {
+      const fi = (v - phaseY) / targetStep;
+      const i0 = Math.max(0, Math.min(rowsCount - 1, Math.floor(fi)));
+      const i1 = Math.max(0, Math.min(rowsCount - 1, i0 + 1));
+      const ty = Math.max(0, Math.min(1, fi - i0));
+
+      for (let u = 0; u < W; u++) {
+        const fj = (u - phaseX) / targetStep;
+        const j0 = Math.max(0, Math.min(colsCount - 1, Math.floor(fj)));
+        const j1 = Math.max(0, Math.min(colsCount - 1, j0 + 1));
+        const tx = Math.max(0, Math.min(1, fj - j0));
+
+        const idx00 = i0 * colsCount + j0;
+        const idx01 = i0 * colsCount + j1;
+        const idx10 = i1 * colsCount + j0;
+        const idx11 = i1 * colsCount + j1;
+
+        const w00 = (1 - tx) * (1 - ty);
+        const w01 = tx * (1 - ty);
+        const w10 = (1 - tx) * ty;
+        const w11 = tx * ty;
+
+        const ddx = dxLat[idx00] * w00 + dxLat[idx01] * w01 + dxLat[idx10] * w10 + dxLat[idx11] * w11;
+        const ddy = dyLat[idx00] * w00 + dyLat[idx01] * w01 + dyLat[idx10] * w10 + dyLat[idx11] * w11;
+
+        // Also correct any X/Y anisotropy toward targetStep
+        const sx = u * (Sx / targetStep) + ddx;
+        const sy = v * (Sy / targetStep) + ddy;
+
+        const x0 = Math.max(0, Math.min(W - 2, Math.floor(sx)));
+        const y0 = Math.max(0, Math.min(H - 2, Math.floor(sy)));
+        const fx = Math.max(0, Math.min(1, sx - x0));
+        const fy = Math.max(0, Math.min(1, sy - y0));
+
+        const p00 = (y0 * W + x0) * 4;
+        const p01 = p00 + 4;
+        const p10 = p00 + W * 4;
+        const p11 = p10 + 4;
+
+        const outP = (v * W + u) * 4;
+        for (let c = 0; c < 3; c++) {
+          const val =
+            srcData[p00 + c] * (1 - fx) * (1 - fy) +
+            srcData[p01 + c] * fx * (1 - fy) +
+            srcData[p10 + c] * (1 - fx) * fy +
+            srcData[p11 + c] * fx * fy;
+          dstData[outP + c] = Math.round(val);
+        }
+        dstData[outP + 3] = 255;
+      }
+    }
+    dCtx.putImageData(dstImg, 0, 0);
+
+    const rectifiedBlob = await new Promise((resolve) => dstCanvas.toBlob(resolve, "image/png"));
+    const rectFile = new File([rectifiedBlob], `rectified_${state.currentSource || "ecg"}.png`, { type: "image/png" });
+    state.uploadedFile = rectFile;
+    if (el.exampleDescription) {
+      el.exampleDescription.textContent = `Выпрямлено по ${res.nodes.length} крестикам сетки (${pxPerMmAvg.toFixed(2)} пикс/мм, RMS был ${res.rmsWarpPx.toFixed(1)} пикс)`;
+    }
+    await runDigitization(Number(pxPerMmAvg.toFixed(2)));
+    setStatus(`Лист выпрямлен по ${res.nodes.length} крестикам, масштаб ${pxPerMmAvg.toFixed(2)} пикс/мм применён`, "ready");
+  }
+
+  // Remove grid lines, shadows & uneven paper illumination artifacts while preserving dark ECG traces
+  async function cleanGridAndLightingArtifacts() {
+    const img = el.imgGridNodesBase;
+    const res = state.gridNodesResult || detectGridIntersectionsAndDeformation();
+    if (!img || !res) return;
+
+    setStatus("Удаление артефактов сетки, теней и выравнивание фона бумаги...", "busy");
+    const { W, H, useRedGrid } = res;
+    const c = document.createElement("canvas");
+    c.width = W;
+    c.height = H;
+    const ctx = c.getContext("2d");
+    ctx.drawImage(img, 0, 0, W, H);
+    const imgData = ctx.getImageData(0, 0, W, H);
+    const d = imgData.data;
+
+    // Estimate local illumination envelope via 1D horizontal box filter (radius 24)
+    const lum = new Float32Array(W * H);
+    for (let i = 0; i < W * H; i++) {
+      lum[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+    }
+    const bg = new Float32Array(W * H);
+    const rad = 22;
+    for (let y = 0; y < H; y++) {
+      const off = y * W;
+      let acc = 0, cnt = 0;
+      for (let x = 0; x <= Math.min(W - 1, rad); x++) {
+        acc += lum[off + x];
+        cnt++;
+      }
+      for (let x = 0; x < W; x++) {
+        bg[off + x] = acc / Math.max(1, cnt);
+        if (x + rad + 1 < W) { acc += lum[off + x + rad + 1]; cnt++; }
+        if (x - rad >= 0) { acc -= lum[off + x - rad]; cnt--; }
+      }
+    }
+
+    for (let i = 0; i < W * H; i++) {
+      const r = d[i * 4];
+      const g = d[i * 4 + 1];
+      const b = d[i * 4 + 2];
+      const l = lum[i];
+      const localBg = Math.max(85, bg[i]);
+      const redEx = r - 0.52 * g - 0.48 * b;
+      const isColoredGrid = useRedGrid && redEx > 6 && l > 65;
+
+      // Normalize illumination so shadows & uneven paper lighting become clean white (252)
+      let norm = Math.min(255, Math.max(0, (l / localBg) * 248));
+      if (isColoredGrid) {
+        norm = 250;
+      } else if (!useRedGrid && localBg - l < 42) {
+        // Suppress light gray grid lines on B&W scans while preserving darker ECG waveforms
+        norm = 250;
+      } else if (norm < 210) {
+        // Sharpen dark ECG ink trace contrast
+        norm = Math.max(0, (norm - 40) * 1.15);
+      } else {
+        norm = 252;
+      }
+      const v = Math.round(Math.max(0, Math.min(255, norm)));
+      d[i * 4] = v;
+      d[i * 4 + 1] = v;
+      d[i * 4 + 2] = v;
+      d[i * 4 + 3] = 255;
+    }
+
+    ctx.putImageData(imgData, 0, 0);
+    const cleanedBlob = await new Promise((resolve) => c.toBlob(resolve, "image/png"));
+    const cleanFile = new File([cleanedBlob], `cleaned_${state.currentSource || "ecg"}.png`, { type: "image/png" });
+    state.uploadedFile = cleanFile;
+    await runDigitization(Number(res.pxPerMmAvg.toFixed(2)));
+    setStatus("Артефакты сетки и тени удалены, сигнал пересчитан", "ready");
+  }
+
+  function bindGridNodesEvents() {
+    const setGridZoom = (z) => {
+      state.gridNodesZoom = Math.max(1.0, Math.min(4.0, z));
+      if (el.selectGridNodesZoom) {
+        const opts = Array.from(el.selectGridNodesZoom.options).map((o) => parseFloat(o.value));
+        const nearest = opts.reduce((a, b) => (Math.abs(b - state.gridNodesZoom) < Math.abs(a - state.gridNodesZoom) ? b : a));
+        el.selectGridNodesZoom.value = String(nearest);
+      }
+      renderGridNodesCanvas();
+    };
+
+    if (el.selectGridNodesZoom) {
+      el.selectGridNodesZoom.addEventListener("change", () => setGridZoom(parseFloat(el.selectGridNodesZoom.value) || 1.0));
+    }
+    if (el.btnGridNodesZoomOut) {
+      el.btnGridNodesZoomOut.addEventListener("click", () => setGridZoom((state.gridNodesZoom || 1.0) - 0.5));
+    }
+    if (el.btnGridNodesZoomIn) {
+      el.btnGridNodesZoomIn.addEventListener("click", () => setGridZoom((state.gridNodesZoom || 1.0) + 0.5));
+    }
+    if (el.selectGridColorMode) {
+      el.selectGridColorMode.addEventListener("change", () => detectGridIntersectionsAndDeformation());
+    }
+    if (el.btnDetectGridCrosses) {
+      el.btnDetectGridCrosses.addEventListener("click", () => detectGridIntersectionsAndDeformation());
+    }
+    if (el.btnRectifyByCrosses) {
+      el.btnRectifyByCrosses.addEventListener("click", () => rectifyPaperByGridCrosses());
+    }
+    if (el.btnCleanGridArtifacts) {
+      el.btnCleanGridArtifacts.addEventListener("click", () => cleanGridAndLightingArtifacts());
+    }
+    if (el.btnResetGridRectify) {
+      el.btnResetGridRectify.addEventListener("click", () => {
+        state.uploadedFile = null;
+        runDigitization(null);
+      });
+    }
+    if (el.chkShowGridCrosses) el.chkShowGridCrosses.addEventListener("change", () => renderGridNodesCanvas());
+    if (el.chkShowWarpMesh) el.chkShowWarpMesh.addEventListener("change", () => renderGridNodesCanvas());
+    if (el.chkShowWarpVectors) el.chkShowWarpVectors.addEventListener("change", () => renderGridNodesCanvas());
+
+    // Drag-to-pan on gridNodesScrollBox
+    if (el.gridNodesCanvas && el.gridNodesScrollBox) {
+      el.gridNodesCanvas.addEventListener("mousedown", (evt) => {
+        state.gridNodesPanState = {
+          startX: evt.clientX,
+          startY: evt.clientY,
+          scrollL: el.gridNodesScrollBox.scrollLeft,
+          scrollT: el.gridNodesScrollBox.scrollTop,
+        };
+        el.gridNodesCanvas.style.cursor = "grabbing";
+      });
+      window.addEventListener("mousemove", (evt) => {
+        if (!state.gridNodesPanState) return;
+        el.gridNodesScrollBox.scrollLeft = state.gridNodesPanState.scrollL - (evt.clientX - state.gridNodesPanState.startX);
+        el.gridNodesScrollBox.scrollTop = state.gridNodesPanState.scrollT - (evt.clientY - state.gridNodesPanState.startY);
+      });
+      window.addEventListener("mouseup", () => {
+        if (state.gridNodesPanState) {
+          state.gridNodesPanState = null;
+          el.gridNodesCanvas.style.cursor = "grab";
+        }
+      });
+      el.gridNodesScrollBox.addEventListener("wheel", (evt) => {
+        if (evt.ctrlKey) {
+          evt.preventDefault();
+          setGridZoom((state.gridNodesZoom || 1.0) + (evt.deltaY < 0 ? 0.5 : -0.5));
+        }
+      }, { passive: false });
+    }
+  }
+
   function buildLeadPills(leadNames) {
     el.leadPillsContainer.innerHTML = "";
     leadNames.forEach((ln) => {
@@ -2508,18 +3276,21 @@
 
     const cols = leadNames.length >= 12 ? 2 : 1;
     const rows = Math.ceil(leadNames.length / cols);
-    const rowHeight = 84;
-    const cssWidth = Math.max(480, container.clientWidth || 640);
+    const z = state.w1Zoom || 1.0;
+    const baseW = Math.max(480, (container.clientWidth || 640) - 4);
+    const rowHeight = Math.round(84 * z);
+    const cssWidth = Math.round(baseW * z);
     const cssHeight = Math.max(400, rows * rowHeight + 24);
 
     canvas.width = Math.round(cssWidth * dpr);
     canvas.height = Math.round(cssHeight * dpr);
+    canvas.style.width = `${cssWidth}px`;
     canvas.style.height = `${cssHeight}px`;
 
     const ctx = canvas.getContext("2d");
     ctx.scale(dpr, dpr);
 
-    const pxPerMm = 4.2;
+    const pxPerMm = 4.2 * z;
     drawMillimeterGrid(ctx, cssWidth, cssHeight, pxPerMm);
 
     const colWidth = cssWidth / cols;
@@ -4241,6 +5012,20 @@
 
     canvas.addEventListener("mousedown", (evt) => {
       if (evt.button === 2) return; // handled by contextmenu
+      // Panning in 'pan' mode or with middle mouse button
+      if (state.w1Tool === "pan" || evt.button === 1) {
+        evt.preventDefault();
+        const wrap = el.multileadContainer || canvas.parentElement;
+        state.w1PanState = {
+          startX: evt.clientX,
+          startY: evt.clientY,
+          scrollL: wrap ? wrap.scrollLeft : 0,
+          scrollT: wrap ? wrap.scrollTop : 0,
+        };
+        canvas.style.cursor = "grabbing";
+        return;
+      }
+
       const pos = getPos(evt);
       const rHit = findW1RPeakHit(pos);
       const chBox = findW1ChannelBox(pos);
@@ -4292,6 +5077,14 @@
     });
 
     window.addEventListener("mousemove", (evt) => {
+      if (state.w1PanState) {
+        const wrap = el.multileadContainer || canvas.parentElement;
+        if (wrap) {
+          wrap.scrollLeft = state.w1PanState.scrollL - (evt.clientX - state.w1PanState.startX);
+          wrap.scrollTop = state.w1PanState.scrollT - (evt.clientY - state.w1PanState.startY);
+        }
+        return;
+      }
       if (!state.w1DragState) return;
       const pos = getPos(evt);
       const { lead, beatIdx, box } = state.w1DragState;
@@ -4301,8 +5094,72 @@
     });
 
     window.addEventListener("mouseup", () => {
+      if (state.w1PanState) {
+        state.w1PanState = null;
+        canvas.style.cursor = state.w1Tool === "pan" ? "grab" : "pointer";
+      }
       state.w1DragState = null;
     });
+
+    // Window 1 Zoom Controls + Ctrl+Wheel Zoom
+    const setW1Zoom = (newZ, anchorEvt = null) => {
+      const wrap = el.multileadContainer || canvas.parentElement;
+      const oldZ = state.w1Zoom || 1.0;
+      const clampedZ = Math.max(1.0, Math.min(4.0, Math.round(newZ * 2) / 2));
+      if (Math.abs(clampedZ - oldZ) < 0.01) return;
+
+      let relX = 0.5;
+      let relY = 0.5;
+      if (wrap && anchorEvt) {
+        const wRect = wrap.getBoundingClientRect();
+        const mx = anchorEvt.clientX - wRect.left;
+        const my = anchorEvt.clientY - wRect.top;
+        relX = (wrap.scrollLeft + mx) / Math.max(1, canvas.clientWidth);
+        relY = (wrap.scrollTop + my) / Math.max(1, canvas.clientHeight);
+      }
+
+      state.w1Zoom = clampedZ;
+      if (el.selectW1Zoom) {
+        const opts = Array.from(el.selectW1Zoom.options).map((o) => parseFloat(o.value));
+        const nearest = opts.reduce((a, b) => (Math.abs(b - clampedZ) < Math.abs(a - clampedZ) ? b : a));
+        el.selectW1Zoom.value = String(nearest);
+      }
+      renderMultiLeadCanvas();
+
+      if (wrap && anchorEvt) {
+        const wRect = wrap.getBoundingClientRect();
+        wrap.scrollLeft = Math.max(0, relX * canvas.clientWidth - (anchorEvt.clientX - wRect.left));
+        wrap.scrollTop = Math.max(0, relY * canvas.clientHeight - (anchorEvt.clientY - wRect.top));
+      }
+    };
+
+    if (el.selectW1Zoom) {
+      el.selectW1Zoom.addEventListener("change", () => setW1Zoom(parseFloat(el.selectW1Zoom.value) || 1.0));
+    }
+    if (el.btnW1ZoomOut) {
+      el.btnW1ZoomOut.addEventListener("click", () => setW1Zoom((state.w1Zoom || 1.0) - 0.5));
+    }
+    if (el.btnW1ZoomIn) {
+      el.btnW1ZoomIn.addEventListener("click", () => setW1Zoom((state.w1Zoom || 1.0) + 0.5));
+    }
+    if (el.btnW1ZoomReset) {
+      el.btnW1ZoomReset.addEventListener("click", () => {
+        setW1Zoom(1.0);
+        const wrap = el.multileadContainer || canvas.parentElement;
+        if (wrap) {
+          wrap.scrollLeft = 0;
+          wrap.scrollTop = 0;
+        }
+      });
+    }
+    if (el.multileadContainer) {
+      el.multileadContainer.addEventListener("wheel", (evt) => {
+        if (evt.ctrlKey) {
+          evt.preventDefault();
+          setW1Zoom((state.w1Zoom || 1.0) + (evt.deltaY < 0 ? 0.5 : -0.5), evt);
+        }
+      }, { passive: false });
+    }
   }
 
   // Interactive Mouse & Touch Events for Window 2 (#caliperCanvas)
@@ -4718,6 +5575,14 @@
           setTimeout(() => renderTraceOverlayCanvas(), 20);
         } else if (btn.getAttribute("data-tab") === "aligned") {
           setTimeout(() => renderPhotoCalibrationCanvas(), 20);
+        } else if (btn.getAttribute("data-tab") === "gridnodes") {
+          setTimeout(() => {
+            if (!state.gridNodesResult) {
+              detectGridIntersectionsAndDeformation();
+            } else {
+              renderGridNodesCanvas();
+            }
+          }, 25);
         }
       });
     });
@@ -4728,12 +5593,16 @@
         document.querySelectorAll(".w1-tool-btn").forEach((b) => b.classList.remove("active"));
         btn.classList.add("active");
         state.w1Tool = btn.getAttribute("data-w1-tool") || "select_move";
+        if (el.multileadCanvas) {
+          el.multileadCanvas.style.cursor = state.w1Tool === "pan" ? "grab" : "pointer";
+        }
       });
     });
 
     bindMultiLeadCanvasEvents();
     bindTraceOverlayEvents();
     bindPhotoCalibrationEvents();
+    bindGridNodesEvents();
 
     el.chkShowFiducialsMulti.addEventListener("change", () => renderMultiLeadCanvas());
 
@@ -4887,6 +5756,7 @@
       renderMultiLeadCanvas();
       renderTraceOverlayCanvas();
       renderPhotoCalibrationCanvas();
+      renderGridNodesCanvas();
       renderCaliperWorkbenchCanvas(computeLiveMetricsClient());
       renderVectorcardiogram();
     });

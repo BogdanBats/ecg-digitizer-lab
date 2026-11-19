@@ -475,7 +475,7 @@ body {
   border-radius: 3px;
 }
 
-#calGridCanvas, #traceOverlayCanvas {
+#calGridCanvas, #traceOverlayCanvas, #gridNodesCanvas {
   position: absolute;
   top: 0;
   left: 0;
@@ -513,13 +513,12 @@ body {
   flex: 1;
   min-height: 405px;
   max-height: 490px;
-  overflow-y: auto;
+  overflow: auto;
   background: var(--ecg-paper-tint);
 }
 
 #multileadCanvas {
   display: block;
-  width: 100%;
   cursor: pointer;
 }
 

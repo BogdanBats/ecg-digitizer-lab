@@ -114,6 +114,7 @@
           <button type="button" class="tab-btn active" data-tab="multilead" role="tab">Все отведения (Цифровой сигнал)</button>
           <button type="button" class="tab-btn" data-tab="overlay" role="tab">Наложение контура на фото</button>
           <button type="button" class="tab-btn" data-tab="aligned" role="tab">Фото &amp; Калибровка сетки</button>
+          <button type="button" class="tab-btn" data-tab="gridnodes" role="tab">Крестики сетки &amp; Деформация</button>
           <button type="button" class="tab-btn" data-tab="heatmap" role="tab">Карта сегментации U-Net</button>
         </div>
       </div>
@@ -127,6 +128,9 @@
               <button type="button" class="w1-tool-btn active" data-w1-tool="select_move" title="Клик по каналу выбирает его; перетаскивание красной метки R двигает её">
                 Выбор / Двигать R
               </button>
+              <button type="button" class="w1-tool-btn" data-w1-tool="pan" title="Панорамирование (перетаскивание холста мышью; также работает колесо мыши и средняя кнопка)">
+                ✋ Панорама
+              </button>
               <button type="button" class="w1-tool-btn" data-w1-tool="r_add_del" title="Клик по сигналу добавляет метку R; клик (или ПКМ) по существующей метке R удаляет её">
                 + Добавить / ✕ Удалить R
               </button>
@@ -135,6 +139,18 @@
               </button>
             </div>
             <div class="multilead-controls">
+              <span class="toolbar-label">Зум:</span>
+              <button type="button" id="btnW1ZoomOut" class="btn btn-xs btn-ghost" title="Уменьшить масштаб Окна 1">−</button>
+              <select id="selectW1Zoom" class="select-input-sm" title="Масштаб обзора всех отведений в Окне 1 (колесо мыши + панорамирование)">
+                <option value="1" selected>1.0×</option>
+                <option value="1.5">1.5×</option>
+                <option value="2">2.0×</option>
+                <option value="3">3.0×</option>
+                <option value="4">4.0×</option>
+              </select>
+              <button type="button" id="btnW1ZoomIn" class="btn btn-xs btn-ghost" title="Увеличить масштаб Окна 1">+</button>
+              <button type="button" id="btnW1ZoomReset" class="btn btn-xs btn-ghost" title="Сбросить масштаб и панораму Окна 1">1:1</button>
+              <span class="toolbar-sep">|</span>
               <label class="checkbox-label" title="Синхронизировать добавление/коррекцию R и артефактов по всем синхронным каналам">
                 <input type="checkbox" id="chkSyncChannels" />
                 <span>Синхр. все каналы</span>
@@ -254,7 +270,59 @@
           </div>
         </div>
 
-        <!-- Tab 4: U-Net Segmentation Probability Heatmap -->
+        <!-- Tab 4: Grid Intersections (Crosses '+') & Paper Deformation Rectification -->
+        <div class="tab-pane" id="tab-gridnodes">
+          <div class="img-viewer-toolbar cal-toolbar">
+            <div class="manual-cal-controls">
+              <label for="selectGridColorMode" class="toolbar-label">Тип сетки:</label>
+              <select id="selectGridColorMode" class="select-input-sm" title="Режим выделения линий калибровочной сетки">
+                <option value="auto" selected>Авто (Красная цветная / Серая Ч/Б)</option>
+                <option value="color_red">Цветная (Красная / Розовая / Оранж.)</option>
+                <option value="bw_gray">Ч/Б скан или PDF (Серая сетка)</option>
+              </select>
+
+              <button type="button" id="btnDetectGridCrosses" class="btn btn-sm" title="Пересчитать пересечения (крестики) калибровочной сетки">Найти крестики (+)</button>
+              <button type="button" id="btnRectifyByCrosses" class="btn btn-sm btn-primary-sm" title="Построить 2D-поле деформации бумаги по крестикам, распрямить геометрию листа, откалибровать масштаб и пересчитать ЭКГ">Выпрямить лист &amp; Откалибровать</button>
+              <button type="button" id="btnCleanGridArtifacts" class="btn btn-sm" title="Убрать артефакты сетки, тени и неравномерную засветку бумаги по карте крестиков">Убрать артефакты</button>
+              <button type="button" id="btnResetGridRectify" class="btn btn-sm btn-ghost" title="Вернуть исходное изображение до распрямления">Сбросить</button>
+
+              <span class="toolbar-sep">|</span>
+              <span class="toolbar-label">Зум:</span>
+              <button type="button" id="btnGridNodesZoomOut" class="btn btn-xs btn-ghost">−</button>
+              <select id="selectGridNodesZoom" class="select-input-sm">
+                <option value="1" selected>1.0×</option>
+                <option value="1.5">1.5×</option>
+                <option value="2">2.0×</option>
+                <option value="3">3.0×</option>
+                <option value="4">4.0×</option>
+              </select>
+              <button type="button" id="btnGridNodesZoomIn" class="btn btn-xs btn-ghost">+</button>
+            </div>
+            <div class="cal-overlay-toggles">
+              <label class="checkbox-label" title="Показать найденные узлы пересечения линий сетки (крестики +)">
+                <input type="checkbox" id="chkShowGridCrosses" checked />
+                <span>Крестики (+)</span>
+              </label>
+              <label class="checkbox-label" title="Показать 2D-решётку деформации листа бумаги между соседними крестиками">
+                <input type="checkbox" id="chkShowWarpMesh" checked />
+                <span>Сетка деформации</span>
+              </label>
+              <label class="checkbox-label" title="Показать векторы смещения узлов от идеальной ортогональной сетки">
+                <input type="checkbox" id="chkShowWarpVectors" checked />
+                <span>Векторы смещения</span>
+              </label>
+              <span id="gridNodesStatus" class="cal-ruler-status">Определение крестиков сетки и поля деформации бумаги...</span>
+            </div>
+          </div>
+          <div class="img-scroll-box" id="gridNodesScrollBox">
+            <div class="cal-stage-wrap" id="gridNodesStageWrap">
+              <img id="imgGridNodesBase" alt="Анализ пересечений калибровочной сетки и деформации листа" />
+              <canvas id="gridNodesCanvas"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 5: U-Net Segmentation Probability Heatmap -->
         <div class="tab-pane" id="tab-heatmap">
           <div class="img-viewer-toolbar">
             <span>Сегментация U-Net (Open-ECG-Digitizer): бирюзовый/зелёный — вероятностная карта сигнала ЭКГ, красный — миллиметровая сетка.</span>
