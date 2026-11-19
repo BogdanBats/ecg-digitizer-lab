@@ -60,6 +60,32 @@ DL_METHODS = ("hybrid_ensemble", "open_ecg_unet", "dangnh_heatmap_dp")
 SUPPORTED_METHODS = DL_METHODS + ("krones_hough_cv",)
 
 
+try:  # Optional JIT for the Viterbi DP inner loop (pure-NumPy fallback below gives identical results)
+    import numba as _numba
+
+    @_numba.njit(cache=True, nogil=True)
+    def _viterbi_forward_numba(dp, backptr, reward, blank_cumsum, qrs_col_mask, idx_mat, pen_qrs, pen_non_qrs):  # pragma: no cover
+        H_b, W_b = reward.shape
+        M = idx_mat.shape[1]
+        for x in range(1, W_b):
+            pen = pen_qrs if qrs_col_mask[x] else pen_non_qrs
+            for y in range(H_b):
+                cs_y = blank_cumsum[y, x]
+                best_val = -np.inf
+                best_src = 0
+                for m in range(M):
+                    src = idx_mat[y, m]
+                    val = (dp[src, x - 1] - pen[m]) - 0.42 * abs(cs_y - blank_cumsum[src, x])
+                    if val > best_val:
+                        best_val = val
+                        best_src = src
+                dp[y, x] = reward[y, x] + best_val
+                backptr[y, x] = best_src
+
+except Exception:  # pragma: no cover - numba not installed
+    _viterbi_forward_numba = None
+
+
 def deep_learning_status() -> Dict[str, Any]:
     """Reports whether the U-Net based methods can run (PyTorch + vendor code + weight files present)."""
     if _DL_IMPORT_ERROR is not None:
@@ -372,11 +398,21 @@ def crop_and_deskew_ecg_region(
             # Find largest contiguous active vertical block (isolates thermal strip on desk or grid inside screenshot)
             gaps = np.where(np.diff(active_rows) > max(15, int(0.06 * H)))[0]
             blocks = np.split(active_rows, gaps + 1)
-            best_block = max(blocks, key=lambda b: float(np.sum(row_profile[b])))
+            best_i = max(range(len(blocks)), key=lambda i: float(np.sum(row_profile[blocks[i]])))
+            # Grow the block over neighbours printed on the SAME grid paper: a 12x1 A4 sheet has an empty band
+            # between limb and chest leads, which must not cut the sheet in half. A desk / hand next to a thermal
+            # strip has (almost) no grid response, so it is still excluded.
+            grid_rows = np.mean(grid_prob, axis=1)
+            best_grid = float(np.mean(grid_rows[blocks[best_i]])) + 1e-6
+            lo_i = hi_i = best_i
+            while lo_i - 1 >= 0 and float(np.mean(grid_rows[blocks[lo_i - 1][0] : blocks[lo_i][0]])) >= 0.5 * best_grid:
+                lo_i -= 1
+            while hi_i + 1 < len(blocks) and float(np.mean(grid_rows[blocks[hi_i][-1] : blocks[hi_i + 1][-1] + 1])) >= 0.5 * best_grid:
+                hi_i += 1
             pad_y = int(round(0.025 * H))
             pad_x = int(round(0.015 * W))
-            y0 = max(0, int(best_block[0]) - pad_y)
-            y1 = min(H, int(best_block[-1]) + pad_y)
+            y0 = max(0, int(blocks[lo_i][0]) - pad_y)
+            y1 = min(H, int(blocks[hi_i][-1]) + pad_y)
             x0 = max(0, int(active_cols[0]) - pad_x)
             x1 = min(W, int(active_cols[-1]) + pad_x)
             # Only crop if box is meaningful
@@ -436,46 +472,181 @@ def crop_and_deskew_ecg_region(
     return img_c, sig_c, grid_c, text_c, meta
 
 
-def estimate_pixel_spacing_mm(
-    grid_prob: np.ndarray,
-    img_rgb: np.ndarray,
-    expected_rows: int = 6,
-) -> Dict[str, float]:
-    """
-    Uses Open-ECG-Digitizer's `PixelSizeFinder` (zoomed autocorrelation comb search)
-    cross-checked with FFT / autocorrelation periodicity of the grid to compute exact
-    `px_per_mm_x`, `px_per_mm_y`, and `mm_per_pixel`.
-    """
-    H, W = grid_prob.shape
-    px_per_mm_x = 0.0
-    px_per_mm_y = 0.0
-    calib_method = "pixel_size_finder"
+def _weighted_autocorr(profile: np.ndarray, highpass_frac: float = 0.0) -> Tuple[np.ndarray, int]:
+    """Mean-removed one-sided autocorrelation of a 1D grid projection, multiplied by a linear 1->0 lag weight
+    (Open-ECG-Digitizer convention: index j <-> lag j+1). Optional moving-average high-pass removes lighting /
+    paper-colour trends that otherwise bias the comb search towards the smallest periods."""
+    prof = profile.astype(np.float64)
+    if highpass_frac > 0.0:
+        win = max(9, int(len(prof) * highpass_frac)) | 1
+        prof = prof - ndimage.uniform_filter1d(prof, size=win, mode="reflect")
+    prof = prof - prof.mean()
+    ac = np.correlate(prof, prof, mode="full")
+    ac = ac[: ac.shape[0] // 2][::-1].astype(np.float32)
+    ac = ac - ac.mean()
+    n = ac.shape[0]
+    return ac * np.linspace(1.0, 0.0, n, dtype=np.float32), n
 
-    # 1. Try Open-ECG-Digitizer's PixelSizeFinder on the central cropped grid region
+
+def _comb_scores(acw: np.ndarray, n: int, cands_5mm_px: np.ndarray, lower_factor: float = 0.35) -> np.ndarray:
+    """Vectorized PixelSizeFinder comb score for every candidate 5-mm period: teeth every 1 mm, weight 1 on
+    every 5th (major) line and `lower_factor` on minor lines, summed over the weighted autocorrelation."""
+    steps = cands_5mm_px.astype(np.float32) / 5.0  # pixels between 1-mm lines
+    k_max = int(np.ceil(n / max(1e-3, float(steps.min())))) + 1
+    k = np.arange(k_max, dtype=np.float32)
+    idx = np.round(k[None, :] * steps[:, None]).astype(np.int64)  # (S, K)
+    valid = idx < n
+    weights = np.where((np.arange(k_max) % 5) == 0, 1.0, lower_factor).astype(np.float32)
+    return np.sum(np.where(valid, acw[np.minimum(idx, n - 1)] * weights[None, :], 0.0), axis=1)
+
+
+def _comb_search_pxls_between_lines(
+    profile: np.ndarray,
+    aspect: float,
+    samples: int,
+    min_lines: float,
+    max_lines: float,
+    lower_factor: float,
+    max_zoom: int = 10,
+    zoom_factor: float = 10.0,
+) -> float:
+    """
+    Vectorized NumPy port of Open-ECG-Digitizer `PixelSizeFinder._find_pxls_between_horizontal_grid_lines`
+    (same autocorrelation, comb template, linear lag weighting and 10-level zoomed grid search), ~50× faster
+    than the per-candidate Python loop and without a PyTorch dependency.
+    """
+    acw, n = _weighted_autocorr(profile)
+    if n < 8:
+        return 0.0
+
+    def grid_search(lo: float, hi: float) -> float:
+        cands = np.linspace(lo, hi, samples, dtype=np.float32)  # pixels between 5-mm lines
+        return float(cands[int(np.argmax(_comb_scores(acw, n, cands, lower_factor)))])
+
+    min_d = n / (max_lines / aspect)
+    max_d = n / (min_lines / aspect)
+    best = grid_search(min_d, max_d)
+    for _ in range(max_zoom):
+        w = (max_d - min_d) / zoom_factor
+        min_d = max(best - w, min_d)
+        max_d = min(best + w, max_d)
+        best = grid_search(min_d, max_d)
+    return best
+
+
+def fast_pixel_size_finder(
+    grid_map: np.ndarray,
+    mm_between_grid_lines: float = 5.0,
+    samples: int = 800,
+    min_number_of_grid_lines: int = 18,
+    max_number_of_grid_lines: int = 95,
+    lower_grid_line_factor: float = 0.35,
+) -> Tuple[float, float]:
+    """Returns `(mm_per_px_x, mm_per_px_y)` exactly like `PixelSizeFinder.forward` (x uses aspect 1, y uses W/H)."""
+    H, W = grid_map.shape
+    pxl_x = _comb_search_pxls_between_lines(
+        grid_map.sum(axis=0), 1.0, samples, min_number_of_grid_lines, max_number_of_grid_lines, lower_grid_line_factor
+    )
+    pxl_y = _comb_search_pxls_between_lines(
+        grid_map.sum(axis=1), W / float(H), samples, min_number_of_grid_lines, max_number_of_grid_lines, lower_grid_line_factor
+    )
+    mm_x = mm_between_grid_lines / pxl_x if pxl_x > 1e-6 else 0.0
+    mm_y = mm_between_grid_lines / pxl_y if pxl_y > 1e-6 else 0.0
+    return mm_x, mm_y
+
+
+def _per_axis_pixel_size_finder(grid_sub: np.ndarray) -> Tuple[float, float]:
+    """Original Open-ECG-Digitizer settings (18-95 major lines in view); (0, 0) unless X and Y agree within 25 %."""
     try:
-        if PixelSizeFinder is None or torch is None:
-            raise RuntimeError("PixelSizeFinder unavailable")
-        cy0, cy1 = int(0.1 * H), int(0.9 * H)
-        cx0, cx1 = int(0.1 * W), int(0.9 * W)
-        sub_grid = torch.from_numpy(grid_prob[cy0:cy1, cx0:cx1]).float()
-        finder = PixelSizeFinder(
+        mm_x, mm_y = fast_pixel_size_finder(
+            grid_sub,
             mm_between_grid_lines=5,
             samples=800,
             min_number_of_grid_lines=18,
             max_number_of_grid_lines=95,
             lower_grid_line_factor=0.35,
         )
-        mm_x, mm_y = finder(sub_grid)
-        px_x = 1.0 / float(mm_x) if float(mm_x) > 1e-4 else 0.0
-        px_y = 1.0 / float(mm_y) if float(mm_y) > 1e-4 else 0.0
-        # Check if x and y agree within 25% (isotropic ECG grid square!)
-        if px_x > 1.2 and px_y > 1.2 and 0.75 <= (px_x / px_y) <= 1.33:
-            px_per_mm_x = px_x
-            px_per_mm_y = px_y
     except Exception:
-        pass
+        return 0.0, 0.0
+    px_x = 1.0 / float(mm_x) if float(mm_x) > 1e-4 else 0.0
+    px_y = 1.0 / float(mm_y) if float(mm_y) > 1e-4 else 0.0
+    if px_x > 1.2 and px_y > 1.2 and 0.75 <= (px_x / px_y) <= 1.33:
+        return px_x, px_y
+    return 0.0, 0.0
 
-    # 2. Cross-check with 1D autocorrelation peak of horizontal & vertical grid projections
+
+def joint_isotropic_grid_search(
+    grid_sub: np.ndarray,
+    full_width_px: float,
+    min_visible_mm: float = 70.0,
+    max_visible_mm: float = 420.0,
+    samples: int = 1500,
+    per_axis_tolerance: float = 0.08,
+) -> Optional[Tuple[float, float]]:
+    """
+    Robust px/mm estimate that fixes the two failure modes of the per-axis PixelSizeFinder search:
+    1. its fixed "18-95 major squares in view" range excludes close-up photos (true period out of range, so it
+       locks onto the 2.5-mm half period or onto the 1-mm dots);
+    2. X and Y are searched independently, so one faint axis (e.g. pale vertical lines) breaks the isotropy check.
+    The ECG grid is square, so both axes' comb scores are summed over one log-spaced candidate range bounded by
+    physically plausible paper sizes (70-420 mm visible), then each axis is refined within +/-8 % (perspective).
+    Returns `(px_per_mm_x, px_per_mm_y)`, or None when the optimum sits on the search boundary (not trustworthy).
+    """
+    acw_x, n_x = _weighted_autocorr(grid_sub.sum(axis=0), highpass_frac=0.12)
+    acw_y, n_y = _weighted_autocorr(grid_sub.sum(axis=1), highpass_frac=0.12)
+    if min(n_x, n_y) < 40:
+        return None
+    lo = 5.0 * max(1.2, full_width_px / max_visible_mm)
+    hi = min(5.0 * full_width_px / min_visible_mm, min(n_x, n_y) / 4.0)  # >= 4 major squares inside the crop
+    if hi <= lo * 1.05:
+        return None
+    cands = np.geomspace(lo, hi, samples)
+    sx = _comb_scores(acw_x, n_x, cands)
+    sy = _comb_scores(acw_y, n_y, cands)
+    total = sx / (np.max(np.abs(sx)) + 1e-12) + sy / (np.max(np.abs(sy)) + 1e-12)
+    best_i = int(np.argmax(total))
+    if best_i < 0.01 * samples or best_i > 0.99 * samples:
+        return None
+    p0 = float(cands[best_i])
+    refined = []
+    for acw, n in ((acw_x, n_x), (acw_y, n_y)):
+        cc = np.linspace((1.0 - per_axis_tolerance) * p0, (1.0 + per_axis_tolerance) * p0, 600)
+        refined.append(float(cc[int(np.argmax(_comb_scores(acw, n, cc)))]) / 5.0)
+    return refined[0], refined[1]
+
+
+def estimate_pixel_spacing_mm(
+    grid_prob: np.ndarray,
+    img_rgb: np.ndarray,
+    expected_rows: int = 6,
+) -> Dict[str, float]:
+    """
+    Grid calibration in three tiers: joint isotropic comb search (`joint_isotropic_grid_search`), then the
+    original per-axis Open-ECG-Digitizer `PixelSizeFinder` range, then a paper-size prior. Returns
+    `px_per_mm_x`, `px_per_mm_y`, `mm_per_px_*` and the tier used in `method`.
+    """
+    H, W = grid_prob.shape
+    px_per_mm_x = 0.0
+    px_per_mm_y = 0.0
+    calib_method = "joint_grid_search"
+    cy0, cy1 = int(0.1 * H), int(0.9 * H)
+    cx0, cx1 = int(0.1 * W), int(0.9 * W)
+    grid_sub = grid_prob[cy0:cy1, cx0:cx1].astype(np.float32)
+
+    # 1. Joint isotropic comb search over both axes with physically plausible bounds
+    try:
+        joint = joint_isotropic_grid_search(grid_sub, full_width_px=float(W))
+        if joint is not None:
+            px_per_mm_x, px_per_mm_y = joint
+    except Exception:
+        px_per_mm_x = px_per_mm_y = 0.0
+
+    # 2. Fallback: original Open-ECG-Digitizer PixelSizeFinder range (vectorized NumPy port), per axis
+    if px_per_mm_x <= 0 or px_per_mm_y <= 0:
+        calib_method = "pixel_size_finder"
+        px_per_mm_x, px_per_mm_y = _per_axis_pixel_size_finder(grid_sub)
+
+    # 3. Last resort: typical paper size of the detected layout
     if px_per_mm_x <= 0 or px_per_mm_y <= 0:
         # Standard ECG paper width is ~210-280 mm (or ~110-150 mm for thermal strip)
         # Standard height is ~80-110 mm for 6-lead strip, ~180-210 mm for A4
@@ -656,6 +827,80 @@ def detect_row_baselines(
     if len(peaks) == 0:
         return np.array([H // 2], dtype=int)
     return np.sort(peaks).astype(int)
+
+
+LAYOUT_ROW_COUNTS = (1, 3, 4, 5, 6, 7, 12)
+
+
+def _smoothed_row_projection(sig_map: np.ndarray) -> np.ndarray:
+    """Same horizontal ink projection as `detect_row_baselines` (labels / borders suppressed, Gaussian smoothed)."""
+    H, W = sig_map.shape
+    x_lo, x_hi = int(0.07 * W), int(0.97 * W)
+    sub = sig_map[:, x_lo:x_hi] if x_hi > x_lo + 10 else sig_map
+    row_proj = np.mean(sub > 0.10, axis=1).astype(np.float64) + 0.6 * np.mean(sub, axis=1).astype(np.float64)
+    border_y = max(3, int(round(0.035 * H)))
+    row_proj[:border_y] *= 0.1
+    row_proj[-border_y:] *= 0.1
+    return ndimage.gaussian_filter1d(row_proj, sigma=max(1.2, H * 0.0042))
+
+
+def select_row_count(
+    sig_map: np.ndarray,
+    px_per_mm_y: Optional[float] = None,
+    gain_mm_mv: float = 10.0,
+    candidates: Tuple[int, ...] = LAYOUT_ROW_COUNTS,
+) -> Tuple[int, np.ndarray, Dict[int, float]]:
+    """
+    Chooses how many ECG rows the sheet has by model selection instead of fixed peak thresholds: for every
+    candidate row count R (the counts the supported layouts can have) the regular-spacing DP of
+    `detect_row_baselines` places R baselines, and R is scored by how much of the projection's peak prominence
+    those rows explain, minus prominent peaks they leave unexplained (too few rows) and baselines that sit on no
+    peak (too many rows). With a trusted grid calibration, rows closer than ~0.85 x gain (8.5 mm at 10 mm/mV)
+    are physically implausible and rejected.
+    Returns `(best_R, baselines_for_best_R, scores)`.
+    """
+    H = sig_map.shape[0]
+    sm = _smoothed_row_projection(sig_map)
+    mx = float(np.max(sm)) + 1e-9
+    peaks, props = sp_signal.find_peaks(sm, prominence=0.03 * mx, distance=max(6, H // 40))
+    if len(peaks) == 0:
+        return 1, np.array([H // 2], dtype=int), {}
+    prom = props["prominences"] / mx
+    total = float(np.sum(prom)) + 1e-9
+    min_spacing_px = 0.85 * gain_mm_mv * px_per_mm_y if px_per_mm_y else 0.0
+
+    scores: Dict[int, float] = {}
+    baselines_by_r: Dict[int, np.ndarray] = {}
+    for R in candidates:
+        chosen = detect_row_baselines(sig_map, target_num_rows=R)
+        baselines_by_r[R] = chosen
+        spacing = float(np.median(np.diff(chosen))) if len(chosen) > 1 else H / 2.0
+        tol = 0.25 * spacing
+        matched: set = set()
+        spurious = 0
+        for b in chosen:
+            d = np.abs(peaks - b)
+            j = int(np.argmin(d))
+            if d[j] <= tol and j not in matched:
+                matched.add(j)
+            else:
+                spurious += 1
+        explained = float(sum(prom[j] for j in matched))
+        med_matched = float(np.median([prom[j] for j in matched])) if matched else 0.0
+        missed = float(sum(prom[j] for j in range(len(peaks)) if j not in matched and prom[j] >= 0.35 * med_matched))
+        score = explained / total - 0.8 * missed / total - 0.25 * spurious / R
+        if R > 1:
+            # Rows of one layout are (near) evenly spaced; a "row" squeezed in at < 55 % of the typical spacing is
+            # a wave tip / text line next to a real baseline (group gaps and rhythm strips are WIDER, never narrower)
+            diffs = np.diff(np.sort(chosen)).astype(np.float64)
+            # (normalised by R: one weak row that forces two baselines together must not let a hypothesis that leaves
+            # several strong rows unexplained win, e.g. a 12x1 A4 sheet with one flat lead)
+            score -= 0.3 * float(np.sum(diffs < 0.55 * np.median(diffs))) / R
+        if R > 1 and min_spacing_px > 0 and spacing < min_spacing_px:
+            score -= 1.0
+        scores[R] = round(score, 3)
+    best_r = max(scores, key=lambda r: scores[r])
+    return best_r, baselines_by_r[best_r], scores
 
 
 def infer_best_layout(
@@ -879,17 +1124,30 @@ def viterbi_trace_unclipped(
     backptr = np.zeros((H_b, W_b), dtype=np.int32)
     dp[:, 0] = reward[:, 0] - 0.50 * dist_from_base[:, 0]
 
-    for x in range(1, W_b):
-        prev_col = dp[:, x - 1]
-        pen_vec = pen_qrs if qrs_col_mask[x] else pen_non_qrs
-        # Exact number of blank non-ink pixels crossed vertically between y_prev and y in O(1) via prefix sum!
-        col_cs = blank_cumsum[:, x]
-        blank_crossed = np.abs(col_cs[:, None] - col_cs[idx_mat])  # (H_b, M)
-        bridge_pen = 0.42 * blank_crossed
-        cands = prev_col[idx_mat] - pen_vec - bridge_pen  # (H_b, M)
-        best_m = np.argmax(cands, axis=1)
-        dp[:, x] = reward[:, x] + cands[rows_arange, best_m]
-        backptr[:, x] = idx_mat[rows_arange, best_m]
+    if _viterbi_forward_numba is not None:
+        # JIT kernel: identical recurrence (same operation order & first-max tie breaking), ~10× faster
+        _viterbi_forward_numba(
+            dp,
+            backptr,
+            np.ascontiguousarray(reward, dtype=np.float64),
+            np.ascontiguousarray(blank_cumsum, dtype=np.float64),
+            np.ascontiguousarray(qrs_col_mask, dtype=np.bool_),
+            idx_mat.astype(np.int32),
+            np.ascontiguousarray(pen_qrs[0], dtype=np.float64),
+            np.ascontiguousarray(pen_non_qrs[0], dtype=np.float64),
+        )
+    else:
+        for x in range(1, W_b):
+            prev_col = dp[:, x - 1]
+            pen_vec = pen_qrs if qrs_col_mask[x] else pen_non_qrs
+            # Exact number of blank non-ink pixels crossed vertically between y_prev and y in O(1) via prefix sum!
+            col_cs = blank_cumsum[:, x]
+            blank_crossed = np.abs(col_cs[:, None] - col_cs[idx_mat])  # (H_b, M)
+            bridge_pen = 0.42 * blank_crossed
+            cands = prev_col[idx_mat] - pen_vec - bridge_pen  # (H_b, M)
+            best_m = np.argmax(cands, axis=1)
+            dp[:, x] = reward[:, x] + cands[rows_arange, best_m]
+            backptr[:, x] = idx_mat[rows_arange, best_m]
 
     # Backtrack optimal continuous path
     end_scores = dp[:, W_b - 1] - 0.35 * dist_from_base[:, W_b - 1]
@@ -1423,22 +1681,21 @@ def digitize_ecg_image(
 
     # Stage 3: Lead label recognition & layout identification
     detected_labels: List[Dict[str, Any]] = []
-    if np.max(aligned_text) > 0.05:
+    # Lead labels are only consumed by layout inference (`auto`) and by the 2-column split (6x2 layouts):
+    # skip the ~5 s LeadName U-Net pass when the user fixed any other layout.
+    explicit_layout = layout != "auto" and layout in LAYOUT_DEFINITIONS
+    labels_needed = (not explicit_layout) or LAYOUT_DEFINITIONS[layout]["cols"] == 2
+    if labels_needed and np.max(aligned_text) > 0.05:
         try:
             detected_labels = detect_lead_labels_with_unet(aligned_text)
         except Exception:
             detected_labels = []
 
-    auto_baselines = detect_row_baselines(aligned_sig, target_num_rows=None)
-    if layout == "auto" or layout not in LAYOUT_DEFINITIONS:
-        chosen_layout = infer_best_layout(aligned_sig, aligned_text, detected_labels, auto_baselines)
-    else:
-        chosen_layout = layout
-
-    layout_info = LAYOUT_DEFINITIONS[chosen_layout]
-    expected_total_rows = len(layout_info["grid"]) + len(layout_info.get("rhythm", []))
-
-    # Stage 4: Grid Pixel Size Calibration (Open-ECG-Digitizer PixelSizeFinder autocorrelation)
+    # Stage 4: Grid Pixel Size Calibration (joint isotropic comb search -> PixelSizeFinder -> paper prior).
+    # Runs BEFORE layout inference: the calibrated row spacing in mm is a strong cue for the number of rows.
+    explicit_rows = (
+        len(LAYOUT_DEFINITIONS[layout]["grid"]) + len(LAYOUT_DEFINITIONS[layout].get("rhythm", [])) if explicit_layout else 6
+    )
     if custom_px_per_mm is not None and custom_px_per_mm > 0.5:
         spacing = {
             "px_per_mm_x": float(custom_px_per_mm),
@@ -1449,7 +1706,7 @@ def digitize_ecg_image(
             "method": "manual",
         }
     else:
-        spacing = estimate_pixel_spacing_mm(aligned_grid, aligned_rgb, expected_rows=expected_total_rows)
+        spacing = estimate_pixel_spacing_mm(aligned_grid, aligned_rgb, expected_rows=explicit_rows)
         if spacing.get("method") == "paper_size_fallback":
             warnings.append(
                 "Шаг миллиметровой сетки не найден автоматически — масштаб оценён по размеру листа; "
@@ -1464,6 +1721,26 @@ def digitize_ecg_image(
                     f"Подозрительная калибровка сетки: ширина изображения ≈ {visible_w_mm:.0f} мм "
                     f"({spacing['px_per_mm']:.2f} пикс/мм) — проверьте масштаб по клеткам 5 мм"
                 )
+
+    # Stage 3b: layout identification (model selection over row counts + lead-label cues)
+    row_count_scores: Dict[int, float] = {}
+    if explicit_layout:
+        chosen_layout = layout
+    else:
+        trusted_scale = spacing.get("method") in ("joint_grid_search", "pixel_size_finder", "manual")
+        n_rows, row_baselines, row_count_scores = select_row_count(
+            aligned_sig,
+            px_per_mm_y=float(spacing["px_per_mm_y"]) if trusted_scale else None,
+            gain_mm_mv=gain_mm_mv,
+        )
+        chosen_layout = infer_best_layout(aligned_sig, aligned_text, detected_labels, row_baselines)
+        if method == "krones_hough_cv":
+            # The classical ink map also responds to grid lines, which look like extra "rows" in the projection
+            warnings.append(
+                f"Раскладка определена автоматически классическим методом ({chosen_layout}) — это ненадёжно; "
+                "проверьте её или выберите раскладку вручную"
+            )
+    layout_info = LAYOUT_DEFINITIONS[chosen_layout]
 
     # Stage 5: Waveform Extraction for all leads in layout
     leads_mv, overlay_traces, final_baselines = extract_all_leads_for_layout(
@@ -1505,6 +1782,7 @@ def digitize_ecg_image(
             "aligned_size": [int(aligned_rgb.shape[1]), int(aligned_rgb.shape[0])],
             "detected_row_baselines_px": [int(y) for y in final_baselines],
             "detected_lead_labels": detected_labels,
+            "row_count_scores": {str(k): v for k, v in row_count_scores.items()},
         },
         "leads_mv": leads_mv,
         "overlay_traces": overlay_traces,

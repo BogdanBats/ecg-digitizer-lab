@@ -102,6 +102,17 @@ def test_sokolow_lyon_index() -> None:
     assert hyp["sokolow_lyon_lvh"] is True
 
 
+@pytest.mark.parametrize("sex,expect_lvh", [("male", False), ("female", True), (None, False)])
+def test_cornell_threshold_is_sex_specific(sex, expect_lvh) -> None:
+    # R(aVL) ≈ 1.2 mV + S(V3) ≈ 1.2 mV deep → Cornell ≈ 2.3–2.5 mV: LVH only by the female criterion (≥ 2.0 mV)
+    avl = synthetic_beat_train(qrs_scale=1.0).tolist()
+    v3 = synthetic_beat_train(qrs_scale=-1.0).tolist()
+    hyp = analyze_all_leads({"aVL": avl, "V3": v3}, fs=FS, sex=sex)["hypertrophy"]
+    assert 2.0 <= hyp["cornell_mv"] < 2.8
+    assert hyp["cornell_lvh"] is expect_lvh
+    assert hyp["cornell_lvh_if_female"] is (sex is None)
+
+
 def test_sokolow_never_negative_with_qs_complexes() -> None:
     # QS-type complexes in V5/V6 (no R above the isoelectric line) must contribute 0 mm, not a negative R
     v1 = synthetic_beat_train(qrs_scale=0.3).tolist()

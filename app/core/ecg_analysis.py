@@ -565,9 +565,11 @@ def analyze_all_leads(
     leads_mv: Dict[str, List[float]],
     fs: float = 500.0,
     preferred_lead: Optional[str] = None,
+    sex: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Performs full clinical analysis across all digitized leads:
+    Performs full clinical analysis across all digitized leads (`sex`: "male" | "female" | None selects the
+    sex-specific Cornell threshold):
     - Finds R peaks and per-beat fiducial points on every lead
     - Selects best reference lead (typically II, V5, V2, or I) for default caliper display
     - Calculates electrical axes (P, QRS, T) when limb leads (I, II, III, aVF, aVL) are present
@@ -729,9 +731,14 @@ def analyze_all_leads(
         r_avl = r_height("aVL")
         s_v3 = s_depth("V3")
         cornell_mv = r_avl + s_v3
+        # Sex-specific Cornell voltage criterion (Casale et al.): ≥ 2.8 mV in men, ≥ 2.0 mV in women
+        cornell_thr = 2.0 if sex == "female" else 2.8
         hypertrophy["cornell_mv"] = round(cornell_mv, 2)
         hypertrophy["cornell_mm"] = round(cornell_mv * 10.0, 1)
-        hypertrophy["cornell_lvh"] = bool(cornell_mv >= 2.8)
+        hypertrophy["cornell_threshold_mv"] = cornell_thr
+        hypertrophy["cornell_sex"] = sex
+        hypertrophy["cornell_lvh"] = bool(cornell_mv >= cornell_thr)
+        hypertrophy["cornell_lvh_if_female"] = bool(sex is None and 2.0 <= cornell_mv < 2.8)
 
     # Global consensus metrics (median across reliable leads)
     all_rrs = [v["hrv"]["median_rr_ms"] for v in per_lead_results.values() if 300 <= v["hrv"]["median_rr_ms"] <= 2000]

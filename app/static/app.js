@@ -213,6 +213,7 @@
     valAxisClass: document.getElementById("valAxisClass"),
     valSokolow: document.getElementById("valSokolow"),
     valCornell: document.getElementById("valCornell"),
+    selectPatientSex: document.getElementById("selectPatientSex"),
     valMacruz: document.getElementById("valMacruz"),
     vcgCanvas: document.getElementById("vcgCanvas"),
     chkVcgVectors: document.getElementById("chkVcgVectors"),
@@ -674,6 +675,9 @@
         formData.append("gain_mm_mv", el.selectGain.value || "10");
         formData.append("target_fs", "500");
         formData.append("rotate_deg", el.selectRotate.value || "0");
+        if (el.selectPatientSex && el.selectPatientSex.value) {
+          formData.append("patient_sex", el.selectPatientSex.value);
+        }
         if (customPxPerMm && customPxPerMm > 0.5) {
           formData.append("custom_px_per_mm", String(customPxPerMm));
         }
@@ -1522,7 +1526,12 @@
           const res = await fetch("/api/reanalyze_leads", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ leads_mv: editedLeads, fs, preferred_lead: tr.lead }),
+            body: JSON.stringify({
+              leads_mv: editedLeads,
+              fs,
+              preferred_lead: tr.lead,
+              sex: (el.selectPatientSex && el.selectPatientSex.value) || null,
+            }),
           });
           if (res.ok) newLeadsAna = (await res.json()).leads || null;
         } catch (err) {
@@ -3371,9 +3380,16 @@
     const aV3 = amp("V3");
     if (aAvl && aV3) {
       const corn = rH(aAvl) + sD(aV3);
+      // Sex-specific Cornell voltage criterion: ≥ 2.8 mV (men), ≥ 2.0 mV (women); unknown sex → men's threshold,
+      // with a "possible LVH in women" note in the 2.0–2.8 mV grey zone
+      const sex = (el.selectPatientSex && el.selectPatientSex.value) || "";
+      const thr = sex === "female" ? 2.0 : 2.8;
       hyp.cornell_mv = Math.round(corn * 100) / 100;
       hyp.cornell_mm = Math.round(corn * 100) / 10;
-      hyp.cornell_lvh = corn >= 2.8;
+      hyp.cornell_threshold_mv = thr;
+      hyp.cornell_sex = sex || null;
+      hyp.cornell_lvh = corn >= thr;
+      hyp.cornell_lvh_if_female = !sex && corn >= 2.0 && corn < 2.8;
     }
     state.analysis.hypertrophy = hyp;
 
@@ -4519,8 +4535,14 @@
       ? `${hyp.sokolow_lyon_mv.toFixed(2)} мВ (${hyp.sokolow_lyon_mm.toFixed(1)} мм) ${hyp.sokolow_lyon_lvh ? "⚠️ ГЛЖ" : "(норма < 3.5 мВ)"}`
       : "Нет V1/V5–V6";
 
+    const cornThr = hyp.cornell_threshold_mv || 2.8;
     el.valCornell.textContent = hyp.cornell_mv !== undefined
-      ? `${hyp.cornell_mv.toFixed(2)} мВ (${hyp.cornell_mm.toFixed(1)} мм) ${hyp.cornell_lvh ? "⚠️ ГЛЖ" : "(норма < 2.8 мВ)"}`
+      ? `${hyp.cornell_mv.toFixed(2)} мВ (${hyp.cornell_mm.toFixed(1)} мм) ` +
+        (hyp.cornell_lvh
+          ? "⚠️ ГЛЖ"
+          : hyp.cornell_lvh_if_female
+            ? "(⚠️ ГЛЖ, если пациент — женщина: порог 2.0 мВ)"
+            : `(норма < ${cornThr.toFixed(1)} мВ)`)
       : "Нет aVL/V3";
 
     const canvas = el.hexaxialCanvas;
@@ -5769,6 +5791,14 @@
   }
 
   function bindUIEvents() {
+    // Patient sex only changes the Cornell LVH threshold: recompute indices without re-digitizing
+    if (el.selectPatientSex) {
+      el.selectPatientSex.addEventListener("change", () => {
+        recomputeGlobalIndicesClient();
+        renderHexaxialCompass();
+      });
+    }
+
     // Example selection
     el.selectExample.addEventListener("change", () => {
       state.uploadedFile = null;

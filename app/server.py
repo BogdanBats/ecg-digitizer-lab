@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import cv2
 import numpy as np
@@ -122,6 +122,7 @@ class ReanalyzeLeadsRequest(BaseModel):
     leads_mv: Dict[str, List[float]]
     fs: float = 500.0
     preferred_lead: Optional[str] = None
+    sex: Optional[Literal["male", "female"]] = None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -227,6 +228,7 @@ async def api_digitize_ecg(
     custom_px_per_mm: Optional[float] = Form(default=None),
     custom_roi_json: Optional[str] = Form(default=None),
     pdf_page: int = Form(default=1),
+    patient_sex: Optional[str] = Form(default=None),
 ) -> JSONResponse:
     img_bgr: Optional[np.ndarray] = None
     source_name = "uploaded_ecg.jpg"
@@ -309,6 +311,7 @@ async def api_digitize_ecg(
             analyze_all_leads,
             leads_mv=dig_result["leads_mv"],
             fs=float(target_fs),
+            sex=patient_sex if patient_sex in ("male", "female") else None,
         )
     except HTTPException:
         raise
@@ -348,5 +351,6 @@ def api_reanalyze_leads(req: ReanalyzeLeadsRequest) -> JSONResponse:
         leads_mv=req.leads_mv,
         fs=req.fs,
         preferred_lead=req.preferred_lead,
+        sex=req.sex,
     )
     return JSONResponse(analysis_result)
