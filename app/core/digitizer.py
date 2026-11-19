@@ -615,6 +615,34 @@ def joint_isotropic_grid_search(
     return refined[0], refined[1]
 
 
+def choose_processing_upscale(
+    img_rgb: np.ndarray,
+    min_px_per_mm: float = 3.3,
+    target_px_per_mm: float = 5.0,
+    max_side_px: int = 2400,
+) -> float:
+    """
+    Cheap pre-check (classical grid map + joint grid search, no U-Net) of how many pixels one millimetre of paper
+    occupies. Returns the upscale factor that brings fine-detail scans to ~`target_px_per_mm`, or 1.0.
+    Large images (>= 1600 px) are never upscaled: they cannot be that coarse for any realistic sheet.
+    """
+    H, W = img_rgb.shape[:2]
+    if max(H, W) >= 1600 or min(H, W) < 64:
+        return 1.0
+    try:
+        _, grid = classical_grid_and_signal_maps(img_rgb)
+        res = joint_isotropic_grid_search(grid[int(0.1 * H):int(0.9 * H), int(0.1 * W):int(0.9 * W)], full_width_px=float(W))
+    except Exception:
+        return 1.0
+    if res is None:
+        return 1.0
+    px = 0.5 * (res[0] + res[1])
+    if px >= min_px_per_mm:
+        return 1.0
+    factor = min(target_px_per_mm / max(px, 1e-3), 2.5, max_side_px / float(max(H, W)))
+    return float(factor) if factor > 1.05 else 1.0
+
+
 def estimate_pixel_spacing_mm(
     grid_prob: np.ndarray,
     img_rgb: np.ndarray,
@@ -806,15 +834,59 @@ def detect_row_baselines(
             top_idx = np.argsort(heights)[::-1][:target_num_rows]
             return np.sort(peaks[top_idx]).astype(int)
 
-        # Fallback: evenly spaced priors within active span refined to local peak
-        priors = np.linspace(y_act0, y_act1, target_num_rows)
-        refined: List[int] = []
-        rad = max(5, int(expected_step * 0.38))
-        for py in priors:
-            lo = max(0, int(round(py)) - rad)
-            hi = min(H, int(round(py)) + rad + 1)
-            refined.append(lo + int(np.argmax(smooth_proj[lo:hi])))
-        return np.array(refined, dtype=int)
+        # Fallback: fewer clear peaks than rows (faint / partly hidden rows). Keep every clear peak and add the
+        # missing rows only where rows are really missing: inside gaps of >= 1.8 steps (a ~1.5-step gap is the
+        # normal limb/chest group gap of 12x1 sheets) or beyond the first / last row, picking the end with more
+        # ink. The former evenly-spaced priors could snap two rows onto ONE trace, making two leads identical.
+        rows = sorted(int(pk) for pk in peaks)
+        if not rows:
+            rows = [int(np.argmax(smooth_proj))]
+        step = float(np.median(np.diff(rows))) if len(rows) >= 3 else expected_step
+        step = float(np.clip(step, 0.6 * expected_step, 1.6 * expected_step))
+        border = max(3, int(round(0.02 * H)))
+        rad = max(3, int(round(0.25 * step)))
+
+        def local_peak(y: float) -> Tuple[int, float]:
+            lo, hi = max(0, int(round(y)) - rad), min(H, int(round(y)) + rad + 1)
+            if hi <= lo:
+                return int(np.clip(round(y), 0, H - 1)), 0.0
+            j = lo + int(np.argmax(smooth_proj[lo:hi]))
+            return j, float(smooth_proj[j])
+
+        for _ in range(4 * target_num_rows):
+            if len(rows) >= target_num_rows:
+                break
+            gaps = [(rows[i + 1] - rows[i], i) for i in range(len(rows) - 1)]
+            big = [(g, i) for g, i in gaps if g >= 1.8 * step]
+            if big:
+                g, i = max(big)
+                k_missing = max(1, int(round(g / step)) - 1)
+                y_new = local_peak(rows[i] + g / (k_missing + 1))[0]
+            else:
+                ends = []
+                if rows[0] - step >= border:
+                    ends.append(local_peak(rows[0] - step))
+                if rows[-1] + step <= H - 1 - border:
+                    ends.append(local_peak(rows[-1] + step))
+                row_level = float(np.median(smooth_proj[rows])) + 1e-9
+                with_ink = [e for e in ends if e[1] >= 0.10 * row_level]
+                if with_ink:
+                    y_new = max(with_ink, key=lambda e: e[1])[0]
+                elif ends:
+                    # no trace of the missing row at either end: prefer the position farther from the image edge
+                    # (sheet margins / header text sit at the edges)
+                    y_new = max(ends, key=lambda e: min(e[0], H - 1 - e[0]))[0]
+                elif gaps:
+                    g, i = max(gaps)
+                    y_new = int(round(rows[i] + g / 2.0))
+                else:
+                    break
+            if any(abs(y_new - r) < 0.5 * step for r in rows):
+                break
+            rows = sorted(rows + [int(y_new)])
+        while len(rows) < target_num_rows:  # degenerate tiny images: pad geometrically
+            rows.append(int(min(H - 1, rows[-1] + max(4.0, step))))
+        return np.array(rows[:target_num_rows], dtype=int)
 
     # Auto-detect number of rows (3, 4, 5, 6, 7, or 12)
     min_dist = max(12, int(H / 16.5))
@@ -1244,10 +1316,77 @@ def determine_column_x_ranges(
     return ranges
 
 
+def refine_anchored_baselines(sig_map: np.ndarray, anchors: np.ndarray) -> np.ndarray:
+    """
+    Per-column row baselines anchored to the whole-sheet rows: each anchor may move to the strongest local
+    projection peak within +/-0.45 row spacing (perspective / staggered columns, e.g. UTAS 6x2 shifts of up to
+    ~0.45 spacing), but rows can never swap order or collapse onto one trace. A column whose top rows are faint
+    therefore keeps the sheet's row grid instead of re-detecting all its rows in the wrong half of the column.
+    """
+    H = sig_map.shape[0]
+    anchors = np.sort(np.asarray(anchors, dtype=np.float64))
+    if len(anchors) == 0:
+        return anchors.astype(int)
+    step = float(np.median(np.diff(anchors))) if len(anchors) > 1 else 0.45 * H
+    proj = _smoothed_row_projection(sig_map)
+    ref = float(np.max(proj)) + 1e-9
+    win = 0.45 * step
+    out: List[int] = []
+    for a in anchors:
+        lo, hi = max(0, int(a - win)), min(H, int(a + win) + 1)
+        seg = proj[lo:hi]
+        if seg.size == 0:
+            out.append(int(np.clip(round(a), 0, H - 1)))
+            continue
+        j = lo + int(np.argmax(seg))
+        is_trace = proj[j] >= 0.12 * ref and proj[j] >= 1.3 * float(np.median(seg))
+        out.append(j if is_trace else int(np.clip(round(a), 0, H - 1)))
+    for i in range(1, len(out)):
+        if out[i] - out[i - 1] < 0.55 * step:
+            out[i - 1], out[i] = int(round(anchors[i - 1])), int(round(anchors[i]))
+    return np.array(out, dtype=int)
+
+
+def _stamp_trace_claims(
+    claimed: np.ndarray,
+    global_y: np.ndarray,
+    base_curve: np.ndarray,
+    median_spacing: float,
+    y_offset: int,
+    baseline_pen: float,
+) -> None:
+    """
+    Adds one traced row's claim penalties into `claimed` (array row 0 = global y `y_offset`), vectorised:
+    - points near that row's baseline: `baseline_pen` (+-3 px),
+    - QRS / wave excursions: 1.65 (+-3 px) so other rows do not ride an already-claimed S-wave limb,
+    - turn-around tips (deep nadir / apex): 2.95 over a 15x7 px patch so other rows do not turn back early there.
+    """
+    Hc, Wc = claimed.shape
+    xs = np.arange(Wc)
+    gy = np.round(global_y).astype(int) - int(y_offset)
+    exc = np.abs(global_y - base_curve)
+    slope = np.abs(np.gradient(global_y))
+    tip = (exc > 0.38 * median_spacing) & (slope <= 9.0)
+    pen = np.where(exc > 0.16 * median_spacing, 1.65, baseline_pen)
+    for dy in range(-3, 4):
+        yy = gy + dy
+        ok = (~tip) & (yy >= 0) & (yy < Hc)
+        claimed[yy[ok], xs[ok]] = np.maximum(claimed[yy[ok], xs[ok]], pen[ok])
+    tip_x = np.nonzero(tip)[0]
+    if tip_x.size:
+        for dx in range(-3, 4):
+            xx = np.clip(tip_x + dx, 0, Wc - 1)
+            for dy in range(-7, 8):
+                yy = gy[tip_x] + dy
+                ok = (yy >= 0) & (yy < Hc)
+                claimed[yy[ok], xx[ok]] = np.maximum(claimed[yy[ok], xx[ok]], 2.95)
+
+
 def extract_column_leads_with_peeling(
     col_sig_map: np.ndarray,
     n_rows_in_col: int,
     min_displaced_run_px: int = 40,
+    anchor_baselines: Optional[np.ndarray] = None,
 ) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray, List[Dict[str, float]]]:
     """
     Extracts `n_rows_in_col` lead traces from a single column sub-image `col_sig_map` `(H, W_c)`:
@@ -1259,7 +1398,10 @@ def extract_column_leads_with_peeling(
        from `work_sig` so adjacent overlapping leads (e.g. V1->V2->V3->V4 deep S waves) never steal each other's tips!
     """
     H, W_c = col_sig_map.shape
-    baselines_y = detect_row_baselines(col_sig_map, target_num_rows=n_rows_in_col)
+    if anchor_baselines is not None and len(anchor_baselines) == n_rows_in_col:
+        baselines_y = refine_anchored_baselines(col_sig_map, anchor_baselines)
+    else:
+        baselines_y = detect_row_baselines(col_sig_map, target_num_rows=n_rows_in_col)
     row_spacings = np.diff(baselines_y) if len(baselines_y) > 1 else np.array([H * 0.45])
     median_spacing = float(np.median(row_spacings)) if len(row_spacings) > 0 else float(H * 0.45)
 
@@ -1311,12 +1453,10 @@ def extract_column_leads_with_peeling(
         dil_w = max(8, int(round(0.20 * median_spacing)))
         qrs_col_mask = ndimage.binary_dilation(raw_qrs_cols, structure=np.ones(2 * dil_w + 1, dtype=bool))
 
-    traces_px: List[np.ndarray] = []
-    trace_quality: List[Dict[str, float]] = []
-    # Soft claimed-trace penalty map (never erases `work_sig` into blank paper, so crossing strokes remain valid ink bridges!)
-    claimed_penalty_full = np.zeros((H, W_c), dtype=np.float64)
-
-    for r_idx, base_y in enumerate(baselines_y):
+    def trace_row(r_idx: int, claimed_full: Optional[np.ndarray], claims_from: Optional[List[int]] = None,
+                  first_pass: Optional[List[np.ndarray]] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Viterbi-traces one row; returns (global_y, local_trace, band) for diagnostics."""
+        base_y = baselines_y[r_idx]
         # Vertical search range:
         # - Top row (r_idx == 0, e.g. Lead I and V1): allow up to 1.35 * spacing upward into top margin.
         # - Lower rows (r_idx > 0): cap upward search at 0.80 * spacing so a lower row can NEVER reach
@@ -1329,7 +1469,15 @@ def extract_column_leads_with_peeling(
 
         band = work_sig[y0:y1, :].copy()
         band_horiz = horiz_smooth[y0:y1, :]
-        claimed_band = claimed_penalty_full[y0:y1, :].copy()
+        if claimed_full is not None:
+            claimed_band = claimed_full[y0:y1, :].copy()
+        else:
+            # Second pass: EVERY other row's first-pass trace is claimed; riding along another row's baseline is
+            # penalised as much as blank paper (2.6), crossing it with a QRS stroke stays cheap (few pixels)
+            claimed_band = np.zeros_like(band)
+            for o_idx in claims_from or []:
+                if first_pass is not None:
+                    _stamp_trace_claims(claimed_band, first_pass[o_idx], baseline_curves[o_idx], median_spacing, y0, 2.6)
 
         # Remove ONLY the horizontal baseline component near other rows' baselines outside QRS windows
         # (inside QRS windows, subtract only 0.40 * band_horiz so deep nadirs touching lower rows stay strong!)
@@ -1348,6 +1496,16 @@ def extract_column_leads_with_peeling(
             )
 
         local_base_rel = baseline_curves[r_idx] - y0
+        # Per-row contrast normalisation: a faint row (pale print / weak U-Net response) must compete with a bright
+        # neighbour inside its own search band on equal terms, otherwise it "rides" the neighbour's baseline
+        own_zone = np.abs(ys_b - local_base_rel[None, :]) <= 0.45 * median_spacing
+        own_vals = band[own_zone]
+        own_vals = own_vals[own_vals > 0.02]
+        if own_vals.size >= 20:
+            own_level = float(np.percentile(own_vals, 95))
+            if own_level < 0.5:
+                band = np.clip(band * min(6.0, 0.9 / max(own_level, 0.05)), 0.0, 1.0)
+
         # Never penalize pixels immediately around this row's own baseline curve
         near_own_base = np.abs(ys_b - local_base_rel[None, :]) <= max(4.0, 0.15 * median_spacing)
         claimed_band[near_own_base] = 0.0
@@ -1359,7 +1517,28 @@ def extract_column_leads_with_peeling(
             qrs_col_mask=qrs_col_mask,
             claimed_penalty_map=claimed_band,
         )
-        global_y = y0 + local_trace
+        return y0 + local_trace, local_trace, band
+
+    # Pass 1: top-to-bottom peeling (each row avoids the waves already claimed by the rows above it)
+    claimed_penalty_full = np.zeros((H, W_c), dtype=np.float64)
+    first_pass: List[np.ndarray] = []
+    for r_idx in range(len(baselines_y)):
+        gy, _, _ = trace_row(r_idx, claimed_penalty_full)
+        first_pass.append(gy)
+        _stamp_trace_claims(claimed_penalty_full, gy, baseline_curves[r_idx], median_spacing, 0, 0.95)
+
+    # Pass 2: re-trace every row against ALL other rows' first-pass traces, so an upper row can no longer steal a
+    # lower row's baseline / QRS (pass 1 only protects rows that were traced earlier)
+    traces_px: List[np.ndarray] = []
+    trace_quality: List[Dict[str, float]] = []
+    n_r = len(baselines_y)
+    for r_idx in range(n_r):
+        if n_r > 1:
+            others = [o for o in range(n_r) if o != r_idx]
+            global_y, local_trace, band = trace_row(r_idx, None, claims_from=others, first_pass=first_pass)
+        else:
+            global_y = first_pass[0]
+            _, local_trace, band = trace_row(r_idx, np.zeros((H, W_c), dtype=np.float64))
         traces_px.append(global_y)
 
         # Trace diagnostics: how much of the path sits on actual ink, and how often it is pinned to the search-band
@@ -1368,7 +1547,7 @@ def extract_column_leads_with_peeling(
         t_idx = np.clip(np.round(local_trace).astype(int), 0, H_band - 1)
         cols_idx = np.arange(W_c)
         near_ink = np.max(np.stack([band[np.clip(t_idx + dy, 0, H_band - 1), cols_idx] for dy in (-2, -1, 0, 1, 2)]), axis=0)
-        # "Displaced" = the path stays far from this row's baseline for longer than any QRS (>= ~0.25 s): the
+        # "Displaced" = the path stays far from this row's baseline for longer than any QRS (>= ~0.12 s): the
         # tracker has jumped to another row or is running across blank paper (typical square-wave failure)
         exc_rel = np.abs(global_y - baseline_curves[r_idx]) / max(1.0, median_spacing)
         far = np.concatenate([[0], (exc_rel > 0.55).astype(np.int8), [0]])
@@ -1387,31 +1566,6 @@ def extract_column_leads_with_peeling(
             "edge_hits": float(np.mean((local_trace <= 1.0) | (local_trace >= H_band - 2.0))),
             "displaced": float(displaced_px / max(1, W_c)),
         })
-
-        # Record this row's traced waveform into `claimed_penalty_full`:
-        # - Standard claimed QRS stroke penalty (+1.65): prevents subsequent leads (like V5) from riding
-        #   an already-claimed deep S-wave limb (like V4's S-wave), while keeping `work_sig` intact for `blank_cumsum`!
-        # - Strong turn-around nadir/apex penalty (+2.95): prevents subsequent leads (e.g. V2, V3, V4) from turning around
-        #   early at a previous lead's S-wave nadir!
-        excursion = np.abs(global_y - baseline_curves[r_idx])
-        slope_abs = np.abs(np.gradient(global_y))
-        for x in range(W_c):
-            gy = int(round(global_y[x]))
-            exc = float(excursion[x])
-            is_nadir_tip = (exc > 0.38 * median_spacing) and (float(slope_abs[x]) <= 9.0)
-            if is_nadir_tip:
-                lo_seg = max(0, gy - 7)
-                hi_seg = min(H, gy + 8)
-                x_lo = max(0, x - 3)
-                x_hi = min(W_c, x + 4)
-                claimed_penalty_full[lo_seg:hi_seg, x_lo:x_hi] = np.maximum(
-                    claimed_penalty_full[lo_seg:hi_seg, x_lo:x_hi], 2.95
-                )
-            else:
-                pen_val = 1.65 if exc > 0.16 * median_spacing else 0.95
-                lo_seg = max(0, gy - 3)
-                hi_seg = min(H, gy + 4)
-                claimed_penalty_full[lo_seg:hi_seg, x] = np.maximum(claimed_penalty_full[lo_seg:hi_seg, x], pen_val)
 
     # Fraction of the strip where a row runs (almost) on top of a neighbouring row: leads crossing / stealing waves
     close_px = max(3.0, 0.08 * median_spacing)
@@ -1500,11 +1654,21 @@ def extract_all_leads_for_layout(
     else:
         main_y_limit = H
 
+    # Whole-sheet row grid: every column refines these anchors locally (staggered columns still get their own
+    # baselines) instead of re-detecting its rows from scratch, which failed on columns with faint rows
+    main_anchors = (
+        np.asarray(global_baselines[:n_main_rows], dtype=np.float64)
+        if len(global_baselines) == total_rows and int(global_baselines[n_main_rows - 1]) < main_y_limit
+        else None
+    )
+
     # Extract each main column independently (so staggered columns like UTAS 6x2 have exact per-column baselines!)
     for c_idx in range(n_cols):
         cx0, cx1 = col_ranges[c_idx]
         col_slice = sig_map[:main_y_limit, cx0:cx1]
-        col_traces, col_bases, col_by, col_q = extract_column_leads_with_peeling(col_slice, n_main_rows, min_run_px)
+        col_traces, col_bases, col_by, col_q = extract_column_leads_with_peeling(
+            col_slice, n_main_rows, min_run_px, anchor_baselines=main_anchors
+        )
 
         for r_idx in range(min(n_main_rows, len(col_traces))):
             row_lead_names = grid_rows[r_idx]
@@ -1542,7 +1706,14 @@ def extract_all_leads_for_layout(
         rx1 = col_ranges[-1][1]
         rhy_y0 = max(0, main_y_limit - int(0.08 * H))
         rhy_slice = sig_map[rhy_y0:, rx0:rx1]
-        rhy_traces, rhy_bases, rhy_by, rhy_q = extract_column_leads_with_peeling(rhy_slice, n_rhythm_rows, min_run_px)
+        rhy_anchors = (
+            np.asarray(global_baselines[n_main_rows:], dtype=np.float64) - rhy_y0
+            if len(global_baselines) == total_rows
+            else None
+        )
+        rhy_traces, rhy_bases, rhy_by, rhy_q = extract_column_leads_with_peeling(
+            rhy_slice, n_rhythm_rows, min_run_px, anchor_baselines=rhy_anchors
+        )
         for rhy_i, rhy_name in enumerate(rhythm_leads):
             if rhy_i >= len(rhy_traces):
                 break
@@ -1909,6 +2080,13 @@ def digitize_ecg_image(
     elif rotate_deg == 270:
         img_rgb = cv2.rotate(img_rgb, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
+    # Stage 0: small scans with < 3.3 px per mm draw a QRS spike 1-2 px wide; the U-Net then barely responds and
+    # whole rows come out flat. Upscale such images to ~5 px/mm before any processing (deterministic, so a manual
+    # px/mm derived from a previous result of the same image stays valid).
+    processing_scale = choose_processing_upscale(img_rgb)
+    if processing_scale > 1.0:
+        img_rgb = cv2.resize(img_rgb, None, fx=processing_scale, fy=processing_scale, interpolation=cv2.INTER_CUBIC)
+
     H, W, _ = img_rgb.shape
 
     # Stage 1: Probability map extraction according to chosen method
@@ -2058,6 +2236,7 @@ def digitize_ecg_image(
     return {
         "method": method,
         "requested_method": requested_method,
+        "processing_scale": round(processing_scale, 3),
         "warnings": warnings,
         "layout": chosen_layout,
         "layout_label": layout_info["label"],

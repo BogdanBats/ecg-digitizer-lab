@@ -187,3 +187,40 @@ def test_lead_quality_levels() -> None:
     assert good["level"] == "ok" and not good["issues"]
     assert jumped["level"] == "bad" and len(jumped["issues"]) >= 2
     assert flat["level"] in ("warn", "bad")
+
+
+# ----------------------------------------------------------------------------- row grid & tracker robustness
+from app.core.digitizer import detect_row_baselines, extract_column_leads_with_peeling, refine_anchored_baselines  # noqa: E402
+
+
+def test_missing_rows_are_added_at_the_end_not_stacked_on_existing_rows() -> None:
+    sig = synthetic_rows_sig_map(12, h=1000)
+    true_rows = np.linspace(100, 900, 12).astype(int)
+    sig[true_rows[-1] - 40:, :] = 0.0  # bottom row of the sheet missing (faint print / hand over the sheet)
+    rows = detect_row_baselines(sig, target_num_rows=12)
+    assert len(rows) == 12
+    gaps = np.diff(np.sort(rows))
+    assert gaps.min() >= 0.5 * np.median(gaps)  # no two rows on one trace
+    assert np.all(np.abs(np.sort(rows)[:11] - true_rows[:11]) <= 4)
+
+
+def test_column_with_faint_top_rows_keeps_the_sheet_row_grid() -> None:
+    sig = synthetic_rows_sig_map(6, h=600)
+    true_rows = np.linspace(60, 540, 6).astype(int)
+    sig[:330, :] *= 0.08  # top three rows printed very faintly in this column
+    refined = refine_anchored_baselines(sig, true_rows.astype(float) + 6)  # anchors slightly off
+    assert np.all(np.abs(refined - true_rows) <= 7)
+
+
+def test_faint_row_does_not_ride_a_bright_neighbour() -> None:
+    h, w = 400, 900
+    sig = np.zeros((h, w), np.float32)
+    xs = np.arange(w)
+    for y, amp, val in ((120, 30, 0.12), (230, 60, 1.0)):  # faint upper row, bright lower row with tall QRS
+        trace = y - (np.abs(((xs % 150) - 75)) < 4) * amp
+        for x, ty in zip(xs, trace):
+            sig[max(0, ty - 1):ty + 2, x] = val
+    traces, curves, baselines, quality = extract_column_leads_with_peeling(sig, 2, min_displaced_run_px=20)
+    assert abs(int(np.median(traces[0])) - 120) <= 4
+    assert quality[0]["displaced"] < 0.02
+    assert quality[0]["neighbor_overlap"] < 0.05
