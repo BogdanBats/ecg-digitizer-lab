@@ -37,6 +37,26 @@
     </div>
   </header>
 
+  <!-- Sticky section navigation + live measurements of the active lead / beat -->
+  <nav class="section-nav" id="sectionNav" aria-label="Навигация по разделам">
+    <div class="nav-links">
+      <a href="#sec1" class="nav-link nav-link-sec1" data-nav="sec1">1 Обзор</a>
+      <a href="#sec2" class="nav-link" data-nav="sec2">2 Калиперы</a>
+      <a href="#autoReportPanel" class="nav-link" data-nav="autoReportPanel">Заключение</a>
+      <a href="#sec3" class="nav-link" data-nav="sec3">3 Интервалы</a>
+      <a href="#sec4" class="nav-link" data-nav="sec4">4 ST / QTc</a>
+      <a href="#sec5" class="nav-link" data-nav="sec5">5 ЭОС / ВКГ</a>
+      <a href="#sec6" class="nav-link" data-nav="sec6">6 Матрица</a>
+      <a href="#sec7" class="nav-link" data-nav="sec7">7 Анализ</a>
+    </div>
+    <div class="nav-live" id="navLive" title="Текущие измерения активного отведения и комплекса (клик — к разделу)"></div>
+    <div class="nav-tools">
+      <button type="button" id="btnUndo" class="nav-icon-btn" disabled title="Отменить правку меток R, калиперов или артефактов (Ctrl+Z)">↶</button>
+      <button type="button" id="btnRedo" class="nav-icon-btn" disabled title="Вернуть отменённую правку (Ctrl+Y)">↷</button>
+      <button type="button" id="btnHelp" class="nav-icon-btn" title="Горячие клавиши и жесты мыши (?)">?</button>
+    </div>
+  </nav>
+
   <!-- Control & Acquisition Bar -->
   <section class="acquisition-bar" aria-label="Параметры оцифровки ЭКГ">
     <div class="acq-group acq-source">
@@ -98,7 +118,10 @@
       <button type="button" id="btnDigitize" class="btn btn-primary">
         <span id="btnDigitizeText">Оцифровать ЭКГ</span>
       </button>
-      <div id="statusBadge" class="status-badge">Готов к работе</div>
+      <div class="status-wrap">
+        <button type="button" id="statusBadge" class="status-badge" title="Клик — журнал сообщений">Готов к работе</button>
+        <div class="status-log" id="statusLog" hidden role="log" aria-label="Журнал сообщений"></div>
+      </div>
     </div>
   </section>
 
@@ -136,7 +159,7 @@
   <!-- Main Workspace Grid -->
   <main class="workspace-grid">
     <!-- Left Column: Visual Verification & Multi-Lead Overview -->
-    <section class="panel panel-visuals" aria-label="Верификация оцифровки и мульти-канальный обзор">
+    <section class="panel panel-visuals" id="sec1" aria-label="Верификация оцифровки и мульти-канальный обзор">
       <div class="panel-header">
         <div>
           <h2 class="panel-title">1. Верификация оцифровки фото и обзор всех отведений</h2>
@@ -373,7 +396,7 @@
     </section>
 
     <!-- Right/Center Column: Precision Interactive Caliper Workbench -->
-    <section class="panel panel-calipers" aria-label="Интерактивный стенд калиперов и расчётов">
+    <section class="panel panel-calipers" id="sec2" aria-label="Интерактивный стенд калиперов и расчётов">
       <div class="panel-header caliper-header">
         <div>
           <h2 class="panel-title">2. Стенд интерактивных калиперов, коррекции R и разметки артефактов (весь сигнал канала)</h2>
@@ -382,12 +405,14 @@
 
         <!-- Caliper Mode Switcher -->
         <div class="caliper-mode-group" role="group" aria-label="Режим работы калиперов">
-          <button type="button" class="mode-btn active" data-mode="fiducial">Калиперы P–QRS–T и R</button>
-          <button type="button" class="mode-btn" data-mode="r_edit">Коррекция R (+ / − / двигать)</button>
-          <button type="button" class="mode-btn mode-btn-artifact" data-mode="artifact">▬▬ Метка артефакта (Синяя линия)</button>
-          <button type="button" class="mode-btn" data-mode="free">Циркуль (Δt / ΔV)</button>
-          <button type="button" class="mode-btn" data-mode="marching">Шагающий циркуль</button>
-          <button type="button" class="mode-btn mode-btn-compass" data-mode="rr_compass" title="Циркуль между двумя точками с проекцией на все RR канала: преждевременные / удлинённые интервалы и повторяющиеся паттерны (аллоритмии, групповые комплексы)">Циркуль RR → аритмии</button>
+          <span class="mode-group-label">Разметка</span>
+          <button type="button" class="mode-btn active" data-mode="fiducial" title="Калиперы P–QRS–T и метки R: тяните метки мышью (клавиша 1)">P–QRS–T <kbd>1</kbd></button>
+          <button type="button" class="mode-btn" data-mode="r_edit" title="Коррекция R: клик — добавить, ПКМ / Alt+клик — удалить, тянуть — двигать (клавиша 2)">R ± <kbd>2</kbd></button>
+          <button type="button" class="mode-btn mode-btn-artifact" data-mode="artifact" title="Метка артефакта (синяя линия): клик между R–R или протяжка — участок исключается из анализа (клавиша 3)">▬ Артефакт <kbd>3</kbd></button>
+          <span class="mode-group-label">Циркуль</span>
+          <button type="button" class="mode-btn" data-mode="free" title="Свободный циркуль: Δt и ΔV между двумя точками, наклон (клавиша 4)">Δt / ΔV <kbd>4</kbd></button>
+          <button type="button" class="mode-btn" data-mode="marching" title="Шагающий циркуль: размах откладывается вдоль всей записи (клавиша 5)">Шагающий <kbd>5</kbd></button>
+          <button type="button" class="mode-btn mode-btn-compass" data-mode="rr_compass" title="Циркуль RR: размах проецируется на все RR канала — преждевременные / удлинённые интервалы и повторяющиеся паттерны (клавиша 6)">RR → аритмии <kbd>6</kbd></button>
         </div>
       </div>
 
@@ -445,6 +470,9 @@
           <button type="button" id="btnClearArtifacts" class="btn btn-xs btn-ghost" title="Удалить все синие линии артефактов на текущем канале">
             Очистить артефакты
           </button>
+          <span class="bar-sep">|</span>
+          <button type="button" id="btnUndoBar" class="btn btn-xs btn-ghost" disabled title="Отменить последнюю правку (Ctrl+Z)">↶ Отменить</button>
+          <button type="button" id="btnRedoBar" class="btn btn-xs btn-ghost" disabled title="Вернуть отменённую правку (Ctrl+Y)">↷ Вернуть</button>
         </div>
         <div class="r-artifact-status" id="lblRAndArtifactStatus">
           Метки R: — • Артефакты: нет
@@ -589,7 +617,7 @@
   </main>
 
   <!-- Bottom Clinical Telemetry & Measurements Dashboard -->
-  <section class="telemetry-dashboard" aria-label="Результаты расчётов интервалов, сегментов, амплитуд и ЭОС">
+  <section class="telemetry-dashboard" id="sec3" aria-label="Результаты расчётов интервалов, сегментов, амплитуд и ЭОС">
     <!-- Card 1: Key Clinical Intervals & Segments Table -->
     <div class="telemetry-card card-intervals">
       <div class="card-header">
@@ -616,7 +644,7 @@
     </div>
 
     <!-- Card 2: Amplitudes, ST-Segment Analysis & QTc Formulas -->
-    <div class="telemetry-card card-st-qtc">
+    <div class="telemetry-card card-st-qtc" id="sec4">
       <div class="card-header">
         <h3>4. Сегмент ST, амплитуды зубцов и формулы QTc</h3>
       </div>
@@ -632,7 +660,7 @@
   </section>
 
   <!-- Section 5 (Moved Below): Electrical Axis of the Heart (ЭОС) + Side-by-Side Vectorcardiogram (ВКГ / VCG) -->
-  <section class="axis-vcg-section" aria-label="Электрическая ось сердца (ЭОС) и Векторкардиограмма (ВКГ)">
+  <section class="axis-vcg-section" id="sec5" aria-label="Электрическая ось сердца (ЭОС) и Векторкардиограмма (ВКГ)">
     <!-- Left Card: Hexaxial Vector Dial (Einthoven / Bailey Axis) & Hypertrophy Indices -->
     <div class="telemetry-card card-axis">
       <div class="card-header">
@@ -763,7 +791,7 @@
   </section>
 
   <!-- Summary Matrix across All Digitized Leads -->
-  <section class="all-leads-section" aria-label="Сводная таблица по всем оцифрованным отведениям">
+  <section class="all-leads-section" id="sec6" aria-label="Сводная таблица по всем оцифрованным отведениям">
     <div class="telemetry-card">
       <div class="card-header">
         <h3>6. Сводная матрица измерений по всем оцифрованным отведениям</h3>
@@ -797,6 +825,115 @@
       </div>
     </div>
   </section>
+
+
+  <!-- Section 7: analysis tools (tabs) -->
+  <section class="analysis-tools-section" id="sec7" aria-label="Инструменты анализа">
+    <div class="telemetry-card">
+      <div class="card-header atool-header">
+        <h3>7. Инструменты анализа <span class="atool-lead">отведение <b id="atoolLead">—</b></span></h3>
+        <div class="atool-tabs" role="tablist" aria-label="Инструменты анализа">
+          <button type="button" class="atool-tab active" data-atool="hrv" role="tab" title="RR во времени, гистограмма, диаграмма Пуанкаре, показатели вариабельности ритма">Ритмограмма и ВСР</button>
+          <button type="button" class="atool-tab" data-atool="overlay" role="tab" title="Все комплексы активного отведения, совмещённые по R: форма QRS и преждевременность каждого комплекса">Наложение комплексов</button>
+          <button type="button" class="atool-tab" data-atool="qtd" role="tab" title="QRS и окончание T в каждом отведении, дисперсия QT">Дисперсия QT</button>
+          <button type="button" class="atool-tab" data-atool="noise" role="tab" title="Спектр мощности сигнала, дрейф изолинии, сетевая наводка, мышечный шум">Спектр и шум</button>
+        </div>
+        <button type="button" id="btnAtoolToReport" class="btn btn-xs btn-primary-sm" title="Добавить вывод открытой вкладки в текст заключения">В заключение</button>
+      </div>
+
+      <div class="atool-pane active" id="atool-hrv" role="tabpanel">
+        <div class="atool-layout">
+          <div class="atool-canvas-wrap"><canvas id="hrvCanvas" height="300"></canvas></div>
+          <div class="atool-metrics" id="hrvMetrics"></div>
+        </div>
+        <p class="atool-note" id="hrvNote"></p>
+      </div>
+
+      <div class="atool-pane" id="atool-overlay" role="tabpanel">
+        <div class="atool-toolbar">
+          <label class="checkbox-label"><input type="checkbox" id="chkOverlayFlaggedOnly" /><span>Только отличающиеся комплексы</span></label>
+          <label class="control-inline">Порог сходства формы QRS (r)
+            <select id="selectOverlayCorr" class="select-input-sm">
+              <option value="0.85">0.85</option>
+              <option value="0.9" selected>0.90</option>
+              <option value="0.95">0.95</option>
+            </select>
+          </label>
+          <span class="atool-legend"><i class="lg lg-n"></i>основная форма <i class="lg lg-s"></i>преждевр., та же форма <i class="lg lg-v"></i>преждевр., иная форма <i class="lg lg-x"></i>иная форма <i class="lg lg-t"></i>медианный комплекс</span>
+        </div>
+        <div class="atool-layout">
+          <div class="atool-canvas-wrap"><canvas id="overlayCanvas" height="300"></canvas></div>
+          <div class="atool-metrics" id="overlayList"></div>
+        </div>
+        <p class="atool-note">Сходство формы — корреляция участка QRS (−60…+100 мс от R) с медианным комплексом; преждевременный — RR перед комплексом &lt; 85 % медианы.
+          Классификация по одному отведению предварительна: подтвердите по зубцу P и форме QRS в других отведениях.</p>
+      </div>
+
+      <div class="atool-pane" id="atool-qtd" role="tabpanel">
+        <div class="atool-layout">
+          <div class="atool-canvas-wrap"><canvas id="qtdCanvas" height="300"></canvas></div>
+          <div class="atool-metrics" id="qtdMetrics"></div>
+        </div>
+        <p class="atool-note">Границы — калиперы каждого отведения (сдвинутые вручную учитываются). В расчёт не входят отведения с T &lt; 0,1 мВ, плохим качеством
+          и нестандартные (полосы ритма). Дисперсия QT — показатель с ограниченной воспроизводимостью, особенно для оцифрованных ЭКГ.</p>
+      </div>
+
+      <div class="atool-pane" id="atool-noise" role="tabpanel">
+        <div class="atool-layout">
+          <div class="atool-canvas-wrap"><canvas id="noiseCanvas" height="300"></canvas></div>
+          <div class="atool-metrics" id="noiseMetrics"></div>
+        </div>
+        <p class="atool-note" id="noiseNote"></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Keyboard shortcuts & mouse gestures -->
+  <div class="help-overlay" id="helpOverlay" hidden>
+    <div class="help-card" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
+      <div class="help-head">
+        <h2 id="helpTitle">Горячие клавиши и жесты мыши</h2>
+        <button type="button" id="btnHelpClose" class="nav-icon-btn" title="Закрыть (Esc)">✕</button>
+      </div>
+      <div class="help-grid">
+        <section>
+          <h3>Стенд калиперов</h3>
+          <dl>
+            <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>предыдущий / следующий комплекс (активный R)</dd>
+            <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>предыдущее / следующее отведение</dd>
+            <dt><kbd>1</kbd>…<kbd>6</kbd></dt><dd>режим: P–QRS–T, R ±, артефакт, Δt/ΔV, шагающий, циркуль RR</dd>
+            <dt><kbd>+</kbd> <kbd>−</kbd> <kbd>0</kbd></dt><dd>развёртка X крупнее / мельче / весь сигнал</dd>
+            <dt><kbd>Ctrl</kbd>+<kbd>Z</kbd></dt><dd>отменить правку R, калиперов, артефактов</dd>
+            <dt><kbd>Ctrl</kbd>+<kbd>Y</kbd></dt><dd>вернуть отменённую правку</dd>
+          </dl>
+        </section>
+        <section>
+          <h3>Запись, заключение, окно</h3>
+          <dl>
+            <dt><kbd>PgUp</kbd> <kbd>PgDn</kbd></dt><dd>предыдущий / следующий фрагмент холтера</dd>
+            <dt><kbd>A</kbd></dt><dd>автоанализ и заключение</dd>
+            <dt><kbd>G</kbd>, затем <kbd>1</kbd>…<kbd>7</kbd></dt><dd>перейти к разделу 1–7</dd>
+            <dt><kbd>?</kbd></dt><dd>эта справка</dd>
+            <dt><kbd>Esc</kbd></dt><dd>закрыть справку / журнал</dd>
+          </dl>
+        </section>
+        <section>
+          <h3>Мышь на сигнале</h3>
+          <dl>
+            <dt><kbd>Shift</kbd>+клик</dt><dd>добавить метку R</dd>
+            <dt>ПКМ / <kbd>Alt</kbd>+клик по R</dt><dd>удалить метку R</dd>
+            <dt><kbd>Ctrl</kbd>+протяжка</dt><dd>отметить артефакт</dd>
+            <dt>Колесо в окне 1</dt><dd>масштаб; средняя кнопка — панорама</dd>
+            <dt><kbd>Alt</kbd> при перетаскивании ножки</dt><dd>циркуль RR без привязки к R</dd>
+          </dl>
+        </section>
+      </div>
+    </div>
+  </div>
+  <div class="drop-overlay" id="dropOverlay" hidden>
+    <div class="drop-card">Отпустите файл: фото / PDF ЭКГ или запись электрокардиографа / холтера<br />
+      <small>EDF, BDF, ISHNE, WFDB (.hea + .dat / .zip), GE MUSE XML, HL7 aECG, DICOM, CSV</small></div>
+  </div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script src="/static/app.js"></script>

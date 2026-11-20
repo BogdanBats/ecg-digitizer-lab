@@ -110,6 +110,17 @@
     // Axis caliper (section 5): window relative to the active R (ms), preset or custom
     axisCal: { preset: "qrs", a: null, b: null, drag: null, hoverRel: null, result: null },
     allLeadsTableRaf: 0,
+    // Undo / redo of R marks, calipers and artifact zones (snapshots of analysis.leads + artifacts)
+    undoStack: [],
+    redoStack: [],
+    undoRestoring: false,
+    // Status message log + elapsed-time ticker for long operations
+    statusLog: [],
+    busyTimer: null,
+    busySince: 0,
+    busyText: "",
+    // Section 7 analysis tools: active tab, lazy rendering (only while visible), caches and last results
+    atool: { tab: "hrv", visible: false, dirty: true, raf: 0, noiseKey: "", noiseCache: null, last: {}, hrvPts: [] },
   };
 
   const FIDUCIAL_DEFS = [
@@ -127,6 +138,30 @@
 
   // DOM Elements
   const el = {
+    atoolLead: document.getElementById("atoolLead"),
+    btnAtoolToReport: document.getElementById("btnAtoolToReport"),
+    hrvCanvas: document.getElementById("hrvCanvas"),
+    hrvMetrics: document.getElementById("hrvMetrics"),
+    hrvNote: document.getElementById("hrvNote"),
+    overlayCanvas: document.getElementById("overlayCanvas"),
+    overlayList: document.getElementById("overlayList"),
+    chkOverlayFlaggedOnly: document.getElementById("chkOverlayFlaggedOnly"),
+    selectOverlayCorr: document.getElementById("selectOverlayCorr"),
+    qtdCanvas: document.getElementById("qtdCanvas"),
+    qtdMetrics: document.getElementById("qtdMetrics"),
+    noiseCanvas: document.getElementById("noiseCanvas"),
+    noiseMetrics: document.getElementById("noiseMetrics"),
+    noiseNote: document.getElementById("noiseNote"),
+    navLive: document.getElementById("navLive"),
+    btnUndo: document.getElementById("btnUndo"),
+    btnRedo: document.getElementById("btnRedo"),
+    btnUndoBar: document.getElementById("btnUndoBar"),
+    btnRedoBar: document.getElementById("btnRedoBar"),
+    btnHelp: document.getElementById("btnHelp"),
+    btnHelpClose: document.getElementById("btnHelpClose"),
+    helpOverlay: document.getElementById("helpOverlay"),
+    dropOverlay: document.getElementById("dropOverlay"),
+    statusLog: document.getElementById("statusLog"),
     signalBar: document.getElementById("signalBar"),
     signalFormatBadge: document.getElementById("signalFormatBadge"),
     signalInfoLine: document.getElementById("signalInfoLine"),
@@ -403,6 +438,27 @@
 
   function setStatus(text, mode = "ready") {
     el.statusBadge.textContent = text;
+    el.statusBadge.title = `${text}\n(клик — журнал сообщений)`;
+    const lastMsg = state.statusLog[0];
+    if (!lastMsg || lastMsg.text !== text) {
+      state.statusLog.unshift({ t: new Date(), text, mode });
+      if (state.statusLog.length > 40) state.statusLog.pop();
+      if (el.statusLog && !el.statusLog.hidden) renderStatusLog();
+    }
+    // Long operations ("...") show how long they have been running
+    if (mode === "busy" && /(\.\.\.|…)\s*$/.test(text)) {
+      state.busyText = text;
+      if (!state.busyTimer) {
+        state.busySince = performance.now();
+        state.busyTimer = setInterval(() => {
+          const sec = Math.round((performance.now() - state.busySince) / 1000);
+          if (sec >= 2) el.statusBadge.textContent = `${state.busyText} ${sec} с`;
+        }, 1000);
+      }
+    } else if (state.busyTimer) {
+      clearInterval(state.busyTimer);
+      state.busyTimer = null;
+    }
     if (mode === "busy") {
       el.statusBadge.style.background = "#FEF7E0";
       el.statusBadge.style.color = "#B06000";
@@ -767,6 +823,7 @@
   function applyLoadedResult(data, customPxPerMm = null) {
     const sigMeta = data.digitization && data.digitization.source_type === "signal" ? data.digitization.signal : null;
     state.signal = sigMeta;
+    resetUndo();
     // Holter segments get their own report draft (key includes the segment start)
     state.currentSource = sigMeta ? `${data.source_name} @ ${fmtHms(sigMeta.segment_start_s)}` : data.source_name;
     state.digitization = data.digitization;
@@ -878,6 +935,1373 @@
     } else {
       setStatus(`Оцифровано (${availLeads.length} отв., ${state.digitization.elapsed_sec} с)`, "ready");
     }
+  }
+
+  // ------------------------------------------------------------------ 7. Analysis tools (tabs)
+  function meanOf(v) {
+    return v.length ? v.reduce((a, b) => a + b, 0) / v.length : NaN;
+  }
+  function sampleSd(v) {
+    if (v.length < 2) return NaN;
+    const m = meanOf(v);
+    return Math.sqrt(v.reduce((acc, x) => acc + (x - m) * (x - m), 0) / (v.length - 1));
+  }
+  function percentileOf(v, q) {
+    if (!v.length) return NaN;
+    const s2 = Array.from(v).sort((a, b) => a - b);
+    const pos = (s2.length - 1) * q;
+    const lo = Math.floor(pos);
+    const hi = Math.min(s2.length - 1, lo + 1);
+    return s2[lo] + (s2[hi] - s2[lo]) * (pos - lo);
+  }
+  function fmtNum(v, d = 0) {
+    return Number.isFinite(v) ? v.toFixed(d) : "—";
+  }
+
+  function sortedBeats(ln) {
+    const la = state.analysis && state.analysis.leads && state.analysis.leads[ln];
+    if (!la || !la.beats) return [];
+    return la.beats
+      .map((b, idx) => ({ idx, r: b && b.times_ms ? b.times_ms.r_peak : NaN, t: (b && b.times_ms) || {} }))
+      .filter((o) => Number.isFinite(o.r))
+      .sort((a, b) => a.r - b.r);
+  }
+
+  function overlapsArtifact(ln, a, b) {
+    return ((state.artifactsByLead && state.artifactsByLead[ln]) || []).some((z) => Math.min(z.endMs, b) - Math.max(z.startMs, a) > 0);
+  }
+
+  // RR series with NN (normal-to-normal) flags: both beats of the dominant QRS morphology, no artifact, and
+  // within 20 % of the local median of neighbouring NN candidates (excludes premature beats and pauses)
+  function rrSeriesNN(ln) {
+    const beats = sortedBeats(ln);
+    const mo = beats.length >= 3 ? computeBeatMorphology(ln, 0.9) : null;
+    const nonN = new Set(mo ? mo.rows.filter((r) => r.corr < mo.thr).map((r) => r.idx) : []);
+    const items = [];
+    for (let i = 0; i + 1 < beats.length; i++) {
+      const a = beats[i].r;
+      const b = beats[i + 1].r;
+      items.push({
+        i, a, b, rr: b - a, art: overlapsArtifact(ln, a, b), beatIdx: beats[i + 1].idx,
+        morphOk: !nonN.has(beats[i].idx) && !nonN.has(beats[i + 1].idx),
+      });
+    }
+    const cand = (x) => !x.art && x.morphOk && x.rr >= 250 && x.rr <= 2500;
+    items.forEach((it, k) => {
+      const neigh = items.slice(Math.max(0, k - 3), k + 4).filter(cand).map((x) => x.rr);
+      const med = neigh.length ? median(neigh) : it.rr;
+      it.localMed = med;
+      it.nn = cand(it) && Math.abs(it.rr - med) <= 0.2 * med;
+    });
+    items.nonNBeats = nonN.size;
+    return items;
+  }
+
+  // Lomb–Scargle periodogram of the uneven NN series; scaled so that its area equals the NN variance (ms²)
+  function lombScargleHrv(nnItems) {
+    const t = nnItems.map((x) => x.b / 1000);
+    const m = meanOf(nnItems.map((x) => x.rr));
+    const x = nnItems.map((it) => it.rr - m);
+    const df = 0.0025;
+    const freqs = [];
+    for (let f = 0.0033; f <= 0.4001; f += df) freqs.push(f);
+    const p = freqs.map((f) => {
+      const w = 2 * Math.PI * f;
+      let s2 = 0;
+      let c2 = 0;
+      t.forEach((tt) => {
+        s2 += Math.sin(2 * w * tt);
+        c2 += Math.cos(2 * w * tt);
+      });
+      const tau = Math.atan2(s2, c2) / (2 * w);
+      let xc = 0, xs = 0, cc = 0, ss = 0;
+      t.forEach((tt, k) => {
+        const c = Math.cos(w * (tt - tau));
+        const sn = Math.sin(w * (tt - tau));
+        xc += x[k] * c;
+        xs += x[k] * sn;
+        cc += c * c;
+        ss += sn * sn;
+      });
+      return 0.5 * ((cc > 0 ? (xc * xc) / cc : 0) + (ss > 0 ? (xs * xs) / ss : 0));
+    });
+    const area = p.reduce((a, v) => a + v, 0) * df;
+    const variance = meanOf(x.map((v) => v * v));
+    const k = area > 0 ? variance / area : 0;
+    const psd = p.map((v) => v * k);
+    const band = (lo, hi) => freqs.reduce((a, f, i) => a + (f >= lo && f < hi ? psd[i] * df : 0), 0);
+    const lf = band(0.04, 0.15);
+    const hf = band(0.15, 0.4);
+    return { freqs, psd, lf, hf, lfhf: hf > 0 ? lf / hf : NaN, lfnu: lf + hf > 0 ? (100 * lf) / (lf + hf) : NaN, hfnu: lf + hf > 0 ? (100 * hf) / (lf + hf) : NaN };
+  }
+
+  function computeHrv(items) {
+    const nn = items.filter((x) => x.nn).map((x) => x.rr);
+    const res = { nAll: items.length, nNN: nn.length, durationS: items.length ? (items[items.length - 1].b - items[0].a) / 1000 : 0 };
+    if (nn.length < 3) return res;
+    res.meanNN = meanOf(nn);
+    res.sdnn = sampleSd(nn);
+    res.cv = (100 * res.sdnn) / res.meanNN;
+    res.hrMean = 60000 / res.meanNN;
+    res.hrMin = 60000 / Math.max(...nn);
+    res.hrMax = 60000 / Math.min(...nn);
+    const d = [];
+    for (let k = 0; k + 1 < items.length; k++) if (items[k].nn && items[k + 1].nn) d.push(items[k + 1].rr - items[k].rr);
+    if (d.length >= 2) {
+      res.rmssd = Math.sqrt(meanOf(d.map((v) => v * v)));
+      res.sdsd = sampleSd(d);
+      res.pnn50 = (100 * d.filter((v) => Math.abs(v) > 50).length) / d.length;
+      res.sd1 = Math.SQRT1_2 * res.sdsd;
+      res.sd2 = Math.sqrt(Math.max(0, 2 * res.sdnn * res.sdnn - 0.5 * res.sdsd * res.sdsd));
+      res.sd1sd2 = res.sd2 > 0 ? res.sd1 / res.sd2 : NaN;
+    }
+    if (res.durationS >= 60 && nn.length >= 30) res.freq = lombScargleHrv(items.filter((x) => x.nn));
+    return res;
+  }
+
+  function prepCanvas(canvas, h = 300) {
+    const dpr = window.devicePixelRatio || 1;
+    const W = Math.max(300, canvas.clientWidth || 700);
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(h * dpr);
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, h);
+    return { ctx, W, H: h };
+  }
+
+  function niceTicks(lo, hi, n = 5) {
+    const span = hi - lo;
+    if (!(span > 0)) return [lo];
+    const raw = span / n;
+    const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((st) => span / st <= n) || 10 * mag;
+    const out = [];
+    for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(Math.round(v * 1e6) / 1e6);
+    return out;
+  }
+
+  function plotFrame(ctx, b, xr, yr, opt = {}) {
+    const X = (v) => b.x + ((v - xr[0]) / (xr[1] - xr[0] || 1)) * b.w;
+    const Y = (v) => b.y + b.h - ((v - yr[0]) / (yr[1] - yr[0] || 1)) * b.h;
+    ctx.save();
+    ctx.lineWidth = 1;
+    ctx.font = "10px 'IBM Plex Mono', monospace";
+    ctx.strokeStyle = "#EDF2F7";
+    ctx.fillStyle = "#718096";
+    niceTicks(yr[0], yr[1], opt.yn || 4).forEach((v) => {
+      const y = Y(v);
+      ctx.beginPath();
+      ctx.moveTo(b.x, y);
+      ctx.lineTo(b.x + b.w, y);
+      ctx.stroke();
+      ctx.textAlign = "right";
+      ctx.fillText(opt.yfmt ? opt.yfmt(v) : String(v), b.x - 4, y + 3);
+    });
+    niceTicks(xr[0], xr[1], opt.xn || 6).forEach((v) => {
+      const x = X(v);
+      ctx.strokeStyle = "#CBD5E0";
+      ctx.beginPath();
+      ctx.moveTo(x, b.y + b.h);
+      ctx.lineTo(x, b.y + b.h + 3);
+      ctx.stroke();
+      ctx.textAlign = "center";
+      ctx.fillText(opt.xfmt ? opt.xfmt(v) : String(v), x, b.y + b.h + 13);
+    });
+    ctx.strokeStyle = "#CBD5E0";
+    ctx.strokeRect(b.x, b.y, b.w, b.h);
+    if (opt.title) {
+      ctx.fillStyle = "#141923";
+      ctx.font = "600 11px 'IBM Plex Sans', sans-serif";
+      ctx.textAlign = "left";
+      ctx.fillText(opt.title, b.x, b.y - 5);
+    }
+    ctx.restore();
+    return { X, Y };
+  }
+
+  function canvasMessage(canvas, text) {
+    const { ctx } = prepCanvas(canvas, 300);
+    ctx.fillStyle = "#94A3B8";
+    ctx.font = "13px 'IBM Plex Sans', sans-serif";
+    ctx.fillText(text, 16, 30);
+  }
+
+  function metricsTable(rows) {
+    return `<table>${rows
+      .map((r) => (r.sub
+        ? `<tr><td colspan="3"><div class="sub">${escapeHtml(r.sub)}</div></td></tr>`
+        : `<tr class="${r.lvl || ""}"><td>${escapeHtml(r.k)}</td><td class="v">${escapeHtml(r.v)}</td><td class="r">${escapeHtml(r.r || "")}</td></tr>`))
+      .join("")}</table>`;
+  }
+
+  // ---- tab 1: tachogram, histogram, Poincaré, HRV
+  function renderHrvTool() {
+    const ln = state.activeLead;
+    const items = rrSeriesNN(ln);
+    const hrv = computeHrv(items);
+    state.atool.last.hrv = { ln, hrv };
+    state.atool.hrvPts = [];
+    if (items.length < 2) {
+      canvasMessage(el.hrvCanvas, "Нужно не меньше трёх комплексов с метками R");
+      el.hrvMetrics.innerHTML = "";
+      el.hrvNote.textContent = "";
+      return;
+    }
+    const { ctx, W } = prepCanvas(el.hrvCanvas, 300);
+    const colorOf = (it) => (it.art ? "#A0AEC0" : it.nn ? "#0F4C81" : "#D97706");
+    const rrVals = items.map((it) => it.rr);
+    const yr = [Math.max(0, Math.floor((Math.min(...rrVals) - 60) / 100) * 100), Math.ceil((Math.max(...rrVals) + 60) / 100) * 100];
+    const t0 = items[0].a;
+    const xr = [0, Math.max(1, (items[items.length - 1].b - t0) / 1000)];
+    const b1 = { x: 46, y: 18, w: W - 58, h: 106 };
+    const f1 = plotFrame(ctx, b1, xr, yr, { title: "Ритмограмма: RR, мс — время, с (синие NN, оранжевые — эктопия/паузы, серые — артефакт)", yn: 4 });
+    if (Number.isFinite(hrv.meanNN)) {
+      ctx.save();
+      ctx.setLineDash([4, 4]);
+      ctx.strokeStyle = "rgba(15, 76, 129, 0.5)";
+      ctx.beginPath();
+      ctx.moveTo(b1.x, f1.Y(hrv.meanNN));
+      ctx.lineTo(b1.x + b1.w, f1.Y(hrv.meanNN));
+      ctx.stroke();
+      ctx.restore();
+    }
+    ctx.strokeStyle = "rgba(74, 85, 104, 0.45)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    items.forEach((it, k) => {
+      const x = f1.X((it.b - t0) / 1000);
+      const y = f1.Y(it.rr);
+      if (k) ctx.lineTo(x, y);
+      else ctx.moveTo(x, y);
+    });
+    ctx.stroke();
+    items.forEach((it) => {
+      const x = f1.X((it.b - t0) / 1000);
+      const y = f1.Y(it.rr);
+      ctx.fillStyle = colorOf(it);
+      ctx.beginPath();
+      ctx.arc(x, y, it.beatIdx === state.activeBeatIdx ? 4.5 : 2.8, 0, Math.PI * 2);
+      ctx.fill();
+      if (it.beatIdx === state.activeBeatIdx) {
+        ctx.strokeStyle = "#7C3AED";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(x, y, 7, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      state.atool.hrvPts.push({ x, y, beatIdx: it.beatIdx });
+    });
+
+    // histogram of NN
+    const nnVals = items.filter((it) => it.nn).map((it) => it.rr);
+    const half = (W - 58) / 2;
+    const b2 = { x: 46, y: 160, w: half - 26, h: 112 };
+    const bin = yr[1] - yr[0] > 1000 ? 50 : 25;
+    const nb = Math.max(1, Math.ceil((yr[1] - yr[0]) / bin));
+    const counts = new Array(nb).fill(0);
+    nnVals.forEach((v) => (counts[Math.min(nb - 1, Math.max(0, Math.floor((v - yr[0]) / bin)))] += 1));
+    const f2 = plotFrame(ctx, b2, yr, [0, Math.max(1, ...counts)], { title: `Гистограмма NN (шаг ${bin} мс)`, yn: 3, xn: 4 });
+    ctx.fillStyle = "rgba(15, 76, 129, 0.75)";
+    counts.forEach((c, i) => {
+      if (!c) return;
+      const x0 = f2.X(yr[0] + i * bin);
+      const x1 = f2.X(yr[0] + (i + 1) * bin);
+      ctx.fillRect(x0 + 0.5, f2.Y(c), Math.max(1, x1 - x0 - 1), b2.y + b2.h - f2.Y(c));
+    });
+
+    // Poincaré (isotropic box) with the SD1 / SD2 ellipse
+    const side = Math.min(112, half - 30);
+    const b3 = { x: 46 + half + 30, y: 160, w: side, h: side };
+    const f3 = plotFrame(ctx, b3, yr, yr, { title: "Пуанкаре: RRn → RRn+1", yn: 3, xn: 3 });
+    for (let k = 0; k + 1 < items.length; k++) {
+      const both = items[k].nn && items[k + 1].nn;
+      ctx.fillStyle = both ? "rgba(15, 76, 129, 0.75)" : "rgba(217, 119, 6, 0.85)";
+      ctx.beginPath();
+      ctx.arc(f3.X(items[k].rr), f3.Y(items[k + 1].rr), 2.4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.save();
+    ctx.strokeStyle = "rgba(74, 85, 104, 0.4)";
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(f3.X(yr[0]), f3.Y(yr[0]));
+    ctx.lineTo(f3.X(yr[1]), f3.Y(yr[1]));
+    ctx.stroke();
+    ctx.restore();
+    if (Number.isFinite(hrv.sd1) && Number.isFinite(hrv.sd2)) {
+      const pxPerMs = b3.w / (yr[1] - yr[0]);
+      ctx.save();
+      ctx.translate(f3.X(hrv.meanNN), f3.Y(hrv.meanNN));
+      ctx.rotate(-Math.PI / 4);
+      ctx.strokeStyle = "#7C3AED";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, Math.max(1, hrv.sd2 * pxPerMs), Math.max(1, hrv.sd1 * pxPerMs), 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+    // LF / HF spectrum when available
+    const fr = hrv.freq;
+    if (fr) {
+      const b4 = { x: b3.x + b3.w + 34, y: 160, w: Math.max(60, W - 12 - (b3.x + b3.w + 34)), h: 112 };
+      if (b4.w >= 90) {
+        const maxP = Math.max(...fr.psd, 1e-9);
+        const f4 = plotFrame(ctx, b4, [0, 0.4], [0, maxP], { title: "Спектр NN (LF / HF)", yn: 2, xn: 4, yfmt: () => "" });
+        ctx.fillStyle = "rgba(217, 119, 6, 0.12)";
+        ctx.fillRect(f4.X(0.04), b4.y, f4.X(0.15) - f4.X(0.04), b4.h);
+        ctx.fillStyle = "rgba(11, 122, 83, 0.12)";
+        ctx.fillRect(f4.X(0.15), b4.y, f4.X(0.4) - f4.X(0.15), b4.h);
+        ctx.strokeStyle = "#141923";
+        ctx.beginPath();
+        fr.freqs.forEach((f, i) => (i ? ctx.lineTo(f4.X(f), f4.Y(fr.psd[i])) : ctx.moveTo(f4.X(f), f4.Y(fr.psd[i]))));
+        ctx.stroke();
+      }
+    }
+
+    const longEnough = hrv.durationS >= 240;
+    const tooShort = hrv.durationS < 30;
+    const lvl = (v, lo, hi) => (!longEnough || !Number.isFinite(v) ? "" : v < lo || v > hi ? "warn" : "");
+    const rows = [
+      { k: "Анализируемый участок", v: `${fmtNum(hrv.durationS, 0)} с`, r: `RR ${hrv.nAll}, NN ${hrv.nNN}` },
+      { k: "ЧСС средняя (мин–макс)", v: `${fmtNum(hrv.hrMean, 0)} (${fmtNum(hrv.hrMin, 0)}–${fmtNum(hrv.hrMax, 0)})`, r: "уд/мин" },
+      { k: "Среднее NN", v: fmtNum(hrv.meanNN, 0), r: "мс" },
+    ];
+    if (!tooShort) rows.push(...[
+      { sub: "Временной анализ" },
+      { k: "SDNN", v: fmtNum(hrv.sdnn, 1), r: "мс · 32–93*", lvl: lvl(hrv.sdnn, 32, 93) },
+      { k: "RMSSD", v: fmtNum(hrv.rmssd, 1), r: "мс · 19–75*", lvl: lvl(hrv.rmssd, 19, 75) },
+      { k: "pNN50", v: fmtNum(hrv.pnn50, 1), r: "%" },
+      { k: "SDSD", v: fmtNum(hrv.sdsd, 1), r: "мс" },
+      { k: "CV (SDNN / NN)", v: fmtNum(hrv.cv, 1), r: "%" },
+      { sub: "Пуанкаре" },
+      { k: "SD1 / SD2", v: `${fmtNum(hrv.sd1, 1)} / ${fmtNum(hrv.sd2, 1)}`, r: "мс" },
+      { k: "SD1/SD2", v: fmtNum(hrv.sd1sd2, 2) },
+    ]);
+    if (fr && !tooShort) {
+      rows.push({ sub: "Частотный анализ (Ломб–Скаргл)" });
+      rows.push({ k: "LF 0.04–0.15 Гц", v: fmtNum(fr.lf, 0), r: "мс²" });
+      rows.push({ k: "HF 0.15–0.40 Гц", v: fmtNum(fr.hf, 0), r: "мс²" });
+      rows.push({ k: "LF/HF", v: fmtNum(fr.lfhf, 2), r: "1.1–11.6*", lvl: lvl(fr.lfhf, 1.1, 11.6) });
+      rows.push({ k: "LFnu / HFnu", v: `${fmtNum(fr.lfnu, 0)} / ${fmtNum(fr.hfnu, 0)}`, r: "%" });
+    }
+    const excluded = hrv.nAll - hrv.nNN;
+    const verdict = tooShort && hrv.nNN >= 3
+      ? { c: "warn", t: `Участок ${fmtNum(hrv.durationS, 0)} с — слишком короткий для ВСР (нужно ≥ 30 с, стандарт 5 мин); показаны ЧСС и RR` }
+      : hrv.nNN < 3
+      ? { c: "bad", t: items.nonNBeats
+        ? `NN-интервалов нет: ${items.nonNBeats} комплексов иной формы (эктопия) — ВСР не оценивается`
+        : "Недостаточно NN-интервалов" }
+      : excluded > 0.2 * hrv.nAll
+        ? { c: "warn", t: `Исключено ${excluded} из ${hrv.nAll} RR (эктопия / паузы / артефакт) — ВСР ненадёжна` }
+        : { c: "ok", t: `NN ${hrv.nNN} из ${hrv.nAll} RR` };
+    el.hrvMetrics.innerHTML = `<div class="atool-verdict ${verdict.c}">${escapeHtml(verdict.t)}</div>` + metricsTable(rows);
+    const notes = ["* ориентир для 5-минутной записи у здоровых взрослых (Nunan et al., 2010); NN — RR без артефактов и без отклонения > 20 % от локальной медианы."];
+    if (hrv.durationS < 60) notes.unshift("Участок < 1 мин: показатели ВСР ориентировочные, частотный анализ не выполняется (стандарт — 5 мин; для холтера выберите окно 120 с).");
+    else if (hrv.durationS < 300) notes.unshift("Участок короче 5 мин: частотные показатели ориентировочные.");
+    notes.push("Клик по точке ритмограммы — перейти к комплексу.");
+    el.hrvNote.textContent = notes.join(" ");
+  }
+
+  // ---- tab 2: beat overlay aligned on R, morphology vs median template
+  function pearsonR(a, b, i0, i1) {
+    let sa = 0, sb = 0, n = 0;
+    for (let i = i0; i <= i1; i++) {
+      sa += a[i];
+      sb += b[i];
+      n += 1;
+    }
+    if (n < 3) return 0;
+    const ma = sa / n;
+    const mb = sb / n;
+    let num = 0, da = 0, db = 0;
+    for (let i = i0; i <= i1; i++) {
+      num += (a[i] - ma) * (b[i] - mb);
+      da += (a[i] - ma) * (a[i] - ma);
+      db += (b[i] - mb) * (b[i] - mb);
+    }
+    return da > 0 && db > 0 ? num / Math.sqrt(da * db) : 0;
+  }
+
+  function computeBeatMorphology(ln, thr) {
+    const sig = state.digitization.leads_mv[ln] || [];
+    const fs = state.digitization.sampling_rate_hz || 500;
+    const beats = sortedBeats(ln);
+    if (beats.length < 3 || sig.length < 10) return null;
+    const rrs = [];
+    for (let k = 1; k < beats.length; k++) rrs.push(beats[k].r - beats[k - 1].r);
+    const medRR = median(rrs.filter((v) => v >= 250 && v <= 2500)) || 800;
+    const pre = Math.max(200, Math.min(350, 0.35 * medRR));
+    const post = Math.max(300, Math.min(550, 0.6 * medRR));
+    const n = Math.round(((pre + post) * fs) / 1000) + 1;
+    const rows = [];
+    beats.forEach((bt, k) => {
+      const i0 = Math.round(((bt.r - pre) * fs) / 1000);
+      if (i0 < 0 || i0 + n > sig.length) return;
+      if (overlapsArtifact(ln, bt.r - 60, bt.r + 100)) return;
+      const qon = Number.isFinite(bt.t.qrs_onset) && bt.t.qrs_onset < bt.r ? bt.t.qrs_onset : bt.r - 50;
+      const ia = Math.max(0, Math.round(((qon - 25) * fs) / 1000));
+      const ib = Math.max(ia + 1, Math.round(((qon - 5) * fs) / 1000));
+      const iso = median(Array.from(sig.slice(ia, ib)));
+      const wave = new Float64Array(n);
+      for (let j = 0; j < n; j++) wave[j] = sig[i0 + j] - iso;
+      rows.push({ idx: bt.idx, num: k + 1, r: bt.r, wave, rrPrev: k > 0 ? bt.r - beats[k - 1].r : null });
+    });
+    if (rows.length < 3) return null;
+    const ja = Math.max(0, Math.round(((pre - 60) * fs) / 1000));
+    const jb = Math.min(n - 1, Math.round(((pre + 100) * fs) / 1000));
+    // Dominant QRS morphology: the largest cluster of mutually similar beats (r >= thr). Among clusters of
+    // similar size (bigeminy is 50/50) the one with the longer preceding RR is the basic rhythm, not the ectopy.
+    const stepT = Math.max(1, Math.ceil(rows.length / 80));
+    const sample = rows.filter((_, i) => i % stepT === 0);
+    const m = sample.length;
+    const cm = Array.from({ length: m }, () => new Float64Array(m));
+    for (let a = 0; a < m; a++) {
+      cm[a][a] = 1;
+      for (let b2 = a + 1; b2 < m; b2++) cm[a][b2] = cm[b2][a] = pearsonR(sample[a].wave, sample[b2].wave, ja, jb);
+    }
+    const members = sample.map((_, a) => sample.filter((__, b2) => cm[a][b2] >= thr));
+    const maxSup = Math.max(...members.map((g) => g.length));
+    let best = 0;
+    let bestRR = -Infinity;
+    members.forEach((g, a) => {
+      if (g.length < 0.8 * maxSup) return;
+      const rrs2 = g.map((r) => r.rrPrev).filter((v) => v !== null);
+      const mrr = rrs2.length ? median(rrs2) : 0;
+      if (mrr > bestRR + 1 || (Math.abs(mrr - bestRR) <= 1 && g.length > members[best].length)) {
+        best = a;
+        bestRR = mrr;
+      }
+    });
+    const cluster = members[best];
+    const template = new Float64Array(n);
+    const col = new Array(cluster.length);
+    for (let j = 0; j < n; j++) {
+      for (let r = 0; r < cluster.length; r++) col[r] = cluster[r].wave[j];
+      template[j] = median(col);
+    }
+    const clusterRR = cluster.map((r) => r.rrPrev).filter((v) => v !== null);
+    const refRR = clusterRR.length ? median(clusterRR) : medRR;
+    const counts = { N: 0, S: 0, V: 0, X: 0 };
+    rows.forEach((row) => {
+      row.corr = pearsonR(row.wave, template, ja, jb);
+      row.prem = row.rrPrev !== null && row.rrPrev < 0.85 * refRR;
+      const same = row.corr >= thr;
+      row.cls = same ? (row.prem ? "S" : "N") : row.prem ? "V" : "X";
+      counts[row.cls] += 1;
+    });
+    return { rows, template, pre, post, n, fs, medRR: refRR, counts, thr, dominantShare: cluster.length / m };
+  }
+
+  const BEAT_CLASS = {
+    N: { color: "rgba(160, 174, 192, 0.55)", name: "основная форма" },
+    S: { color: "#D97706", name: "преждевременный, та же форма QRS (наджелудочковый?)" },
+    V: { color: "#D9381E", name: "преждевременный, иная форма QRS (желудочковый / аберрантный?)" },
+    X: { color: "#7C3AED", name: "иная форма без преждевременности (артефакт, выскальзывающий, смена проведения?)" },
+  };
+
+  function renderOverlayTool() {
+    const ln = state.activeLead;
+    const thr = parseFloat(el.selectOverlayCorr.value) || 0.9;
+    const mo = computeBeatMorphology(ln, thr);
+    state.atool.last.overlay = { ln, mo };
+    if (!mo) {
+      canvasMessage(el.overlayCanvas, "Нужно не меньше трёх полных комплексов с метками R");
+      el.overlayList.innerHTML = "";
+      return;
+    }
+    const flaggedOnly = el.chkOverlayFlaggedOnly.checked;
+    const { ctx, W } = prepCanvas(el.overlayCanvas, 300);
+    let lo = Infinity;
+    let hi = -Infinity;
+    mo.rows.forEach((row) => {
+      for (let j = 0; j < mo.n; j += 2) {
+        lo = Math.min(lo, row.wave[j]);
+        hi = Math.max(hi, row.wave[j]);
+      }
+    });
+    const pad = 0.08 * Math.max(0.2, hi - lo);
+    const b = { x: 46, y: 18, w: W - 58, h: 252 };
+    const f = plotFrame(ctx, b, [-mo.pre, mo.post], [lo - pad, hi + pad], {
+      title: `Комплексы ${ln}, совмещённые по R (мВ; мс от R), n = ${mo.rows.length}`, yn: 5, xn: 8,
+    });
+    ctx.fillStyle = "rgba(124, 58, 237, 0.06)";
+    ctx.fillRect(f.X(-60), b.y, f.X(100) - f.X(-60), b.h);
+    ctx.strokeStyle = "rgba(176, 35, 16, 0.35)";
+    ctx.beginPath();
+    ctx.moveTo(f.X(0), b.y);
+    ctx.lineTo(f.X(0), b.y + b.h);
+    ctx.stroke();
+    const tOf = (j) => (j * 1000) / mo.fs - mo.pre;
+    const drawWave = (w, color, lw, dash) => {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = lw;
+      ctx.setLineDash(dash || []);
+      ctx.beginPath();
+      for (let j = 0; j < mo.n; j++) {
+        const x = f.X(tOf(j));
+        const y = f.Y(w[j]);
+        if (j) ctx.lineTo(x, y);
+        else ctx.moveTo(x, y);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+    };
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(b.x, b.y, b.w, b.h);
+    ctx.clip();
+    if (!flaggedOnly) mo.rows.filter((r) => r.cls === "N").forEach((r) => drawWave(r.wave, BEAT_CLASS.N.color, 1));
+    mo.rows.filter((r) => r.cls !== "N").forEach((r) => drawWave(r.wave, BEAT_CLASS[r.cls].color, 1.4));
+    drawWave(mo.template, "#141923", 2.6);
+    const act = mo.rows.find((r) => r.idx === state.activeBeatIdx);
+    if (act) drawWave(act.wave, "#2563EB", 2, [6, 4]);
+    ctx.restore();
+
+    const c = mo.counts;
+    const total = mo.rows.length;
+    const verdict = c.V + c.X === 0 && c.S === 0
+      ? { cls: "ok", t: `Все ${total} комплексов одной формы, без преждевременных` }
+      : { cls: c.V ? "bad" : "warn", t: `Отличаются ${c.S + c.V + c.X} из ${total}: S? ${c.S}, V? ${c.V}, иная форма ${c.X}` };
+    const chips = mo.rows
+      .filter((r) => r.cls !== "N")
+      .slice(0, 80)
+      .map((r) => {
+        const dev = r.rrPrev !== null ? `${Math.round(((r.rrPrev - mo.medRR) / mo.medRR) * 100)}%` : "—";
+        return `<button type="button" class="beat-chip c-${r.cls}${r.idx === state.activeBeatIdx ? " active" : ""}" data-beat="${r.idx}" ` +
+          `title="${escapeHtml(BEAT_CLASS[r.cls].name)}">R${r.num} ${r.cls}? · r=${r.corr.toFixed(2)} · RR ${r.rrPrev !== null ? r.rrPrev.toFixed(0) : "—"} (${dev})</button>`;
+      })
+      .join("");
+    el.overlayList.innerHTML =
+      `<div class="atool-verdict ${verdict.cls}">${escapeHtml(verdict.t)}</div>` +
+      metricsTable([
+        { k: "Основная форма (N)", v: String(c.N) },
+        { k: "Преждевр., та же форма (S?)", v: String(c.S), lvl: c.S ? "warn" : "" },
+        { k: "Преждевр., иная форма (V?)", v: String(c.V), lvl: c.V ? "bad" : "" },
+        { k: "Иная форма (X)", v: String(c.X), lvl: c.X ? "warn" : "" },
+        { k: "Опорный цикл (RR перед основными)", v: `${mo.medRR.toFixed(0)} мс` },
+        { k: "Доля основной формы", v: `${Math.round(mo.dominantShare * 100)}%`, lvl: mo.dominantShare < 0.6 ? "warn" : "" },
+      ]) +
+      (chips ? `<div class="sub">Отличающиеся комплексы (клик — к комплексу)</div>${chips}` : "");
+  }
+
+  // ---- tab 3: QT dispersion across leads (each lead's own calipers)
+  const STANDARD_LEADS = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"];
+  function computeQtDispersion() {
+    const leads = Object.keys((state.analysis && state.analysis.leads) || {});
+    const rows = leads.map((ln) => {
+      const la = state.analysis.leads[ln];
+      const c = ln === state.activeLead ? state.calipersMs : la.calipers_ms || {};
+      const m = la.metrics || {};
+      const iv = m.intervals_ms || {};
+      const am = m.amplitudes_mv || {};
+      const qt = Number.isFinite(c.t_offset) && Number.isFinite(c.qrs_onset) ? c.t_offset - c.qrs_onset : NaN;
+      const rr = (m.intervals_ms && m.intervals_ms.rr) || m.rr_ms || NaN;
+      const qtcf = Number.isFinite(qt) && rr > 250 ? qt / Math.cbrt(rr / 1000) : iv.qtc_fridericia;
+      const reasons = [];
+      if (!STANDARD_LEADS.includes(ln)) reasons.push("нестандартное отведение");
+      if (!(qt >= 200 && qt <= 700)) reasons.push("QT вне 200–700 мс");
+      if (!(Math.abs(am.t_amp_mv || 0) >= 0.1)) reasons.push("T < 0,1 мВ");
+      if (leadQualityInfo(ln).level === "bad") reasons.push("плохое качество");
+      const beatNo = (la.beats || []).findIndex((b) => b && b.times_ms && Math.abs(b.times_ms.r_peak - c.r_peak) < 1);
+      const len = ((state.digitization.leads_mv || {})[ln] || []).length;
+      return { ln, c, qt, qtcf, qrsOn: c.qrs_onset, qrsOff: c.qrs_offset, include: reasons.length === 0, reasons, beatNo, r: c.r_peak, len };
+    });
+    // a lead whose QT differs > 20 % from the median of the other leads is almost always a mis-placed T_off
+    const pre = rows.filter((r) => r.include);
+    if (pre.length >= 3) {
+      const medQt = median(pre.map((r) => r.qt));
+      pre.forEach((r) => {
+        if (Math.abs(r.qt - medQt) > 0.2 * medQt) {
+          r.include = false;
+          r.reasons.push(`QT ${r.qt.toFixed(0)} мс отличается от медианы ${medQt.toFixed(0)} мс > 20 % — проверьте T_off`);
+        }
+      });
+    }
+    const inc = rows.filter((r) => r.include);
+    const res = { rows, inc };
+    const edited = (ln) => {
+      const e = state.editedCalipers && state.editedCalipers[ln];
+      return !!(e && (e.has("t_offset") || e.has("qrs_onset")));
+    };
+    // simultaneous leads (same recording length) should be measured on the same complex
+    const groups = {};
+    inc.forEach((r) => (groups[r.len] = groups[r.len] || []).push(r));
+    res.mixedBeats = Object.values(groups).some((g) => g.length >= 2 && Math.max(...g.map((r) => r.r)) - Math.min(...g.map((r) => r.r)) > 100);
+    if (inc.length >= 2) {
+      const byQt = inc.slice().sort((a, b) => a.qt - b.qt);
+      res.min = byQt[0];
+      res.max = byQt[byQt.length - 1];
+      res.qtd = res.max.qt - res.min.qt;
+      const qtcs = inc.map((r) => r.qtcf).filter(Number.isFinite);
+      res.qtcd = qtcs.length >= 2 ? Math.max(...qtcs) - Math.min(...qtcs) : NaN;
+      res.meanQt = meanOf(inc.map((r) => r.qt));
+      res.uniform = inc.length >= 3 && res.qtd < 2;
+      res.manual = edited(res.min.ln) && edited(res.max.ln);
+    }
+    return res;
+  }
+
+  function renderQtdTool() {
+    const res = computeQtDispersion();
+    state.atool.last.qtd = res;
+    const valid = res.rows.filter((r) => Number.isFinite(r.qt));
+    if (!valid.length) {
+      canvasMessage(el.qtdCanvas, "Нет калиперов QRS / T ни в одном отведении");
+      el.qtdMetrics.innerHTML = "";
+      return;
+    }
+    const { ctx, W } = prepCanvas(el.qtdCanvas, 300);
+    const maxQt = Math.max(...valid.map((r) => r.qt));
+    const b = { x: 84, y: 18, w: W - 172, h: 256 };
+    const f = plotFrame(ctx, b, [0, Math.ceil((maxQt + 40) / 50) * 50], [0, 1], {
+      title: "От начала QRS: QRS (красный), ST–T (зелёный), конец T — мс", yn: 1, xn: 8, yfmt: () => "",
+    });
+    const rowH = b.h / res.rows.length;
+    ctx.font = "600 10.5px 'IBM Plex Mono', monospace";
+    res.rows.forEach((r, i) => {
+      const yc = b.y + rowH * (i + 0.5);
+      ctx.globalAlpha = r.include ? 1 : 0.35;
+      ctx.fillStyle = "#141923";
+      ctx.textAlign = "right";
+      ctx.fillText(`${r.ln.length > 6 ? `${r.ln.slice(0, 6)}…` : r.ln}${r.beatNo >= 0 ? ` R${r.beatNo + 1}` : ""}`, b.x - 6, yc + 3);
+      if (Number.isFinite(r.qt)) {
+        const qrsEnd = Number.isFinite(r.qrsOff) ? r.qrsOff - r.qrsOn : 0;
+        ctx.fillStyle = "#D9381E";
+        ctx.fillRect(f.X(0), yc - 4, Math.max(1, f.X(qrsEnd) - f.X(0)), 8);
+        ctx.strokeStyle = "#0B7A53";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(f.X(qrsEnd), yc);
+        ctx.lineTo(f.X(r.qt), yc);
+        ctx.stroke();
+        ctx.fillStyle = "#0B7A53";
+        ctx.fillRect(f.X(r.qt) - 1.5, yc - 6, 3, 12);
+        ctx.fillStyle = "#4A5568";
+        ctx.textAlign = "left";
+        ctx.fillText(`${r.qt.toFixed(0)}${r.include ? "" : " ×"}`, b.x + b.w + 6, yc + 3);
+      }
+      ctx.globalAlpha = 1;
+    });
+    if (res.min && res.max && !res.uniform) {
+      [res.min, res.max].forEach((r) => {
+        ctx.save();
+        ctx.setLineDash([4, 3]);
+        ctx.strokeStyle = "#7C3AED";
+        ctx.beginPath();
+        ctx.moveTo(f.X(r.qt), b.y);
+        ctx.lineTo(f.X(r.qt), b.y + b.h);
+        ctx.stroke();
+        ctx.restore();
+      });
+      ctx.fillStyle = "#6D28D9";
+      ctx.textAlign = "center";
+      ctx.fillText(`QTd ${res.qtd.toFixed(0)} мс`, (f.X(res.min.qt) + f.X(res.max.qt)) / 2, b.y + 10);
+    }
+    const rows = [];
+    let verdict;
+    if (res.inc.length < 2) {
+      verdict = { c: "warn", t: "Для дисперсии нужно ≥ 2 пригодных отведения (желательно ≥ 8)" };
+    } else if (res.uniform) {
+      verdict = { c: "warn", t: "Границы QT во всех отведениях одинаковы (общая разметка автоанализа) — дисперсия не оценивается; уточните T_off по отведениям вручную" };
+    } else {
+      const auto = res.manual ? "" : ` (автоматические границы — проверьте T_off в ${res.max.ln} и ${res.min.ln})`;
+      verdict = res.qtd >= 100
+        ? { c: res.manual ? "bad" : "warn", t: `Выраженная дисперсия QT: ${res.qtd.toFixed(0)} мс${auto}` }
+        : res.qtd >= 80
+          ? { c: "warn", t: `Повышенная дисперсия QT: ${res.qtd.toFixed(0)} мс${auto}` }
+          : { c: "ok", t: `Дисперсия QT ${res.qtd.toFixed(0)} мс` };
+      rows.push({ k: "QTd (max − min)", v: `${res.qtd.toFixed(0)} мс`, r: "≥ 80–100 мс — повышена", lvl: res.qtd >= 100 ? "bad" : res.qtd >= 80 ? "warn" : "" });
+      rows.push({ k: "QTcd (Фридеричиа)", v: `${fmtNum(res.qtcd, 0)} мс` });
+      rows.push({ k: "QT max", v: `${res.max.qt.toFixed(0)} мс`, r: res.max.ln });
+      rows.push({ k: "QT min", v: `${res.min.qt.toFixed(0)} мс`, r: res.min.ln });
+      rows.push({ k: "QT средний", v: `${res.meanQt.toFixed(0)} мс` });
+    }
+    rows.push({ k: "Отведений в расчёте", v: `${res.inc.length} из ${res.rows.length}`, lvl: res.inc.length < 8 ? "warn" : "" });
+    if (res.mixedBeats) {
+      verdict = { c: "warn", t: `${verdict.t}. Калиперы синхронных отведений стоят на разных комплексах (номер R у названия) — ` +
+        "при экстрасистолии сравнивайте QT на одном и том же синусовом комплексе" };
+    }
+    const excl = res.rows.filter((r) => !r.include);
+    if (excl.length) {
+      rows.push({ sub: "Не вошли в расчёт" });
+      excl.forEach((r) => rows.push({ k: r.ln, v: "×", r: r.reasons.join(", ") }));
+    }
+    el.qtdMetrics.innerHTML = `<div class="atool-verdict ${verdict.c}">${escapeHtml(verdict.t)}</div>` + metricsTable(rows);
+  }
+
+  // ---- tab 4: power spectrum and noise of the active lead
+  function fftInPlace(re, im) {
+    const n = re.length;
+    for (let i = 1, j = 0; i < n; i++) {
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i < j) {
+        [re[i], re[j]] = [re[j], re[i]];
+        [im[i], im[j]] = [im[j], im[i]];
+      }
+    }
+    for (let len = 2; len <= n; len <<= 1) {
+      const ang = (-2 * Math.PI) / len;
+      const wr = Math.cos(ang);
+      const wi = Math.sin(ang);
+      for (let i = 0; i < n; i += len) {
+        let cr = 1;
+        let ci = 0;
+        for (let k = 0; k < len / 2; k++) {
+          const ar = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci;
+          const ai = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
+          re[i + k + len / 2] = re[i + k] - ar;
+          im[i + k + len / 2] = im[i + k] - ai;
+          re[i + k] += ar;
+          im[i + k] += ai;
+          const nr = cr * wr - ci * wi;
+          ci = cr * wi + ci * wr;
+          cr = nr;
+        }
+      }
+    }
+  }
+
+  // Welch PSD (Hann, 50 % overlap), one-sided, mV²/Hz
+  function welchPsd(sig, fs) {
+    let nfft = 1;
+    while (nfft * 2 <= Math.min(sig.length, 4096)) nfft *= 2;
+    if (nfft < 256) return null;
+    const w = new Float64Array(nfft);
+    let u = 0;
+    for (let k = 0; k < nfft; k++) {
+      w[k] = 0.5 - 0.5 * Math.cos((2 * Math.PI * k) / (nfft - 1));
+      u += w[k] * w[k];
+    }
+    const half = nfft / 2;
+    const psd = new Float64Array(half + 1);
+    let segs = 0;
+    for (let start = 0; start + nfft <= sig.length; start += half) {
+      let m = 0;
+      for (let k = 0; k < nfft; k++) m += sig[start + k];
+      m /= nfft;
+      const re = new Float64Array(nfft);
+      const im = new Float64Array(nfft);
+      for (let k = 0; k < nfft; k++) re[k] = (sig[start + k] - m) * w[k];
+      fftInPlace(re, im);
+      for (let k = 0; k <= half; k++) psd[k] += re[k] * re[k] + im[k] * im[k];
+      segs += 1;
+    }
+    for (let k = 0; k <= half; k++) psd[k] = (psd[k] / (fs * u * segs)) * (k === 0 || k === half ? 1 : 2);
+    return { freqs: Array.from({ length: half + 1 }, (_, k) => (k * fs) / nfft), psd, nfft, segs };
+  }
+
+  function movingAverage(x, len) {
+    const L = Math.max(1, len | 0);
+    const out = new Float64Array(x.length);
+    let acc = 0;
+    const h = Math.floor(L / 2);
+    const cs = new Float64Array(x.length + 1);
+    for (let i = 0; i < x.length; i++) cs[i + 1] = cs[i] + x[i];
+    for (let i = 0; i < x.length; i++) {
+      const a = Math.max(0, i - h);
+      const b = Math.min(x.length, i - h + L);
+      acc = (cs[b] - cs[a]) / Math.max(1, b - a);
+      out[i] = acc;
+    }
+    return out;
+  }
+
+  function computeNoise(ln) {
+    const sig = state.digitization.leads_mv[ln] || [];
+    const fs = state.digitization.sampling_rate_hz || 500;
+    if (sig.length < fs * 2) return null;
+    const x = Float64Array.from(sig);
+    const psd = welchPsd(x, fs);
+    const edge = Math.round(0.5 * fs);
+    const lp = movingAverage(x, Math.round(fs));
+    const core = Array.from(lp.slice(edge, Math.max(edge + 1, lp.length - edge)));
+    const wander = percentileOf(core, 0.95) - percentileOf(core, 0.05);
+    const L = Math.max(3, Math.round(0.018 * fs) | 1);
+    const hp = movingAverage(x, L).map((v, i) => x[i] - v);
+    const beats = sortedBeats(ln);
+    const mask = new Uint8Array(x.length);
+    beats.forEach((bt) => {
+      const a = Math.max(0, Math.round(((bt.r - 100) * fs) / 1000));
+      const b = Math.min(x.length, Math.round(((bt.r + 100) * fs) / 1000));
+      for (let i = a; i < b; i++) mask[i] = 1;
+    });
+    ((state.artifactsByLead && state.artifactsByLead[ln]) || []).forEach((z) => {
+      for (let i = Math.max(0, Math.round((z.startMs * fs) / 1000)); i < Math.min(x.length, Math.round((z.endMs * fs) / 1000)); i++) mask[i] = 1;
+    });
+    let ss = 0;
+    let cnt = 0;
+    for (let i = edge; i < x.length - edge; i++) {
+      if (mask[i]) continue;
+      ss += hp[i] * hp[i];
+      cnt += 1;
+    }
+    const hfRmsUv = cnt > fs * 0.2 ? Math.sqrt(ss / cnt) * 1000 : NaN;
+    const amps = beats.map((bt) => {
+      const a = Math.max(0, Math.round(((bt.r - 60) * fs) / 1000));
+      const b = Math.min(x.length, Math.round(((bt.r + 60) * fs) / 1000));
+      let lo = Infinity, hi = -Infinity;
+      for (let i = a; i < b; i++) {
+        lo = Math.min(lo, x[i]);
+        hi = Math.max(hi, x[i]);
+      }
+      return hi - lo;
+    }).filter(Number.isFinite);
+    const qrsAmp = amps.length ? median(amps) : NaN;
+    const snrDb = Number.isFinite(hfRmsUv) && hfRmsUv > 0 && qrsAmp > 0 ? 20 * Math.log10((qrsAmp * 1000) / hfRmsUv) : NaN;
+    const mains = {};
+    if (psd) {
+      [50, 60].forEach((f0) => {
+        if (f0 > fs / 2 - 8) return;
+        const peak = Math.max(...psd.freqs.map((f, i) => (Math.abs(f - f0) <= 0.6 ? psd.psd[i] : 0)));
+        const ref = percentileOf(psd.freqs.map((f, i) => (Math.abs(f - f0) >= 1.5 && Math.abs(f - f0) <= 6 ? psd.psd[i] : null)).filter((v) => v !== null && v > 0), 0.9);
+        mains[f0] = peak > 0 && ref > 0 ? 10 * Math.log10(peak / ref) : NaN;
+      });
+    }
+    return { fs, psd, wander, hfRmsUv, qrsAmp, snrDb, mains };
+  }
+
+  function renderNoiseTool() {
+    const ln = state.activeLead;
+    const sig = (state.digitization.leads_mv && state.digitization.leads_mv[ln]) || [];
+    const arts = JSON.stringify((state.artifactsByLead && state.artifactsByLead[ln]) || []);
+    const key = `${state.currentSource}|${ln}|${sig.length}|${sortedBeats(ln).length}|${arts}`;
+    if (key !== state.atool.noiseKey) {
+      state.atool.noiseKey = key;
+      state.atool.noiseCache = computeNoise(ln);
+    }
+    const nz = state.atool.noiseCache;
+    state.atool.last.noise = { ln, nz };
+    if (!nz || !nz.psd) {
+      canvasMessage(el.noiseCanvas, "Сигнал слишком короткий для спектрального анализа (нужно ≥ 2 с)");
+      el.noiseMetrics.innerHTML = "";
+      el.noiseNote.textContent = "";
+      return;
+    }
+    const { ctx, W } = prepCanvas(el.noiseCanvas, 300);
+    const fmax = Math.min(nz.fs / 2, 150);
+    const db = nz.psd.psd.map((v) => 10 * Math.log10(Math.max(v, 1e-12)));
+    const vis = db.filter((_, i) => nz.psd.freqs[i] <= fmax && nz.psd.freqs[i] > 0);
+    const yhi = Math.ceil((Math.max(...vis) + 3) / 10) * 10;
+    const ylo = Math.max(yhi - 90, Math.floor((Math.min(...vis) - 3) / 10) * 10);
+    const b = { x: 50, y: 18, w: W - 62, h: 252 };
+    const f = plotFrame(ctx, b, [0, fmax], [ylo, yhi], { title: `Спектр мощности ${ln} (дБ отн. 1 мВ²/Гц; Гц), Welch, окно ${(nz.psd.nfft / nz.fs).toFixed(1)} с × ${nz.psd.segs}`, yn: 5, xn: 10 });
+    ctx.fillStyle = "rgba(217, 119, 6, 0.12)";
+    ctx.fillRect(f.X(0), b.y, f.X(0.5) - f.X(0), b.h);
+    ctx.fillStyle = "rgba(11, 122, 83, 0.07)";
+    ctx.fillRect(f.X(0.5), b.y, f.X(Math.min(40, fmax)) - f.X(0.5), b.h);
+    [50, 60].forEach((f0) => {
+      if (f0 > fmax) return;
+      ctx.save();
+      ctx.setLineDash([4, 3]);
+      ctx.strokeStyle = "rgba(217, 56, 30, 0.6)";
+      ctx.beginPath();
+      ctx.moveTo(f.X(f0), b.y);
+      ctx.lineTo(f.X(f0), b.y + b.h);
+      ctx.stroke();
+      ctx.restore();
+      ctx.fillStyle = "#D9381E";
+      ctx.font = "10px 'IBM Plex Mono', monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(`${f0} Гц`, f.X(f0), b.y + 10);
+    });
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(b.x, b.y, b.w, b.h);
+    ctx.clip();
+    ctx.strokeStyle = "#141923";
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    let started = false;
+    nz.psd.freqs.forEach((fr, i) => {
+      if (fr > fmax) return;
+      const x = f.X(fr);
+      const y = f.Y(db[i]);
+      if (started) ctx.lineTo(x, y);
+      else {
+        ctx.moveTo(x, y);
+        started = true;
+      }
+    });
+    ctx.stroke();
+    ctx.restore();
+
+    const findings = [];
+    const lv = (v, warn, bad, higherIsWorse = true) => (!Number.isFinite(v) ? "" : higherIsWorse ? (v >= bad ? "bad" : v >= warn ? "warn" : "") : (v <= bad ? "bad" : v <= warn ? "warn" : ""));
+    const wl = lv(nz.wander, 0.2, 0.5);
+    if (wl) findings.push(wl === "bad" ? "выраженный дрейф изолинии" : "дрейф изолинии");
+    [50, 60].forEach((f0) => {
+      const l = lv(nz.mains[f0], 8, 15);
+      if (l) findings.push(`сетевая наводка ${f0} Гц`);
+    });
+    const hl = lv(nz.hfRmsUv, 20, 50);
+    if (hl) findings.push(hl === "bad" ? "выраженный высокочастотный (мышечный) шум" : "высокочастотный шум");
+    const sl = lv(nz.snrDb, 20, 14, false);
+    if (sl) findings.push("низкое отношение сигнал/шум");
+    const worst = [wl, hl, sl, lv(nz.mains[50], 8, 15), lv(nz.mains[60], 8, 15)].includes("bad") ? "bad" : findings.length ? "warn" : "ok";
+    const verdictText = findings.length ? `Качество снижено: ${findings.join(", ")}` : "Качество сигнала хорошее: шум и дрейф в пределах нормы";
+    const rows = [
+      { k: "Дрейф изолинии (< 1 Гц, размах)", v: `${fmtNum(nz.wander, 2)} мВ`, r: "≥ 0,2 — заметен", lvl: wl },
+      { k: "Наводка 50 Гц (над соседними частотами)", v: `${fmtNum(nz.mains[50], 1)} дБ`, r: "≥ 8 дБ — есть", lvl: lv(nz.mains[50], 8, 15) },
+      { k: "Наводка 60 Гц (над соседними частотами)", v: `${fmtNum(nz.mains[60], 1)} дБ`, r: "≥ 8 дБ — есть", lvl: lv(nz.mains[60], 8, 15) },
+      { k: "ВЧ-шум вне QRS (СКО)", v: `${fmtNum(nz.hfRmsUv, 0)} мкВ`, r: "≥ 20 мкВ — заметен", lvl: hl },
+      { k: "Размах QRS (медиана)", v: `${fmtNum(nz.qrsAmp, 2)} мВ` },
+      { k: "Сигнал / шум", v: `${fmtNum(nz.snrDb, 0)} дБ`, r: "< 20 дБ — низкое", lvl: sl },
+    ];
+    el.noiseMetrics.innerHTML = `<div class="atool-verdict ${worst}">${escapeHtml(verdictText)}</div>` + metricsTable(rows);
+    el.noiseNote.textContent =
+      "Оранжевая полоса — дрейф изолинии (< 0,5 Гц), зелёная — основная полоса ЭКГ (0,5–40 Гц), пунктир — сеть 50/60 Гц. " +
+      "ВЧ-шум — остаток после сглаживания ~18 мс вне участков R ± 100 мс и артефактов." +
+      (state.signal ? "" : " Для оцифрованного фото спектр включает артефакты трассировки (ступени пикселей); частоты выше ~40 Гц малоинформативны.");
+  }
+
+  // ---- tab texts for the conclusion
+  function analysisToolReportText() {
+    const tab = state.atool.tab;
+    const L = state.atool.last;
+    if (tab === "hrv" && L.hrv && L.hrv.hrv.nNN >= 3 && L.hrv.hrv.durationS >= 30) {
+      const h = L.hrv.hrv;
+      let t = `ВСР (отв. ${L.hrv.ln}, ${h.durationS.toFixed(0)} с, NN ${h.nNN} из ${h.nAll}): SDNN ${fmtNum(h.sdnn, 0)} мс, RMSSD ${fmtNum(h.rmssd, 0)} мс, pNN50 ${fmtNum(h.pnn50, 1)}%`;
+      if (h.freq) t += `, LF/HF ${fmtNum(h.freq.lfhf, 2)}`;
+      t += h.durationS < 300 ? " (участок < 5 мин — ориентировочно)." : ".";
+      return t;
+    }
+    if (tab === "overlay" && L.overlay && L.overlay.mo) {
+      const c = L.overlay.mo.counts;
+      return `Наложение комплексов (отв. ${L.overlay.ln}, ${L.overlay.mo.rows.length} компл.): основной формы ${c.N}, преждевременных с той же формой QRS ${c.S}, ` +
+        `преждевременных с иной формой QRS ${c.V}, иной формы без преждевременности ${c.X}.`;
+    }
+    if (tab === "qtd" && L.qtd && L.qtd.inc.length >= 2 && !L.qtd.uniform) {
+      const q = L.qtd;
+      return `Дисперсия QT ${q.qtd.toFixed(0)} мс (QT ${q.min.qt.toFixed(0)} мс в ${q.min.ln} — ${q.max.qt.toFixed(0)} мс в ${q.max.ln}, ${q.inc.length} отв.), QTcd ${fmtNum(q.qtcd, 0)} мс` +
+        (q.manual ? "." : "; границы автоматические, требуют проверки.");
+    }
+    if (tab === "noise" && L.noise && L.noise.nz) {
+      const n = L.noise.nz;
+      return `Качество сигнала (отв. ${L.noise.ln}): дрейф изолинии ${fmtNum(n.wander, 2)} мВ, наводка 50 Гц ${fmtNum(n.mains[50], 0)} дБ, ВЧ-шум ${fmtNum(n.hfRmsUv, 0)} мкВ, сигнал/шум ${fmtNum(n.snrDb, 0)} дБ.`;
+    }
+    return "";
+  }
+
+  function renderAnalysisTools() {
+    state.atool.dirty = false;
+    if (!el.hrvCanvas || !state.digitization || !state.analysis) return;
+    if (el.atoolLead) el.atoolLead.textContent = state.activeLead || "—";
+    const tab = state.atool.tab;
+    if (tab === "hrv") renderHrvTool();
+    else if (tab === "overlay") renderOverlayTool();
+    else if (tab === "qtd") renderQtdTool();
+    else if (tab === "noise") renderNoiseTool();
+  }
+
+  function scheduleAnalysisTools() {
+    state.atool.dirty = true;
+    if (!state.atool.visible || state.atool.raf) return;
+    state.atool.raf = requestAnimationFrame(() => {
+      state.atool.raf = 0;
+      renderAnalysisTools();
+    });
+  }
+
+  function gotoBeat(idx) {
+    if (!Number.isFinite(idx)) return;
+    state.activeBeatIdx = idx;
+    el.selectBeat.value = String(idx);
+    loadBeatCalipers(state.activeLead, idx);
+  }
+
+  function bindAnalysisTools() {
+    const sec = document.getElementById("sec7");
+    if (!sec) return;
+    document.querySelectorAll(".atool-tab").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        state.atool.tab = btn.getAttribute("data-atool") || "hrv";
+        document.querySelectorAll(".atool-tab").forEach((b) => b.classList.toggle("active", b === btn));
+        document.querySelectorAll(".atool-pane").forEach((p2) => p2.classList.toggle("active", p2.id === `atool-${state.atool.tab}`));
+        renderAnalysisTools();
+      });
+    });
+    if ("IntersectionObserver" in window) {
+      new IntersectionObserver((entries) => {
+        state.atool.visible = entries.some((e) => e.isIntersecting);
+        if (state.atool.visible && state.atool.dirty) scheduleAnalysisTools();
+      }, { rootMargin: "150px" }).observe(sec);
+    } else {
+      state.atool.visible = true;
+    }
+    el.chkOverlayFlaggedOnly.addEventListener("change", renderAnalysisTools);
+    el.selectOverlayCorr.addEventListener("change", renderAnalysisTools);
+    el.overlayList.addEventListener("click", (e) => {
+      const chip = e.target.closest("[data-beat]");
+      if (chip) gotoBeat(parseInt(chip.getAttribute("data-beat"), 10));
+    });
+    el.hrvCanvas.addEventListener("click", (e) => {
+      const r = el.hrvCanvas.getBoundingClientRect();
+      const x = e.clientX - r.left;
+      const y = e.clientY - r.top;
+      let best = null;
+      let bd = 10;
+      state.atool.hrvPts.forEach((p2) => {
+        const d = Math.hypot(p2.x - x, p2.y - y);
+        if (d < bd) {
+          bd = d;
+          best = p2;
+        }
+      });
+      if (best) gotoBeat(best.beatIdx);
+    });
+    el.btnAtoolToReport.addEventListener("click", () => {
+      const txt = analysisToolReportText();
+      if (!txt) {
+        setStatus("Во вкладке нет вывода для заключения", "busy");
+        return;
+      }
+      el.txtConclusion.value = (el.txtConclusion.value.trim() ? `${el.txtConclusion.value.trim()}\n` : "") + txt;
+      state.report.edited = true;
+      markConclusionState("Добавлен вывод инструмента анализа (текст отредактирован)");
+      saveReportDraft();
+      setStatus("Вывод инструмента анализа добавлен в заключение", "ready");
+    });
+    window.ECGTools = { computeHrv, rrSeriesNN, welchPsd, lombScargleHrv };
+  }
+
+  // ------------------------------------------------------------------ interface helpers
+  function renderStatusLog() {
+    if (!el.statusLog) return;
+    const pad = (n) => String(n).padStart(2, "0");
+    el.statusLog.innerHTML = state.statusLog.length
+      ? state.statusLog
+          .map((it) => `<div class="status-log-item ${it.mode}"><time>${pad(it.t.getHours())}:${pad(it.t.getMinutes())}:${pad(it.t.getSeconds())}</time>` +
+            `<span>${escapeHtml(it.text)}</span></div>`)
+          .join("")
+      : '<div class="status-log-empty">Сообщений нет</div>';
+  }
+
+  // ---- undo / redo of R marks, calipers and artifact zones
+  function undoKey(leadsObj, artifacts, edited) {
+    // only the fiducials a physician can move (rounded): derived fields written on every render do not count
+    const KEYS = ["p_onset", "p_peak", "p_offset", "qrs_onset", "r_peak", "qrs_offset", "t_onset", "t_peak", "t_offset"];
+    const beats = {};
+    Object.entries(leadsObj || {}).forEach(([ln, la]) => {
+      beats[ln] = la && la.beats
+        ? la.beats.map((b) => KEYS.map((k) => (b && b.times_ms && Number.isFinite(b.times_ms[k]) ? Math.round(b.times_ms[k]) : null)))
+        : [];
+    });
+    return JSON.stringify(beats) + "|" + artifacts + "|" + edited;
+  }
+
+  function captureSnapshot() {
+    if (!state.analysis || !state.analysis.leads || !state.digitization) return null;
+    const edited = {};
+    Object.entries(state.editedCalipers || {}).forEach(([k, v]) => (edited[k] = Array.from(v || [])));
+    const artifacts = JSON.stringify(state.artifactsByLead || {});
+    const editedStr = JSON.stringify(edited);
+    return {
+      leads: JSON.stringify(state.analysis.leads),
+      artifacts,
+      edited: editedStr,
+      key: undoKey(state.analysis.leads, artifacts, editedStr),
+      lead: state.activeLead,
+      beat: state.activeBeatIdx,
+    };
+  }
+
+  function updateUndoButtons() {
+    const u = state.undoStack.length === 0;
+    const r = state.redoStack.length === 0;
+    [el.btnUndo, el.btnUndoBar].forEach((b) => b && (b.disabled = u));
+    [el.btnRedo, el.btnRedoBar].forEach((b) => b && (b.disabled = r));
+  }
+
+  // Call BEFORE a manual edit (drag start, add / delete R, artifact toggle, reset, applying autoanalysis)
+  function pushUndo() {
+    if (state.undoRestoring) return;
+    const snap = captureSnapshot();
+    if (!snap) return;
+    const top = state.undoStack[state.undoStack.length - 1];
+    if (top && top.key === snap.key) return;
+    state.undoStack.push(snap);
+    if (state.undoStack.length > 40) state.undoStack.shift();
+    state.redoStack = [];
+    updateUndoButtons();
+  }
+
+  function resetUndo() {
+    state.undoStack = [];
+    state.redoStack = [];
+    updateUndoButtons();
+  }
+
+  function restoreSnapshot(snap) {
+    state.undoRestoring = true;
+    try {
+      state.analysis.leads = JSON.parse(snap.leads);
+      state.artifactsByLead = JSON.parse(snap.artifacts);
+      state.editedCalipers = {};
+      Object.entries(JSON.parse(snap.edited)).forEach(([k, v]) => (state.editedCalipers[k] = new Set(v)));
+      const lead = state.digitization.leads_mv[snap.lead] ? snap.lead : state.activeLead;
+      state.activeLead = lead;
+      el.lblActiveLead.textContent = lead;
+      Array.from(el.leadPillsContainer.children).forEach((btn) => btn.classList.toggle("active", btn.textContent === lead));
+      const la = state.analysis.leads[lead];
+      const n = la && la.beats ? la.beats.length : 0;
+      state.activeBeatIdx = Math.max(0, Math.min(snap.beat, n - 1));
+      populateBeatDropdown(lead);
+      if (n) loadBeatCalipers(lead, state.activeBeatIdx);
+      else recalculateLiveMetricsAndRender();
+      renderMultiLeadCanvas();
+      renderAllLeadsTable();
+    } finally {
+      state.undoRestoring = false;
+    }
+  }
+
+  function undoEdit() {
+    const cur = captureSnapshot();
+    if (!cur) return;
+    while (state.undoStack.length) {
+      const snap = state.undoStack.pop();
+      if (snap.key === cur.key) continue; // a drag that did not move anything
+      state.redoStack.push(cur);
+      restoreSnapshot(snap);
+      updateUndoButtons();
+      setStatus(`Правка отменена (осталось ${state.undoStack.length}; Ctrl+Y — вернуть)`, "ready");
+      return;
+    }
+    updateUndoButtons();
+    setStatus("Нечего отменять", "ready");
+  }
+
+  function redoEdit() {
+    const snap = state.redoStack.pop();
+    if (!snap) return;
+    const cur = captureSnapshot();
+    if (cur) state.undoStack.push(cur);
+    restoreSnapshot(snap);
+    updateUndoButtons();
+    setStatus("Правка возвращена", "ready");
+  }
+
+  // ---- live measurements in the sticky navigation bar
+  function renderLiveSummary(live) {
+    if (!el.navLive) return;
+    if (!live || !state.digitization) {
+      el.navLive.innerHTML = "";
+      return;
+    }
+    const iv = live.intervals_ms || {};
+    const du = live.durations_ms || {};
+    const ok = (v) => Number.isFinite(v) && v > 0;
+    const f0 = (v) => (ok(v) ? v.toFixed(0) : "—");
+    const hr = live.hr_bpm;
+    const pq = iv.pq_pr;
+    const qrs = du.qrs_complex;
+    const qtcf = iv.qtc_fridericia;
+    const sex = (el.selectPatientSex && el.selectPatientSex.value) || "";
+    const qtcLim = sex === "female" ? 460 : 450;
+    const ax = state.analysis && state.analysis.axes ? state.analysis.axes.qrs_axis_deg : null;
+    const chips = [
+      { cls: "lead", label: "", val: `${state.activeLead} · R${state.activeBeatIdx + 1}`, target: "sec2", title: "Активное отведение и комплекс" },
+      { label: "ЧСС", val: f0(hr), target: "sec3", title: "уд/мин",
+        lvl: !ok(hr) ? "" : hr < 45 || hr > 130 ? "bad" : hr < 60 || hr > 100 ? "warn" : "" },
+      { label: "PQ", val: f0(pq), target: "sec3", title: "мс (норма 120–200)",
+        lvl: !ok(pq) ? "" : pq > 300 ? "bad" : pq > 200 || pq < 120 ? "warn" : "" },
+      { label: "QRS", val: f0(qrs), target: "sec3", title: "мс (норма < 110)",
+        lvl: !ok(qrs) ? "" : qrs >= 120 ? "bad" : qrs >= 110 ? "warn" : "" },
+      { label: "QT/QTcF", val: `${f0(iv.qt)}/${f0(qtcf)}`, target: "sec4", title: `мс (QTcF: норма ≤ ${qtcLim})`,
+        lvl: !ok(qtcf) ? "" : qtcf >= 500 ? "bad" : qtcf > qtcLim ? "warn" : "" },
+      { label: "ЭОС", val: ax === null || ax === undefined ? "—" : `${ax >= 0 ? "+" : ""}${Math.round(ax)}°`, target: "sec5",
+        title: "угол α QRS", lvl: ax === null || ax === undefined ? "" : ax < -30 || ax > 90 ? "warn" : "" },
+    ];
+    el.navLive.innerHTML = chips
+      .map((c) => `<button type="button" class="live-chip ${c.cls || ""} ${c.lvl || ""}" data-target="${c.target}" title="${escapeHtml(`${c.label} ${c.val} ${c.title}`.trim())}">` +
+        `${c.label ? `<span>${c.label}</span>` : ""}${escapeHtml(c.val)}</button>`)
+      .join("");
+  }
+
+  function scrollToSection(id) {
+    const target = document.getElementById(id);
+    if (target && target.offsetParent !== null) target.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function bindInterfaceExtras() {
+    // status log popover
+    if (el.statusLog) {
+      el.statusBadge.addEventListener("click", (e) => {
+        e.stopPropagation();
+        el.statusLog.hidden = !el.statusLog.hidden;
+        if (!el.statusLog.hidden) renderStatusLog();
+      });
+      document.addEventListener("click", (e) => {
+        if (!el.statusLog.hidden && !el.statusLog.contains(e.target)) el.statusLog.hidden = true;
+      });
+    }
+    // undo / redo buttons
+    [el.btnUndo, el.btnUndoBar].forEach((b) => b && b.addEventListener("click", undoEdit));
+    [el.btnRedo, el.btnRedoBar].forEach((b) => b && b.addEventListener("click", redoEdit));
+    // snapshot before typing into a caliper time box
+    FIDUCIAL_DEFS.forEach((fd) => {
+      const inp = document.getElementById(`num_${fd.key}`);
+      if (inp) inp.addEventListener("focus", pushUndo);
+    });
+    // help
+    const showHelp = (on) => {
+      if (el.helpOverlay) el.helpOverlay.hidden = !on;
+    };
+    if (el.btnHelp) el.btnHelp.addEventListener("click", () => showHelp(true));
+    if (el.btnHelpClose) el.btnHelpClose.addEventListener("click", () => showHelp(false));
+    if (el.helpOverlay) el.helpOverlay.addEventListener("click", (e) => e.target === el.helpOverlay && showHelp(false));
+    // live chips -> sections
+    if (el.navLive) {
+      el.navLive.addEventListener("click", (e) => {
+        const chip = e.target.closest("[data-target]");
+        if (chip) scrollToSection(chip.getAttribute("data-target"));
+      });
+    }
+    // scroll-spy for the section links
+    const links = Array.from(document.querySelectorAll(".nav-link[data-nav]"));
+    let spyRaf = 0;
+    const spy = () => {
+      spyRaf = 0;
+      let active = null;
+      links.forEach((a) => {
+        const t = document.getElementById(a.getAttribute("data-nav"));
+        if (!t || t.offsetParent === null) return;
+        if (t.getBoundingClientRect().top <= 90) active = a;
+      });
+      links.forEach((a) => a.classList.toggle("active", a === active));
+    };
+    window.addEventListener("scroll", () => {
+      if (!spyRaf) spyRaf = requestAnimationFrame(spy);
+    }, { passive: true });
+    spy();
+    // drag & drop feedback
+    let dragDepth = 0;
+    const hasFiles = (e) => e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files");
+    window.addEventListener("dragenter", (e) => {
+      if (!hasFiles(e) || !el.dropOverlay) return;
+      dragDepth += 1;
+      el.dropOverlay.hidden = false;
+    });
+    window.addEventListener("dragleave", (e) => {
+      if (!hasFiles(e) || !el.dropOverlay) return;
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (!dragDepth) el.dropOverlay.hidden = true;
+    });
+    ["drop", "dragend"].forEach((ev) => window.addEventListener(ev, () => {
+      dragDepth = 0;
+      if (el.dropOverlay) el.dropOverlay.hidden = true;
+    }));
+
+    // keyboard shortcuts
+    let gPendingUntil = 0;
+    const SECTION_IDS = ["sec1", "sec2", "sec3", "sec4", "sec5", "sec6", "sec7"];
+    const stepBeat = (d) => {
+      const la = state.analysis && state.analysis.leads && state.analysis.leads[state.activeLead];
+      if (!la || !la.beats || !la.beats.length) return;
+      const idx = Math.max(0, Math.min(la.beats.length - 1, state.activeBeatIdx + d));
+      if (idx === state.activeBeatIdx) return;
+      el.selectBeat.value = String(idx);
+      el.selectBeat.dispatchEvent(new Event("change"));
+    };
+    const stepLead = (d) => {
+      const names = Object.keys((state.digitization && state.digitization.leads_mv) || {});
+      const i = names.indexOf(state.activeLead);
+      if (i < 0 || !names.length) return;
+      const ni = Math.max(0, Math.min(names.length - 1, i + d));
+      if (ni !== i) selectLead(names[ni]);
+    };
+    const stepZoom = (d) => {
+      const opts = Array.from(el.selectZoomX.options).map((o) => o.value);
+      let i = opts.indexOf(el.selectZoomX.value);
+      i = d === 0 ? 0 : Math.max(0, Math.min(opts.length - 1, i + d));
+      if (opts[i] === el.selectZoomX.value) return;
+      el.selectZoomX.value = opts[i];
+      el.selectZoomX.dispatchEvent(new Event("change"));
+    };
+    document.addEventListener("keydown", (e) => {
+      const t = e.target;
+      const typing = t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
+      if (e.key === "Escape") {
+        if (el.helpOverlay) el.helpOverlay.hidden = true;
+        if (el.statusLog) el.statusLog.hidden = true;
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+        if (typing) return;
+        if (e.code === "KeyZ") {
+          e.preventDefault();
+          if (e.shiftKey) redoEdit();
+          else undoEdit();
+        } else if (e.code === "KeyY") {
+          e.preventDefault();
+          redoEdit();
+        }
+        return;
+      }
+      if (typing || e.altKey) return;
+      if (e.key === "?" || (e.code === "Slash" && e.shiftKey) || e.code === "F1") {
+        e.preventDefault();
+        if (el.helpOverlay) el.helpOverlay.hidden = !el.helpOverlay.hidden;
+        return;
+      }
+      if (el.helpOverlay && !el.helpOverlay.hidden) return;
+      const gDigit = /^(?:Digit|Numpad)([1-7])$/.exec(e.code);
+      if (gDigit && Date.now() < gPendingUntil) {
+        gPendingUntil = 0;
+        scrollToSection(SECTION_IDS[parseInt(gDigit[1], 10) - 1]);
+        return;
+      }
+      const digit = /^(?:Digit|Numpad)([1-6])$/.exec(e.code);
+      if (!state.digitization) return;
+      if (digit) {
+        const btns = document.querySelectorAll(".caliper-mode-group .mode-btn");
+        const b = btns[parseInt(digit[1], 10) - 1];
+        if (b) b.click();
+        return;
+      }
+      switch (e.code) {
+        case "ArrowLeft":
+        case "ArrowRight":
+          e.preventDefault();
+          stepBeat(e.code === "ArrowLeft" ? -1 : 1);
+          break;
+        case "ArrowUp":
+        case "ArrowDown":
+          e.preventDefault();
+          stepLead(e.code === "ArrowUp" ? -1 : 1);
+          break;
+        case "Equal":
+        case "NumpadAdd":
+          stepZoom(1);
+          break;
+        case "Minus":
+        case "NumpadSubtract":
+          stepZoom(-1);
+          break;
+        case "Digit0":
+        case "Numpad0":
+          stepZoom(0);
+          break;
+        case "PageUp":
+        case "PageDown":
+          if (state.signal) {
+            e.preventDefault();
+            (e.code === "PageUp" ? el.btnSignalPrev : el.btnSignalNext).click();
+          }
+          break;
+        case "KeyA":
+          if (el.btnRunAutoAnalysis && !el.btnRunAutoAnalysis.disabled) el.btnRunAutoAnalysis.click();
+          break;
+        case "KeyG":
+          gPendingUntil = Date.now() + 1500;
+          break;
+        default:
+          break;
+      }
+    });
   }
 
   // ------------------------------------------------------------ native digital ECG / Holter recordings
@@ -3375,6 +4799,7 @@
   }
 
   function addRPeak(leadName, clickMs) {
+    pushUndo();
     applyToTargetLeads(leadName, (ln) => {
       const leadAna = state.analysis && state.analysis.leads && state.analysis.leads[ln];
       if (!leadAna) return;
@@ -3419,6 +4844,7 @@
       return;
     }
     const targetMs = leadAna.beats[beatIdx] ? leadAna.beats[beatIdx].times_ms.r_peak : 0;
+    pushUndo();
 
     applyToTargetLeads(leadName, (ln) => {
       const lAna = state.analysis && state.analysis.leads && state.analysis.leads[ln];
@@ -3455,6 +4881,7 @@
     const sMs = Math.max(0, Math.min(totalMs, Math.round(Math.min(t1Ms, t2Ms))));
     const eMs = Math.max(0, Math.min(totalMs, Math.round(Math.max(t1Ms, t2Ms))));
     if (eMs - sMs < 15) return;
+    pushUndo();
 
     applyToTargetLeads(leadName, (ln) => {
       if (!state.artifactsByLead[ln]) state.artifactsByLead[ln] = [];
@@ -3479,6 +4906,7 @@
   }
 
   function toggleSmartArtifactAtClick(leadName, clickMs) {
+    pushUndo();
     if (!state.artifactsByLead[leadName]) state.artifactsByLead[leadName] = [];
     const zones = state.artifactsByLead[leadName];
     // 1. If click is inside an existing blue artifact line, remove it!
@@ -3763,6 +5191,8 @@
     renderAxisCaliper();
     renderHexaxialCompass();
     scheduleAllLeadsTableRender();
+    renderLiveSummary(live);
+    scheduleAnalysisTools();
   }
 
   // Recomputes metrics of EVERY lead from its own representative beat (not only the active one).
@@ -6721,6 +8151,7 @@
         state.activeBeatIdx = rHit.beatIdx;
         populateBeatDropdown(rHit.lead);
         loadBeatCalipers(rHit.lead, rHit.beatIdx);
+        pushUndo();
         state.w1DragState = {
           lead: rHit.lead,
           beatIdx: rHit.beatIdx,
@@ -6953,6 +8384,7 @@
       if (evt.ctrlKey || state.caliperMode === "artifact") {
         const handle = findNearestHandle(pos);
         if (handle && handle.startsWith("art_")) {
+          pushUndo();
           state.draggingHandle = handle;
           return;
         }
@@ -6975,6 +8407,7 @@
         if (handle === "cmp_body") {
           state.compassDrag = { startMs: clickMs, t1: state.compass.t1_ms, t2: state.compass.t2_ms };
         }
+        if (!/^(cmp_|free_)/.test(handle)) pushUndo();
         state.draggingHandle = handle;
         return;
       }
@@ -7428,6 +8861,7 @@
   }
 
   function applyAutoAnalysisToWorkbench(analysis) {
+    pushUndo();
     state.editedCalipers = {};
     const keepArtifacts = state.artifactsByLead || {};
     state.analysis = analysis;
@@ -7613,6 +9047,8 @@ ${img ? `<h2>Запись (оцифрованные отведения)</h2><img
     bindSignalEvents();
     bindCompassEvents();
     bindAxisCaliperEvents();
+    bindInterfaceExtras();
+    bindAnalysisTools();
     // Calibration pulse disagrees with the entered gain → re-digitize with the gain the pulse shows
     if (el.btnApplyPulseGain) {
       el.btnApplyPulseGain.addEventListener("click", () => {
@@ -7806,6 +9242,7 @@ ${img ? `<h2>Запись (оцифрованные отведения)</h2><img
 
     if (el.btnClearArtifacts) {
       el.btnClearArtifacts.addEventListener("click", () => {
+        pushUndo();
         applyToTargetLeads(state.activeLead, (ln) => {
           state.artifactsByLead[ln] = [];
           syncLeadRArrayFromBeats(ln);
@@ -7835,6 +9272,7 @@ ${img ? `<h2>Запись (оцифрованные отведения)</h2><img
     });
 
     el.btnAutoResetCalipers.addEventListener("click", () => {
+      pushUndo();
       if (state.originalBeatsByLead && state.originalBeatsByLead[state.activeLead]) {
         state.analysis.leads[state.activeLead] = JSON.parse(
           JSON.stringify(state.originalBeatsByLead[state.activeLead])
@@ -7905,6 +9343,7 @@ ${img ? `<h2>Запись (оцифрованные отведения)</h2><img
     el.btnPrintReport.addEventListener("click", () => window.print());
 
     window.addEventListener("resize", () => {
+      scheduleAnalysisTools();
       renderSignalTrend();
       renderAxisCaliper();
       renderMultiLeadCanvas();
