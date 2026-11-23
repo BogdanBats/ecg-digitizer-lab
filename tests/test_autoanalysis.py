@@ -234,3 +234,12 @@ def test_only_moved_fiducials_override_the_automatic_intervals() -> None:
     no_edit = analyze_ecg(leads, fs=FS, groups=groups, calipers_override=cal, reference_lead="II", reference_edited=["qrs_onset"])
     assert res["intervals"]["qt_ms"] == pytest.approx(no_edit["intervals"]["qt_ms"] + 40, abs=6)
     assert res["rhythm"]["hr_bpm"] == pytest.approx(72, abs=2)
+
+
+def test_group_with_unequal_lengths_is_trimmed():
+    """A hand-corrected lead may come back a few samples shorter than its column neighbours."""
+    leads = synthetic_12lead(hr_bpm=72, duration_s=10.0, fs=500.0, seed=11)
+    leads["V2"] = leads["V2"][:-5]
+    res = analyze_ecg(leads, fs=500.0, groups=[list(leads)])
+    assert res["ok"]
+    assert abs(res["rhythm"]["hr_bpm"] - 72) <= 2

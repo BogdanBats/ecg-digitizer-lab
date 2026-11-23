@@ -630,6 +630,12 @@ def analyze_ecg(
         groups = _groups_from_lengths(signals)
     groups = [[ln for ln in g if ln in signals] for g in groups]
     groups = [g for g in groups if g]
+    # Leads of one simultaneous group must share a time base: a hand-corrected line can come back a few samples
+    # longer or shorter than its neighbours -> trim the group to its shortest lead (a few ms at the end)
+    for g in groups:
+        n_min = min(len(signals[ln]) for ln in g)
+        for ln in g:
+            signals[ln] = signals[ln][:n_min]
     used_methods: set = set()
     good = lambda ln: lead_quality.get(ln, "ok") != "bad"  # noqa: E731
 

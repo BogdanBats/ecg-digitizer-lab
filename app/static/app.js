@@ -82,6 +82,9 @@
     // Interactive Trace Overlay (Zoom + Lead Rename + Auto-Trace Line Correction)
     overlayZoom: 1.0,
     overlayTool: "view", // 'view' | 'autotrace' | 'draw'
+    // Dragging a lead name badge onto the isoline of another row (section 1, overlay tab)
+    badgeDrag: null,
+    badgeProposal: null,
     selectedTraceIdx: 0,
     originalOverlayTraces: [],
     overlayInkMap: null,
@@ -2502,7 +2505,11 @@
       saveReportDraft();
       setStatus("Вывод инструмента анализа добавлен в заключение", "ready");
     });
-    window.ECGTools = { computeHrv, rrSeriesNN, welchPsd, lombScargleHrv };
+    // read-only hooks for verification from the browser console
+    window.ECGTools = {
+      computeHrv, rrSeriesNN, welchPsd, lombScargleHrv,
+      overlayTraces: () => JSON.parse(JSON.stringify((state.digitization && state.digitization.overlay_traces) || [])),
+    };
   }
 
   // ------------------------------------------------------------------ interface helpers
@@ -3740,6 +3747,11 @@
 
   function renderTraceOverlayCanvas() {
     const img = el.imgTraceOverlay;
+    if (state.badgeProposal && state.digitization && !(state.digitization.overlay_traces || [])[state.badgeProposal.idx]) {
+      state.badgeProposal = null;
+      const panel = document.getElementById("badgeDropPanel");
+      if (panel) panel.hidden = true;
+    }
     const canvas = el.traceOverlayCanvas;
     if (!img || !canvas || !state.digitization) return;
 
@@ -3840,6 +3852,40 @@
       });
     });
 
+    // 2b. Badge being dragged (or a pending proposal): the isoline it would set, the trace already on it
+    const bt = state.badgeDrag && state.badgeDrag.moved ? state.badgeDrag.target : state.badgeProposal;
+    if (bt && traces[bt.idx]) {
+      const color = OVERLAY_PALETTE[bt.idx % OVERLAY_PALETTE.length];
+      const y = bt.snapY * scaleY;
+      ctx.save();
+      if (bt.occupantIdx >= 0 && traces[bt.occupantIdx]) {
+        const op = traces[bt.occupantIdx].points_px;
+        ctx.strokeStyle = "rgba(255, 64, 129, 0.9)";
+        ctx.lineWidth = 3.2;
+        ctx.setLineDash([2, 3]);
+        ctx.beginPath();
+        op.forEach((p, i) => (i === 0 ? ctx.moveTo(p[0] * scaleX, p[1] * scaleY) : ctx.lineTo(p[0] * scaleX, p[1] * scaleY)));
+        ctx.stroke();
+      }
+      ctx.setLineDash([8, 5]);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(bt.range[0] * scaleX, y);
+      ctx.lineTo(bt.range[1] * scaleX, y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      const lbl = `${traces[bt.idx].lead}: изолиния${bt.snapped ? "" : " (не найдена)"}`;
+      ctx.font = "700 11px 'IBM Plex Mono', monospace";
+      const tw = ctx.measureText(lbl).width + 10;
+      const lx = Math.max(2, Math.min(dispW - tw - 2, bt.range[0] * scaleX + 4));
+      ctx.fillStyle = "rgba(15, 23, 42, 0.88)";
+      ctx.fillRect(lx, y - 20, tw, 16);
+      ctx.fillStyle = color;
+      ctx.fillText(lbl, lx + 5, y - 8);
+      ctx.restore();
+    }
+
     // 3. Top-right Zoom indicator pill
     ctx.save();
     const zTxt = `Зум: ${(state.overlayZoom || 1.0).toFixed(1)}× • Отведение: ${traces[state.selectedTraceIdx] ? traces[state.selectedTraceIdx].lead : "—"}`;
@@ -3870,7 +3916,13 @@
     const invertSign = String(tr.lead).startsWith("-");
     const spanPx = Math.max(10, pts[pts.length - 1][0] - pts[0][0]);
     const durSec = Math.max(0.2, Math.min(60.0, (spanPx / Math.max(0.5, pxPerMmX)) / Math.max(5.0, speed)));
-    const numSamples = Math.max(100, Math.round(durSec * fs));
+    // Same time base as the other leads of this column (same x range): the edited line must keep their sample count
+    const rangeKey = (tr.x_range_px || []).join("-");
+    const sibling = state.digitization.overlay_traces.find(
+      (t, i) => i !== traceIdx && (t.x_range_px || []).join("-") === rangeKey && state.digitization.leads_mv[t.lead]
+    );
+    const siblingLen = sibling ? state.digitization.leads_mv[sibling.lead].length : 0;
+    const numSamples = siblingLen > 50 ? siblingLen : Math.max(100, Math.round(durSec * fs));
 
     const mvRaw = new Float64Array(pts.length);
     for (let i = 0; i < pts.length; i++) {
@@ -4203,6 +4255,216 @@
     setStatus(msg, "ready");
   }
 
+  // ---- lead badge -> isoline of the correct row
+  function overlayPxPerMmY() {
+    const sp = (state.digitization && state.digitization.pixel_spacing) || {};
+    return sp.px_per_mm_y || sp.px_per_mm || state.activePxPerMm || 5.5;
+  }
+
+  // The isoline of an ECG row is the horizontal line with the most ink along the row (the trace spends most of
+  // the cycle on it). Search +-3 mm around the requested level; weak evidence -> keep the requested level.
+  function snapIsolineY(natY, x0, x1) {
+    const ink = ensureOverlayInkMap();
+    if (!ink) return { y: natY, conf: 0, snapped: false };
+    const half = Math.max(6, Math.round(3 * overlayPxPerMmY()));
+    const yLo = Math.max(1, Math.round(natY) - half);
+    const yHi = Math.min(ink.H - 2, Math.round(natY) + half);
+    const xa = Math.max(0, Math.round(Math.min(x0, x1)));
+    const xb = Math.min(ink.W - 1, Math.round(Math.max(x0, x1)));
+    if (yHi <= yLo || xb <= xa) return { y: natY, conf: 0, snapped: false };
+    const raw = [];
+    let n = 0;
+    for (let y = yLo - 1; y <= yHi + 1; y++) {
+      let sum = 0;
+      n = 0;
+      for (let x = xa; x <= xb; x += 2) {
+        sum += ink.data[y * ink.W + x];
+        n += 1;
+      }
+      raw.push(sum / Math.max(1, n));
+    }
+    let best = 1;
+    let bestScore = -1;
+    for (let i = 1; i < raw.length - 1; i++) {
+      // thick (2-3 px) lines: neighbours count half; mild preference for the requested level
+      const sc = raw[i] + 0.5 * (raw[i - 1] + raw[i + 1]) - 0.002 * Math.abs(yLo - 1 + i - natY);
+      if (sc > bestScore) {
+        bestScore = sc;
+        best = i;
+      }
+    }
+    const conf = raw[best];
+    return conf >= 0.12 ? { y: yLo - 1 + best, conf, snapped: true } : { y: natY, conf, snapped: false };
+  }
+
+  function overlayColumnRanges() {
+    const seen = {};
+    ((state.digitization && state.digitization.overlay_traces) || []).forEach((t) => {
+      if (Array.isArray(t.x_range_px)) seen[t.x_range_px.join("-")] = t.x_range_px;
+    });
+    return Object.values(seen);
+  }
+
+  // Where would the dragged badge put the trace: target column (x range), snapped isoline, trace already there
+  function evaluateBadgeTarget(idx, natX, natY) {
+    const traces = state.digitization.overlay_traces;
+    const tr = traces[idx];
+    let range = tr.x_range_px || [tr.points_px[0][0], tr.points_px[tr.points_px.length - 1][0]];
+    const col = overlayColumnRanges().find((r) => natX >= r[0] && natX <= r[1]);
+    if (col && col.join("-") !== range.join("-")) range = col;
+    const snap = snapIsolineY(natY, range[0], range[1]);
+    const sameCol = traces
+      .map((t, i) => ({ t, i }))
+      .filter(({ t, i }) => i !== idx && Array.isArray(t.x_range_px) && t.x_range_px.join("-") === range.join("-"));
+    const tol = Math.max(2.5 * overlayPxPerMmY(), 8);
+    const occ = sameCol
+      .filter(({ t }) => Math.abs((t.baseline_y_px ?? t.points_px[0][1]) - snap.y) <= tol)
+      .sort((a, b) => Math.abs(a.t.baseline_y_px - snap.y) - Math.abs(b.t.baseline_y_px - snap.y))[0];
+    return { idx, range, snapY: snap.y, snapped: snap.snapped, conf: snap.conf, occupantIdx: occ ? occ.i : -1, columnChanged: range !== tr.x_range_px && range.join("-") !== (tr.x_range_px || []).join("-") };
+  }
+
+  // Viterbi re-trace of one lead along a given isoline. Other traces of the same column are "foreign" lines: their
+  // ink earns almost nothing, so the path can cross them (tall R waves) but not follow a neighbouring row.
+  function retraceAlongIsoline(traceIdx, baseY, range, keepOccupantIdx = -1) {
+    const inkObj = ensureOverlayInkMap();
+    const traces = state.digitization && state.digitization.overlay_traces;
+    if (!inkObj || !traces || !traces[traceIdx]) return false;
+    const tr = traces[traceIdx];
+    const rangeKey = range.join("-");
+    if ((tr.x_range_px || []).join("-") !== rangeKey) {
+      const donor = traces.find((t) => (t.x_range_px || []).join("-") === rangeKey);
+      if (!donor) return false;
+      tr.points_px = donor.points_px.map((p) => [p[0], baseY]);
+      tr.x_range_px = range.slice();
+      if (donor.col !== undefined) tr.col = donor.col;
+    }
+    tr.baseline_y_px = Number(baseY.toFixed(1));
+    const pts = tr.points_px;
+    const pxmm = overlayPxPerMmY();
+    const others = traces.filter((t, i) => i !== traceIdx && i !== keepOccupantIdx && (t.x_range_px || []).join("-") === rangeKey);
+    const gaps = others.map((t) => Math.abs((t.baseline_y_px ?? t.points_px[0][1]) - baseY)).filter((g) => g > 0);
+    const gap = gaps.length ? Math.min(...gaps) : 30 * pxmm;
+    const halfBand = Math.round(Math.max(6 * pxmm, Math.min(14 * pxmm, 0.9 * gap)));
+    const yLo = Math.max(1, Math.floor(baseY - halfBand));
+    const yHi = Math.min(inkObj.H - 2, Math.ceil(baseY + halfBand));
+    const H_b = yHi - yLo + 1;
+    const lenK = pts.length;
+    const baseRel = Math.max(0, Math.min(H_b - 1, Math.round(baseY) - yLo));
+    // y of every foreign trace at each of our x positions
+    const foreignAt = others.map((t) => {
+      const m = new Map();
+      t.points_px.forEach((p) => m.set(Math.round(p[0]), p[1]));
+      return m;
+    });
+    const dp = new Float64Array(lenK * H_b);
+    const back = new Int32Array(lenK * H_b);
+    const maxStep = Math.max(12, Math.round(H_b * 0.32));
+    for (let r = 0; r < H_b; r++) dp[r] = -0.08 * Math.abs(r - baseRel);
+    const rewRow = new Float64Array(H_b);
+    for (let k = 1; k < lenK; k++) {
+      const xr = Math.round(pts[k][0]);
+      const x = Math.max(0, Math.min(inkObj.W - 1, xr));
+      for (let r = 0; r < H_b; r++) rewRow[r] = inkObj.data[(yLo + r) * inkObj.W + x] * 2.1;
+      foreignAt.forEach((m) => {
+        const fy = m.get(xr);
+        if (fy === undefined) return;
+        const fr = Math.round(fy) - yLo;
+        for (let r = Math.max(0, fr - 2); r <= Math.min(H_b - 1, fr + 2); r++) rewRow[r] *= 0.12;
+      });
+      for (let r = 0; r < H_b; r++) {
+        const rew = rewRow[r] - 0.012 * Math.abs(r - baseRel);
+        let bestPrev = -1e9;
+        let bestR = r;
+        const rMin = Math.max(0, r - maxStep);
+        const rMax = Math.min(H_b - 1, r + maxStep);
+        for (let pr = rMin; pr <= rMax; pr++) {
+          const cand = dp[(k - 1) * H_b + pr] - 0.045 * Math.abs(r - pr);
+          if (cand > bestPrev) {
+            bestPrev = cand;
+            bestR = pr;
+          }
+        }
+        dp[k * H_b + r] = rew + bestPrev;
+        back[k * H_b + r] = bestR;
+      }
+    }
+    let currR = baseRel;
+    let bestEnd = -1e9;
+    for (let r = 0; r < H_b; r++) {
+      if (dp[(lenK - 1) * H_b + r] > bestEnd) {
+        bestEnd = dp[(lenK - 1) * H_b + r];
+        currR = r;
+      }
+    }
+    for (let k = lenK - 1; k >= 0; k--) {
+      pts[k][1] = Number((yLo + currR).toFixed(1));
+      if (k > 0) currR = back[k * H_b + currR];
+    }
+    return true;
+  }
+
+  function closeBadgeProposal() {
+    state.badgeProposal = null;
+    const panel = document.getElementById("badgeDropPanel");
+    if (panel) panel.hidden = true;
+    renderTraceOverlayCanvas();
+  }
+
+  function showBadgeProposal(target, cssPos) {
+    const traces = state.digitization.overlay_traces;
+    const tr = traces[target.idx];
+    state.badgeProposal = target;
+    let panel = document.getElementById("badgeDropPanel");
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.id = "badgeDropPanel";
+      panel.className = "badge-drop-panel";
+      el.overlayStageWrap.appendChild(panel);
+      panel.addEventListener("mousedown", (e) => e.stopPropagation());
+      panel.addEventListener("click", (e) => {
+        const act = e.target.closest("[data-act]");
+        if (!act || !state.badgeProposal) return;
+        const p = state.badgeProposal;
+        const a = act.getAttribute("data-act");
+        if (a === "cancel") {
+          closeBadgeProposal();
+        } else if (a === "swap") {
+          const occName = state.digitization.overlay_traces[p.occupantIdx].lead;
+          closeBadgeProposal();
+          renameOverlayTrace(p.idx, occName);
+        } else if (a === "retrace") {
+          const lead = state.digitization.overlay_traces[p.idx].lead;
+          closeBadgeProposal();
+          if (retraceAlongIsoline(p.idx, p.snapY, p.range, p.occupantIdx)) {
+            state.selectedTraceIdx = p.idx;
+            populateOverlayTraceDropdown();
+            renderTraceOverlayCanvas();
+            syncTraceToDigitalLead(p.idx, true);
+            const msg = `Отведение ${lead} перетрассировано вдоль новой изолинии`;
+            if (el.overlayEditStatus) el.overlayEditStatus.textContent = `${msg} («Сбросить линию» — вернуть исходную)`;
+            setStatus(msg, "ready");
+          } else {
+            setStatus("Не удалось перетрассировать: нет изображения или колонки", "error");
+          }
+        }
+      });
+    }
+    const occ = target.occupantIdx >= 0 ? traces[target.occupantIdx] : null;
+    panel.innerHTML =
+      `<div class="bdp-title">Отведение <b>${escapeHtml(tr.lead)}</b> → ${target.snapped ? "изолиния найдена" : "чёткой изолинии нет — уточните уровень"}` +
+      `${target.columnChanged ? " (другая колонка)" : ""}</div>` +
+      (occ ? `<div class="bdp-note">На этой изолинии уже трасса <b>${escapeHtml(occ.lead)}</b>: если перепутаны только названия — поменяйте местами.</div>` : "") +
+      `<div class="bdp-actions">` +
+      `<button type="button" class="btn btn-xs btn-primary-sm" data-act="retrace">Автотрассировка вдоль изолинии</button>` +
+      (occ ? `<button type="button" class="btn btn-xs" data-act="swap">Поменять местами с ${escapeHtml(occ.lead)}</button>` : "") +
+      `<button type="button" class="btn btn-xs btn-ghost" data-act="cancel">Отмена</button></div>`;
+    panel.hidden = false;
+    const wrapW = el.overlayStageWrap.clientWidth || 600;
+    panel.style.left = `${Math.max(4, Math.min(wrapW - 330, cssPos.x + 12))}px`;
+    panel.style.top = `${Math.max(4, cssPos.y + 14)}px`;
+    renderTraceOverlayCanvas();
+  }
+
   function bindTraceOverlayEvents() {
     const canvas = el.traceOverlayCanvas;
     const img = el.imgTraceOverlay;
@@ -4251,6 +4513,17 @@
       const natPos = getNatPos(evt);
       const cssPos = getCssPos(evt);
       if (state.overlayTool === "view") {
+        if (state.badgeProposal) closeBadgeProposal();
+        const badgeHit = (state.overlayBadgeHitBoxes || []).find(
+          (b) => cssPos.x >= b.bx - 3 && cssPos.x <= b.bx + b.bw + 3 && cssPos.y >= b.by - 3 && cssPos.y <= b.by + b.bh + 3
+        );
+        if (badgeHit) {
+          state.badgeDrag = { idx: badgeHit.idx, start: cssPos, moved: false, target: null };
+        } else if (evt.altKey && state.digitization.overlay_traces[state.selectedTraceIdx]) {
+          // Alt+click: put the selected lead's isoline at this level
+          showBadgeProposal(evaluateBadgeTarget(state.selectedTraceIdx, natPos.x, natPos.y), cssPos);
+          return;
+        }
         const hitIdx = selectTraceAtClick(cssPos, natPos);
         if (hitIdx >= 0) {
           state.selectedTraceIdx = hitIdx;
@@ -4260,7 +4533,7 @@
           if (tr) {
             selectLead(tr.lead);
             if (el.overlayEditStatus) {
-              el.overlayEditStatus.textContent = `Выбрано отведение ${tr.lead} — можно переименовать или править линию`;
+              el.overlayEditStatus.textContent = `Выбрано отведение ${tr.lead} — переименуйте, правьте линию или перетащите его название на изолинию нужного ряда`;
             }
           }
         }
@@ -4281,6 +4554,18 @@
     });
 
     canvas.addEventListener("mousemove", (evt) => {
+      const bd = state.badgeDrag;
+      if (bd) {
+        const cp = getCssPos(evt);
+        if (!bd.moved && Math.hypot(cp.x - bd.start.x, cp.y - bd.start.y) < 4) return;
+        bd.moved = true;
+        const np = getNatPos(evt);
+        bd.target = evaluateBadgeTarget(bd.idx, np.x, np.y);
+        bd.css = cp;
+        canvas.style.cursor = "grabbing";
+        renderTraceOverlayCanvas();
+        return;
+      }
       if (!state.overlayDrawActive) return;
       const natPos = getNatPos(evt);
       if (state.overlayTool === "autotrace") {
@@ -4292,6 +4577,14 @@
     });
 
     window.addEventListener("mouseup", () => {
+      const bd = state.badgeDrag;
+      if (bd) {
+        state.badgeDrag = null;
+        canvas.style.cursor = state.overlayTool === "view" ? "pointer" : "crosshair";
+        if (bd.moved && bd.target) showBadgeProposal(bd.target, bd.css);
+        else renderTraceOverlayCanvas();
+        return;
+      }
       if (state.overlayDrawActive) {
         state.overlayDrawActive = false;
         state.overlayLastPt = null;
@@ -4301,6 +4594,10 @@
           el.overlayEditStatus.textContent = `Линия ${tr.lead} скорректирована и пересчитана`;
         }
       }
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && state.badgeProposal) closeBadgeProposal();
     });
 
     // Zoom controls

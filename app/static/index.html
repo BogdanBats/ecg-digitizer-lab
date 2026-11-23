@@ -280,13 +280,13 @@
             <div class="cal-overlay-toggles">
               <div class="w1-tool-group" role="group" aria-label="Инструмент коррекции линии">
                 <span class="toolbar-label">Линия:</span>
-                <button type="button" class="ov-tool-btn active" data-ov-tool="view" title="Клик по линии или подписи выбирает отведение">Выбор</button>
+                <button type="button" class="ov-tool-btn active" data-ov-tool="view" title="Клик по линии или подписи выбирает отведение; перетащите подпись отведения на изолинию нужного ряда (или Alt+клик по изолинии) — будет предложена автотрассировка вдоль неё">Выбор</button>
                 <button type="button" class="ov-tool-btn" data-ov-tool="autotrace" title="Кликните или потяните точку на фото — авто-трассировка привяжет линию к чернилам ЭКГ через вашу точку">Авто-трассировка (точка)</button>
                 <button type="button" class="ov-tool-btn" data-ov-tool="draw" title="Свободная коррекция линии карандашом по фото">Карандаш (вручную)</button>
               </div>
               <button type="button" id="btnAutoRetraceLead" class="btn btn-sm" title="Автоматически перетрассировать выбранное отведение по чернилам на фото">Авто-трасс. канала</button>
               <button type="button" id="btnResetOverlayTrace" class="btn btn-sm btn-ghost" title="Вернуть исходную трассировку выбранного отведения">Сбросить линию</button>
-              <span id="overlayEditStatus" class="cal-ruler-status">Клик по линии выбирает отведение • Включите «Авто-трассировка» для правки зубцов</span>
+              <span id="overlayEditStatus" class="cal-ruler-status">Клик по линии выбирает отведение • Отведение не на своём ряду — перетащите его подпись на изолинию нужного ряда • «Авто-трассировка» правит зубцы</span>
             </div>
           </div>
           <div class="img-scroll-box" id="overlayScrollBox">
