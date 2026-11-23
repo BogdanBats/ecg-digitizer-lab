@@ -8,6 +8,7 @@ import zipfile
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from scipy.signal import welch as sp_welch
 
 from app.core.ecg_formats import (
     FormatError,
@@ -223,3 +224,57 @@ def test_api_load_signal_and_segment(ecg):
 
     bad = client.post("/api/load_signal", files=[("files", ("x.edf", b"0       garbage", "application/octet-stream"))])
     assert bad.status_code == 400
+
+
+def _beat_levels(sig_mv, fs, beats_ms, start_ms):
+    """Per beat: PR level, ST(J+60) - PR and R - PR of the synthetic generator (R at the beat time, QRS +-45 ms)."""
+    x = np.asarray(sig_mv)
+    pr, st, r = [], [], []
+    for bt in beats_ms:
+        c = (bt - start_ms) * fs / 1000.0
+        if c < 120 or c > len(x) - 150:
+            continue
+        lvl = x[int(c - 0.080 * fs):int(c - 0.055 * fs)].mean()
+        pr.append(lvl)
+        st.append(x[int(c + 0.105 * fs)] - lvl)
+        r.append(x[int(c)] - lvl)
+    return np.array(pr), np.array(st), np.array(r)
+
+
+def test_zero_phase_filters_remove_wander_and_mains_but_keep_st():
+    fs = 500.0
+    clean = synthetic_12lead(hr_bpm=70, duration_s=30.0, fs=fs, st_elevation_mv={"V2": 0.2}, seed=4)
+    t = np.arange(len(clean["II"])) / fs
+    noisy = {k: np.asarray(v) + 0.5 * np.sin(2 * np.pi * 0.3 * t) + 0.1 * np.sin(2 * np.pi * 50 * t) for k, v in clean.items()}
+    rec = prepare_recording({"noisy.edf": write_edf(noisy, fs)})
+    raw = extract_segment(rec, 10.0, 10.0)
+    filt = extract_segment(rec, 10.0, 10.0, "baseline", 50)
+    assert filt["filter"] == {"mode": "baseline", "notch_hz": 50}
+    assert any("нулевой фазой" in w for w in filt["warnings"])
+    rr = 60000.0 / 70.0
+    beats = [400.0 + k * rr for k in range(40)]
+    for ln in ("II", "V2"):
+        ref_seg = np.asarray(clean[ln][5000:10000])
+        pr_c, st_c, r_c = _beat_levels(ref_seg, fs, beats, 10000.0)
+        pr_raw, _, _ = _beat_levels(raw["leads_mv"][ln], fs, beats, 10000.0)
+        pr_f, st_f, r_f = _beat_levels(filt["leads_mv"][ln], fs, beats, 10000.0)
+        assert np.std(pr_raw) > 0.2                     # wander present before
+        assert np.std(pr_f) < 0.03                      # removed after
+        assert np.max(np.abs(st_f - st_c)) < 0.04       # ST deviation preserved (zero phase)
+        assert np.max(np.abs(r_f / r_c - 1.0)) < 0.05   # R amplitude preserved
+    psd = lambda v: sp_welch(np.asarray(v), fs=fs, nperseg=1024)  # noqa: E731
+    f, p_raw = psd(raw["leads_mv"]["II"])
+    _, p_f = psd(filt["leads_mv"]["II"])
+    k50 = int(np.argmin(np.abs(f - 50)))
+    assert 10 * np.log10(p_raw[k50] / p_f[k50]) > 20   # mains suppressed > 20 dB
+
+
+def test_api_rejects_unknown_filter():
+    client = TestClient(app)
+    leads, fs = _holter(minutes=1.0)
+    r = client.post("/api/load_signal", files=[("files", ("h.edf", write_edf(leads, fs), "application/octet-stream"))],
+                    data={"filter_mode": "magic"})
+    assert r.status_code == 400
+    r2 = client.post("/api/load_signal", files=[("files", ("h.edf", write_edf(leads, fs), "application/octet-stream"))],
+                     data={"filter_mode": "monitor", "notch_hz": "50"})
+    assert r2.status_code == 200 and r2.json()["digitization"]["signal"]["filter"]["mode"] == "monitor"

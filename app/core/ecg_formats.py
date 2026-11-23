@@ -549,19 +549,61 @@ def prepare_recording(files: Dict[str, bytes], fs_hint: Optional[float] = None) 
     return rec
 
 
-def extract_segment(rec: Recording, segment_start_s: float = 0.0, segment_duration_s: Optional[float] = None) -> Dict[str, Any]:
+# Zero-phase (forward-backward) filters. AHA/ACCF/HRS 2007: a 0.67 Hz high-pass is acceptable for diagnostic ECGs
+# only when it does not shift the phase (ST level preserved), which sosfiltfilt guarantees.
+FILTER_MODES: Dict[str, Tuple[Optional[float], Optional[float]]] = {
+    "none": (None, None),
+    "baseline": (0.67, None),   # baseline-wander removal only
+    "monitor": (0.67, 40.0),    # + muscle / high-frequency noise
+    "diagnostic": (0.05, 150.0),
+}
+FILTER_LABELS = {
+    "none": "без фильтра",
+    "baseline": "изолиния 0,67 Гц",
+    "monitor": "мониторный 0,67–40 Гц",
+    "diagnostic": "диагностический 0,05–150 Гц",
+}
+
+
+def filter_signal(x: np.ndarray, fs: float, mode: str = "none", notch_hz: Optional[float] = None) -> np.ndarray:
+    hp, lp = FILTER_MODES.get(mode or "none", (None, None))
+    y = np.asarray(x, dtype=np.float64)
+    if hp:
+        y = sp_signal.sosfiltfilt(sp_signal.butter(2, hp, btype="highpass", fs=fs, output="sos"), y)
+    if lp and lp < 0.45 * fs:
+        y = sp_signal.sosfiltfilt(sp_signal.butter(4, lp, btype="lowpass", fs=fs, output="sos"), y)
+    if notch_hz and notch_hz < fs / 2 - 2:
+        b, a = sp_signal.iirnotch(float(notch_hz), 30.0, fs=fs)
+        y = sp_signal.filtfilt(b, a, y)
+    return y
+
+
+def extract_segment(rec: Recording, segment_start_s: float = 0.0, segment_duration_s: Optional[float] = None,
+                    filter_mode: str = "none", notch_hz: Optional[float] = None) -> Dict[str, Any]:
     total_s = float(rec.info["duration_s"])
     seg_dur = float(segment_duration_s) if segment_duration_s else (total_s if total_s <= 60.0 else 30.0)
     seg_dur = float(np.clip(seg_dur, 2.0, MAX_SEGMENT_S))
     seg_dur = min(seg_dur, total_s)
     start = float(np.clip(segment_start_s or 0.0, 0.0, max(0.0, total_s - seg_dur)))
     a, b = int(round(start * rec.fs)), int(round((start + seg_dur) * rec.fs))
+    filter_mode = filter_mode if filter_mode in FILTER_MODES else "none"
+    filtering = filter_mode != "none" or bool(notch_hz)
+    # filter with the real signal around the window, so no edge transients fall inside the shown segment
+    pad = int(round(5.0 * rec.fs)) if filtering else 0
+    n_total = len(next(iter(rec.leads.values())))
+    pa, pb = max(0, a - pad), min(n_total, b + pad)
     out: Dict[str, List[float]] = {}
     for name, sig in rec.leads.items():
-        seg = sig[a:b].astype(np.float64)
+        seg = sig[pa:pb].astype(np.float64)
+        if filtering:
+            seg = filter_signal(seg, rec.fs, filter_mode, notch_hz)
+        seg = seg[a - pa:a - pa + (b - a)]
         seg = seg - np.median(seg)
         out[name] = [round(float(v), 4) for v in _resample(seg, rec.fs, TARGET_FS)]
     warnings = list(rec.warnings)
+    if filtering:
+        label = FILTER_LABELS[filter_mode] + (f" + режектор {notch_hz:g} Гц" if notch_hz else "")
+        warnings.append(f"Фильтр с нулевой фазой: {label}")
     if total_s > seg_dur + 0.5:
         warnings.append(f"Длинная запись ({_fmt_hms(total_s)}): показан фрагмент {_fmt_hms(start)}–{_fmt_hms(start + seg_dur)}")
     return {
@@ -573,6 +615,7 @@ def extract_segment(rec: Recording, segment_start_s: float = 0.0, segment_durati
         "segment_duration_s": round(seg_dur, 3),
         "info": {k: v for k, v in rec.info.items() if v not in (None, "") and k != "duration_s"},
         "warnings": warnings,
+        "filter": {"mode": filter_mode, "notch_hz": notch_hz or None},
     }
 
 

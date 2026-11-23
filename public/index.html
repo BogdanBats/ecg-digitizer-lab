@@ -145,6 +145,20 @@
         <button type="button" id="btnSignalGo" class="btn btn-xs btn-primary-sm">Показать</button>
         <button type="button" id="btnSignalNext" class="btn btn-xs btn-ghost" title="Следующий фрагмент">▶</button>
       </div>
+      <div class="signal-nav" title="Фильтры с нулевой фазой (вперёд-назад): не сдвигают сегмент ST. Применяются к фрагменту на сервере, измерения пересчитываются. Мониторный 40 Гц снижает амплитуду острых QRS — для диагностических измерений используйте «изолинию» или «диагностический»">
+        <label class="toolbar-label" for="selectSignalFilter">Фильтр</label>
+        <select id="selectSignalFilter" class="select-input-sm">
+          <option value="none" selected>без фильтра</option>
+          <option value="baseline">изолиния 0,67 Гц</option>
+          <option value="monitor">мониторный 0,67–40 Гц</option>
+          <option value="diagnostic">диагностический 0,05–150 Гц</option>
+        </select>
+        <select id="selectSignalNotch" class="select-input-sm" title="Режекторный фильтр сетевой наводки">
+          <option value="" selected>сеть: нет</option>
+          <option value="50">режектор 50 Гц</option>
+          <option value="60">режектор 60 Гц</option>
+        </select>
+      </div>
       <label class="checkbox-label" title="Раздел 1 (верификация оцифровки фото) для цифровой записи не нужен; здесь можно показать только обзор всех отведений">
         <input type="checkbox" id="chkSignalOverview" />
         <span>Обзор всех отведений</span>
@@ -610,6 +624,18 @@
               <button type="button" id="btnCopyConclusion" class="btn btn-sm btn-ghost">Копировать</button>
               <button type="button" id="btnPrintConclusion" class="btn btn-sm btn-primary-sm">Печать заключения</button>
             </div>
+            <div class="phrase-lib">
+              <button type="button" id="btnTogglePhrases" class="btn btn-sm btn-ghost" aria-expanded="false" aria-controls="phrasePanel">Шаблоны фраз ▾</button>
+              <div class="phrase-panel" id="phrasePanel" hidden>
+                <div class="phrase-tools">
+                  <input type="search" id="inpPhraseSearch" class="text-input-sm" placeholder="Поиск фразы…" aria-label="Поиск фразы" />
+                  <input type="text" id="inpPhraseNew" class="text-input-sm" placeholder="Своя фраза…" aria-label="Новая своя фраза" />
+                  <button type="button" id="btnPhraseAdd" class="btn btn-xs btn-primary-sm">Добавить</button>
+                </div>
+                <div class="phrase-groups" id="phraseGroups"></div>
+                <p class="phrase-hint">Клик — вставить в позицию курсора (с новой строки); «…» сразу выделяется для ввода. Свои фразы хранятся в этом браузере.</p>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -837,6 +863,7 @@
           <button type="button" class="atool-tab" data-atool="overlay" role="tab" title="Все комплексы активного отведения, совмещённые по R: форма QRS и преждевременность каждого комплекса">Наложение комплексов</button>
           <button type="button" class="atool-tab" data-atool="qtd" role="tab" title="QRS и окончание T в каждом отведении, дисперсия QT">Дисперсия QT</button>
           <button type="button" class="atool-tab" data-atool="noise" role="tab" title="Спектр мощности сигнала, дрейф изолинии, сетевая наводка, мышечный шум">Спектр и шум</button>
+          <button type="button" class="atool-tab" data-atool="compare" role="tab" title="Сравнение с сохранённой ранее ЭКГ: наложение медианных комплексов и динамика ST, T, QRS, QTc, оси">Сравнение с предыдущей</button>
         </div>
         <button type="button" id="btnAtoolToReport" class="btn btn-xs btn-primary-sm" title="Добавить вывод открытой вкладки в текст заключения">В заключение</button>
       </div>
@@ -876,6 +903,26 @@
         </div>
         <p class="atool-note">Границы — калиперы каждого отведения (сдвинутые вручную учитываются). В расчёт не входят отведения с T &lt; 0,1 мВ, плохим качеством
           и нестандартные (полосы ритма). Дисперсия QT — показатель с ограниченной воспроизводимостью, особенно для оцифрованных ЭКГ.</p>
+      </div>
+
+      <div class="atool-pane" id="atool-compare" role="tabpanel">
+        <div class="atool-toolbar">
+          <label class="control-inline">Эталон
+            <select id="selectCompareRef" class="select-input-sm"><option value="">— нет сохранённых —</option></select>
+          </label>
+          <button type="button" id="btnCompareSave" class="btn btn-xs btn-primary-sm" title="Запомнить медианные комплексы и измерения текущей ЭКГ для будущего сравнения">Сохранить текущую как эталон</button>
+          <button type="button" id="btnCompareExport" class="btn btn-xs btn-ghost" title="Сохранить выбранный эталон в файл (.json) — например, в карту пациента">В файл</button>
+          <label class="btn btn-xs btn-ghost" title="Загрузить эталон из файла">Из файла…<input type="file" id="inpCompareImport" accept=".json,application/json" hidden /></label>
+          <button type="button" id="btnCompareDelete" class="btn btn-xs btn-ghost" title="Удалить выбранный эталон из браузера">Удалить</button>
+          <span class="atool-legend"><i class="lg lg-n"></i>эталон (было) <i class="lg lg-cur"></i>текущая (стало)</span>
+        </div>
+        <div class="atool-layout">
+          <div class="atool-canvas-wrap"><canvas id="compareCanvas" height="360" style="height:360px"></canvas></div>
+          <div class="atool-metrics" id="compareMetrics"></div>
+        </div>
+        <p class="atool-note">Медианные комплексы основной формы синхронных отведений совмещены по R опорного отведения (II, V5, I…), изолиния — по PR; ST — на J+60 мс
+          своей ЭКГ, T — наибольшее отклонение после J. Появление зубцов Q оценивайте визуально по наложению. Сравнение чувствительно к положению
+          электродов, усилению и качеству оцифровки: находки — повод сверить исходные ЭКГ, а не самостоятельный диагноз. Эталоны хранятся только в этом браузере (или в файле).</p>
       </div>
 
       <div class="atool-pane" id="atool-noise" role="tabpanel">

@@ -25,7 +25,16 @@ from pydantic import BaseModel
 from app.core.digitizer import LAYOUT_DEFINITIONS, SUPPORTED_METHODS, deep_learning_status, digitize_ecg_image
 from app.core.ecg_analysis import analyze_all_leads, compute_intervals_from_calipers
 from app.core.ecg_autoanalysis import NEUROKIT_VERSION, analyze_ecg
-from app.core.ecg_formats import SIGNAL_EXTENSIONS, TARGET_FS, FormatError, Recording, extract_segment, hr_trend, prepare_recording
+from app.core.ecg_formats import (
+    FILTER_MODES,
+    SIGNAL_EXTENSIONS,
+    TARGET_FS,
+    FormatError,
+    Recording,
+    extract_segment,
+    hr_trend,
+    prepare_recording,
+)
 from app.core.ecg_interpretation import interpret
 
 logger = logging.getLogger("ecg_workstation")
@@ -361,10 +370,17 @@ def _cache_get(rid: str) -> Optional[Dict[str, Any]]:
         return item
 
 
+def _check_filter(filter_mode: Optional[str], notch_hz: Optional[float]) -> None:
+    if filter_mode is not None and filter_mode not in FILTER_MODES:
+        raise HTTPException(status_code=400, detail=f"Неизвестный фильтр: {filter_mode}")
+    if notch_hz not in (None, 0, 50, 60):
+        raise HTTPException(status_code=400, detail="Режекторный фильтр: 50 или 60 Гц")
+
+
 def _signal_payload(rid: str, item: Dict[str, Any], start_s: float, dur_s: Optional[float], sex: Optional[str],
-                    t0: float) -> Dict[str, Any]:
+                    t0: float, filter_mode: Optional[str] = None, notch_hz: Optional[float] = None) -> Dict[str, Any]:
     rec: Recording = item["rec"]
-    seg = extract_segment(rec, start_s, dur_s)
+    seg = extract_segment(rec, start_s, dur_s, filter_mode or "none", notch_hz or None)
     analysis = analyze_all_leads(leads_mv=seg["leads_mv"], fs=TARGET_FS, sex=sex if sex in ("male", "female") else None)
     n_leads = len(seg["leads_mv"])
     digitization = {
@@ -391,6 +407,7 @@ def _signal_payload(rid: str, item: Dict[str, Any], start_s: float, dur_s: Optio
             "info": seg["info"],
             "channels": list(rec.leads),
             "trend": item["trend"],
+            "filter": seg["filter"],
         },
     }
     return {"source_name": item["name"], "digitization": digitization, "analysis": analysis}
@@ -403,6 +420,8 @@ async def api_load_signal(
     segment_duration_s: Optional[float] = Form(default=None),
     fs_hint: Optional[float] = Form(default=None),
     patient_sex: Optional[str] = Form(default=None),
+    filter_mode: Optional[str] = Form(default=None),
+    notch_hz: Optional[float] = Form(default=None),
 ) -> JSONResponse:
     """Native digital recordings (EDF/BDF, ISHNE, WFDB, GE MUSE XML, HL7 aECG, DICOM, CSV): no image digitization."""
     t0 = time.perf_counter()
@@ -419,6 +438,7 @@ async def api_load_signal(
             blobs[f.filename] = data
     if not blobs:
         raise HTTPException(status_code=400, detail="Файлы записи пусты")
+    _check_filter(filter_mode, notch_hz)
     if fs_hint is not None and not (50.0 <= fs_hint <= 20000.0):
         raise HTTPException(status_code=400, detail="Частота дискретизации должна быть 50–20000 Гц")
     name = " + ".join(sorted(blobs))
@@ -427,7 +447,7 @@ async def api_load_signal(
         trend = await run_in_threadpool(hr_trend, rec)
         rid = _cache_put(rec, trend, name)
         payload = await run_in_threadpool(_signal_payload, rid, _signal_cache[rid], segment_start_s, segment_duration_s,
-                                          patient_sex, t0)
+                                          patient_sex, t0, filter_mode, notch_hz)
     except FormatError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except HTTPException:
@@ -443,6 +463,8 @@ class SignalSegmentRequest(BaseModel):
     segment_start_s: float = 0.0
     segment_duration_s: Optional[float] = None
     patient_sex: Optional[str] = None
+    filter_mode: Optional[str] = None
+    notch_hz: Optional[float] = None
 
 
 @app.post("/api/signal_segment")
@@ -452,8 +474,9 @@ async def api_signal_segment(req: SignalSegmentRequest) -> JSONResponse:
     item = _cache_get(req.recording_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Запись не найдена в памяти сервера — загрузите файл заново")
+    _check_filter(req.filter_mode, req.notch_hz)
     payload = await run_in_threadpool(_signal_payload, req.recording_id, item, req.segment_start_s, req.segment_duration_s,
-                                      req.patient_sex, t0)
+                                      req.patient_sex, t0, req.filter_mode, req.notch_hz)
     return JSONResponse(payload)
 
 

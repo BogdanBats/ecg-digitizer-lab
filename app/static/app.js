@@ -138,6 +138,19 @@
 
   // DOM Elements
   const el = {
+    selectCompareRef: document.getElementById("selectCompareRef"),
+    btnCompareSave: document.getElementById("btnCompareSave"),
+    btnCompareExport: document.getElementById("btnCompareExport"),
+    inpCompareImport: document.getElementById("inpCompareImport"),
+    btnCompareDelete: document.getElementById("btnCompareDelete"),
+    compareCanvas: document.getElementById("compareCanvas"),
+    compareMetrics: document.getElementById("compareMetrics"),
+    btnTogglePhrases: document.getElementById("btnTogglePhrases"),
+    phrasePanel: document.getElementById("phrasePanel"),
+    phraseGroups: document.getElementById("phraseGroups"),
+    inpPhraseSearch: document.getElementById("inpPhraseSearch"),
+    inpPhraseNew: document.getElementById("inpPhraseNew"),
+    btnPhraseAdd: document.getElementById("btnPhraseAdd"),
     atoolLead: document.getElementById("atoolLead"),
     btnAtoolToReport: document.getElementById("btnAtoolToReport"),
     hrvCanvas: document.getElementById("hrvCanvas"),
@@ -171,6 +184,8 @@
     btnSignalGo: document.getElementById("btnSignalGo"),
     inpSignalStart: document.getElementById("inpSignalStart"),
     selectSignalDuration: document.getElementById("selectSignalDuration"),
+    selectSignalFilter: document.getElementById("selectSignalFilter"),
+    selectSignalNotch: document.getElementById("selectSignalNotch"),
     chkSignalOverview: document.getElementById("chkSignalOverview"),
     signalTrendWrap: document.getElementById("signalTrendWrap"),
     signalTrendCanvas: document.getElementById("signalTrendCanvas"),
@@ -937,6 +952,145 @@
     }
   }
 
+  // ------------------------------------------------------------------ conclusion phrase library
+  const PHRASE_LIBRARY = [
+    ["Ритм", [
+      "Синусовый ритм, правильный.", "Синусовая тахикардия.", "Синусовая брадикардия.", "Синусовая аритмия (дыхательная).",
+      "Фибрилляция предсердий, нормосистолическая форма.", "Фибрилляция предсердий, тахисистолическая форма.",
+      "Трепетание предсердий с проведением …:1.", "Миграция водителя ритма по предсердиям.", "Ритм из АВ-соединения.",
+      "Ускоренный идиовентрикулярный ритм.", "Ритм электрокардиостимулятора.",
+    ]],
+    ["Экстрасистолия", [
+      "Одиночная наджелудочковая экстрасистолия.", "Частая наджелудочковая экстрасистолия.",
+      "Одиночная желудочковая экстрасистолия.", "Частая желудочковая экстрасистолия.",
+      "Желудочковая экстрасистолия по типу бигеминии.", "Желудочковая экстрасистолия по типу тригеминии.",
+      "Парная желудочковая экстрасистолия.", "Пробежка наджелудочковой тахикардии из … комплексов.",
+    ]],
+    ["ЭОС", [
+      "Нормальное положение электрической оси сердца.", "Горизонтальное положение ЭОС.", "Вертикальное положение ЭОС.",
+      "Отклонение ЭОС влево.", "Отклонение ЭОС вправо.", "ЭОС не определяется.",
+    ]],
+    ["Проводимость", [
+      "АВ-блокада I степени.", "АВ-блокада II степени, тип Мобитц I (периодика Самойлова–Венкебаха).",
+      "АВ-блокада II степени, тип Мобитц II.", "АВ-блокада III степени (полная).", "Синоатриальная блокада II степени.",
+      "Полная блокада правой ножки пучка Гиса.", "Неполная блокада правой ножки пучка Гиса.",
+      "Полная блокада левой ножки пучка Гиса.", "Блокада передней ветви левой ножки пучка Гиса.",
+      "Блокада задней ветви левой ножки пучка Гиса.", "Неспецифическое нарушение внутрижелудочковой проводимости.",
+      "Укороченный интервал PQ.", "Феномен WPW.", "Удлинение интервала QT (QTc … мс).",
+    ]],
+    ["Гипертрофия", [
+      "Признаки гипертрофии левого желудочка.", "Признаки гипертрофии левого желудочка с изменениями реполяризации.",
+      "Признаки гипертрофии правого желудочка.", "Признаки увеличения левого предсердия.",
+      "Признаки увеличения правого предсердия.", "Низкий вольтаж комплексов QRS.",
+    ]],
+    ["ST–T / ишемия", [
+      "Неспецифические изменения сегмента ST и зубца T.", "Синдром ранней реполяризации желудочков.",
+      "Подъём сегмента ST в отведениях … — исключить острый коронарный синдром.",
+      "Депрессия сегмента ST в отведениях … .", "Отрицательные зубцы T в отведениях … .",
+      "Патологические зубцы Q в отведениях … .", "Диффузные изменения миокарда.",
+    ]],
+    ["Динамика и рекомендации", [
+      "ЭКГ без патологических изменений.", "В сравнении с ЭКГ от … — без существенной динамики.",
+      "В сравнении с ЭКГ от … — отрицательная динамика: … .", "В сравнении с ЭКГ от … — положительная динамика.",
+      "Рекомендована консультация кардиолога.", "Рекомендовано суточное мониторирование ЭКГ.", "Рекомендована ЭхоКГ.",
+      "Рекомендована ЭКГ в динамике.", "Экстренная консультация кардиолога (подозрение на ОКС).",
+    ]],
+  ];
+  const PHRASE_STORE_KEY = "ecg-phrases-custom";
+
+  function loadCustomPhrases() {
+    try {
+      const v = JSON.parse(localStorage.getItem(PHRASE_STORE_KEY) || "[]");
+      return Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+    } catch (_) {
+      return [];
+    }
+  }
+  function saveCustomPhrases(list) {
+    try {
+      localStorage.setItem(PHRASE_STORE_KEY, JSON.stringify(list));
+    } catch (_) {}
+  }
+
+  function renderPhraseLibrary() {
+    if (!el.phraseGroups) return;
+    const q = (el.inpPhraseSearch.value || "").trim().toLowerCase();
+    const custom = loadCustomPhrases();
+    const groups = (custom.length ? [["Мои фразы", custom]] : []).concat(PHRASE_LIBRARY);
+    el.phraseGroups.innerHTML = groups
+      .map(([title, list]) => {
+        const items = list.filter((ph) => !q || ph.toLowerCase().includes(q));
+        if (!items.length) return "";
+        const mine = title === "Мои фразы";
+        return `<div class="phrase-group"><div class="phrase-group-title">${escapeHtml(title)}</div>` +
+          items.map((ph) => `<span class="phrase-chip-wrap"><button type="button" class="phrase-chip" data-phrase="${escapeHtml(ph)}">${escapeHtml(ph)}</button>` +
+            (mine ? `<button type="button" class="phrase-del" data-del="${escapeHtml(ph)}" title="Удалить свою фразу">×</button>` : "") + "</span>").join("") +
+          "</div>";
+      })
+      .join("") || '<p class="phrase-hint">Ничего не найдено</p>';
+  }
+
+  function insertPhrase(text) {
+    const ta = el.txtConclusion;
+    if (!ta) return;
+    const val = ta.value;
+    let pos = document.activeElement === ta || ta.dataset.caret ? (ta.selectionStart ?? val.length) : val.length;
+    if (!Number.isFinite(pos)) pos = val.length;
+    const before = val.slice(0, pos);
+    const after = val.slice(ta.selectionEnd ?? pos);
+    const lead = before && !before.endsWith("\n") ? "\n" : "";
+    const tail = after && !after.startsWith("\n") ? "\n" : "";
+    ta.value = before + lead + text + tail + after;
+    const start = before.length + lead.length;
+    const ell = text.indexOf("…");
+    ta.focus();
+    if (ell >= 0) ta.setSelectionRange(start + ell, start + ell + 1);
+    else ta.setSelectionRange(start + text.length, start + text.length);
+    ta.dataset.caret = "1";
+    state.report.edited = true;
+    markConclusionState("Текст отредактирован вручную");
+    saveReportDraft();
+  }
+
+  function bindPhraseLibrary() {
+    if (!el.btnTogglePhrases) return;
+    el.btnTogglePhrases.addEventListener("click", () => {
+      const open = el.phrasePanel.hidden;
+      el.phrasePanel.hidden = !open;
+      el.btnTogglePhrases.setAttribute("aria-expanded", String(open));
+      el.btnTogglePhrases.textContent = open ? "Шаблоны фраз ▴" : "Шаблоны фраз ▾";
+      if (open) renderPhraseLibrary();
+    });
+    el.inpPhraseSearch.addEventListener("input", renderPhraseLibrary);
+    // keep the caret position of the conclusion when the doctor clicks a phrase
+    el.phraseGroups.addEventListener("mousedown", (e) => {
+      if (e.target.closest(".phrase-chip")) e.preventDefault();
+    });
+    el.phraseGroups.addEventListener("click", (e) => {
+      const del = e.target.closest("[data-del]");
+      if (del) {
+        saveCustomPhrases(loadCustomPhrases().filter((x) => x !== del.getAttribute("data-del")));
+        renderPhraseLibrary();
+        return;
+      }
+      const chip = e.target.closest("[data-phrase]");
+      if (chip) insertPhrase(chip.getAttribute("data-phrase"));
+    });
+    const addCustom = () => {
+      const txt = (el.inpPhraseNew.value || "").trim();
+      if (!txt) return;
+      const list = loadCustomPhrases();
+      if (!list.includes(txt)) list.unshift(txt);
+      saveCustomPhrases(list.slice(0, 200));
+      el.inpPhraseNew.value = "";
+      renderPhraseLibrary();
+    };
+    el.btnPhraseAdd.addEventListener("click", addCustom);
+    el.inpPhraseNew.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") addCustom();
+    });
+  }
+
   // ------------------------------------------------------------------ 7. Analysis tools (tabs)
   function meanOf(v) {
     return v.length ? v.reduce((a, b) => a + b, 0) / v.length : NaN;
@@ -1323,10 +1477,10 @@
     return da > 0 && db > 0 ? num / Math.sqrt(da * db) : 0;
   }
 
-  function computeBeatMorphology(ln, thr) {
+  function computeBeatMorphology(ln, thr, alignBeats = null) {
     const sig = state.digitization.leads_mv[ln] || [];
     const fs = state.digitization.sampling_rate_hz || 500;
-    const beats = sortedBeats(ln);
+    const beats = alignBeats || sortedBeats(ln);
     if (beats.length < 3 || sig.length < 10) return null;
     const rrs = [];
     for (let k = 1; k < beats.length; k++) rrs.push(beats[k].r - beats[k - 1].r);
@@ -1767,7 +1921,10 @@
     const ln = state.activeLead;
     const sig = (state.digitization.leads_mv && state.digitization.leads_mv[ln]) || [];
     const arts = JSON.stringify((state.artifactsByLead && state.artifactsByLead[ln]) || []);
-    const key = `${state.currentSource}|${ln}|${sig.length}|${sortedBeats(ln).length}|${arts}`;
+    // fingerprint of the samples: a filtered / re-loaded segment of the same length must not hit the cache
+    let fp = 0;
+    for (let i = 0; i < sig.length; i += 97) fp += sig[i] * ((i % 7) + 1);
+    const key = `${state.currentSource}|${ln}|${sig.length}|${fp.toFixed(4)}|${sortedBeats(ln).length}|${arts}`;
     if (key !== state.atool.noiseKey) {
       state.atool.noiseKey = key;
       state.atool.noiseCache = computeNoise(ln);
@@ -1857,6 +2014,380 @@
       (state.signal ? "" : " Для оцифрованного фото спектр включает артефакты трассировки (ступени пикселей); частоты выше ~40 Гц малоинформативны.");
   }
 
+  // ---- tab 5: serial comparison with a saved reference ECG
+  const CMP_KEY = "ecg-compare-refs";
+  const CMP_PRE = 300;
+  const CMP_POST = 600;
+  const CMP_STEP = 4;
+
+  function loadCompareRefs() {
+    try {
+      const v = JSON.parse(localStorage.getItem(CMP_KEY) || "[]");
+      return Array.isArray(v) ? v.filter((r) => r && r.id && r.leads) : [];
+    } catch (_) {
+      return [];
+    }
+  }
+  function saveCompareRefs(list) {
+    try {
+      localStorage.setItem(CMP_KEY, JSON.stringify(list));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function leadMetricsSummary(ln) {
+    const la = state.analysis && state.analysis.leads && state.analysis.leads[ln];
+    const m = (la && la.metrics) || {};
+    const iv = m.intervals_ms || {};
+    const du = m.durations_ms || {};
+    const am = m.amplitudes_mv || {};
+    return {
+      hr: m.hr_bpm, pq: iv.pq_pr, qrs: du.qrs_complex, qt: iv.qt, qtcf: iv.qtc_fridericia,
+      r: am.r_amp_mv, s: am.s_amp_mv, q: am.q_amp_mv, t: am.t_amp_mv,
+    };
+  }
+
+  // Median beat of every standard lead on a fixed grid (-300..+600 ms, 4 ms) + measurements. Simultaneous leads are
+  // aligned on the R peaks of ONE anchor lead (II, V5, I, ...): a lead's own "R" mark may sit on R in one ECG and
+  // on a deep S in the next, which would shift its template. J is shared within a group (median of the leads' J).
+  const CMP_ANCHORS = ["II", "V5", "I", "aVF", "V6", "V4", "III", "aVL"];
+  function buildEcgSnapshot() {
+    const leads = {};
+    const groups = leadGroupsForAnalysis();
+    const anchorOf = {};
+    groups.forEach((g) => {
+      let a = CMP_ANCHORS.find((x) => g.includes(x) && state.analysis.leads[x] && sortedBeats(x).length >= 2);
+      if (!a) {
+        a = g.filter((x) => state.analysis.leads[x] && sortedBeats(x).length >= 2)
+          .sort((x, y) => (leadMetricsSummary(y).r || 0) - (leadMetricsSummary(x).r || 0))[0];
+      }
+      g.forEach((ln) => (anchorOf[ln] = a || ln));
+    });
+    const groupJ = {};
+    groups.forEach((g) => {
+      const a = anchorOf[g[0]];
+      const ab = a ? sortedBeats(a) : [];
+      const js = g.map((ln) => {
+        const la = state.analysis.leads[ln];
+        const c = ln === state.activeLead ? state.calipersMs : (la && la.calipers_ms) || {};
+        if (!Number.isFinite(c.qrs_offset) || !Number.isFinite(c.r_peak) || !ab.length) return NaN;
+        const near = ab.reduce((best, b) => (Math.abs(b.r - c.r_peak) < Math.abs(best.r - c.r_peak) ? b : best), ab[0]);
+        return Math.abs(near.r - c.r_peak) <= 100 ? c.qrs_offset - near.r : NaN;
+      }).filter(Number.isFinite);
+      g.forEach((ln) => (groupJ[ln] = js.length ? median(js) : 45));
+    });
+    STANDARD_LEADS.forEach((ln) => {
+      if (!state.analysis.leads[ln] || !state.digitization.leads_mv[ln]) return;
+      const anchor = anchorOf[ln] || ln;
+      const mo = computeBeatMorphology(ln, 0.9, anchor !== ln ? sortedBeats(anchor) : null);
+      if (!mo) return;
+      const tpl = [];
+      for (let t = -CMP_PRE; t <= CMP_POST; t += CMP_STEP) {
+        const idx = Math.round(((t + mo.pre) * mo.fs) / 1000);
+        tpl.push(idx >= 0 && idx < mo.n ? Math.round(mo.template[idx] * 10000) / 10000 : null);
+      }
+      leads[ln] = { tpl, j: Number.isFinite(groupJ[ln]) ? groupJ[ln] : 45, anchor, m: leadMetricsSummary(ln) };
+    });
+    const g = globalIntervalsForCompare();
+    const ax = state.analysis.axes || {};
+    const p = reportPatient();
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    const dateTxt = `${pad(now.getDate())}.${pad(now.getMonth() + 1)}.${now.getFullYear()} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+    return {
+      id: `ref-${now.getTime()}`,
+      name: `${p.name || "Без имени"} — ${dateTxt} — ${state.currentSource || ""}`.slice(0, 140),
+      savedAt: now.toISOString(),
+      date: dateTxt,
+      source: state.currentSource || "",
+      patient: { name: p.name, age: p.age, sex: p.sex },
+      global: { ...g, axis: ax.qrs_axis_deg },
+      leads,
+    };
+  }
+
+  function refTemplateAt(lead, t) {
+    const i = Math.round((t + CMP_PRE) / CMP_STEP);
+    const v = lead.tpl[i];
+    return v === null || v === undefined ? NaN : v;
+  }
+
+  function globalIntervalsForCompare() {
+    const sum = state.report && state.report.summary;
+    const iv = sum && sum.intervals;
+    const hrLead = leadMetricsSummary(state.analysis.leads.II ? "II" : state.activeLead).hr;
+    if (iv && Number.isFinite(iv.qrs_ms)) {
+      return {
+        hr: (sum.rhythm && sum.rhythm.hr_bpm) || hrLead, pq: iv.pr_ms, qrs: iv.qrs_ms, qt: iv.qt_ms,
+        qtcf: iv.qtc_fridericia_ms || iv.qtc_ms, source: "autoanalysis",
+      };
+    }
+    const med = (k, lo, hi) => {
+      const v = STANDARD_LEADS.map((ln) => (state.analysis.leads[ln] ? leadMetricsSummary(ln)[k] : NaN)).filter((x) => x >= lo && x <= hi);
+      return v.length ? median(v) : NaN;
+    };
+    return { hr: hrLead, pq: med("pq", 60, 400), qrs: med("qrs", 40, 220), qt: med("qt", 200, 700), qtcf: med("qtcf", 250, 750), source: "median" };
+  }
+
+  // signed T amplitude of a template: the largest deflection between J+60 and J+420 ms
+  function templateTAmp(lead) {
+    let best = 0;
+    for (let t = lead.j + 60; t <= lead.j + 420; t += CMP_STEP) {
+      const v = refTemplateAt(lead, t);
+      if (Number.isFinite(v) && Math.abs(v) > Math.abs(best)) best = v;
+    }
+    return best;
+  }
+
+  function compareSnapshots(cur, ref) {
+    const leads = STANDARD_LEADS.filter((ln) => cur.leads[ln] && ref.leads[ln]);
+    const rows = leads.map((ln) => {
+      const a = ref.leads[ln];
+      const b = cur.leads[ln];
+      const stRef = refTemplateAt(a, a.j + 60);
+      const stCur = refTemplateAt(b, b.j + 60);
+      // QRS shape similarity (-60..+100 ms)
+      const ia = Math.round((CMP_PRE - 60) / CMP_STEP);
+      const ib = Math.round((CMP_PRE + 100) / CMP_STEP);
+      const va = a.tpl.slice(ia, ib + 1).map((v) => v || 0);
+      const vb = b.tpl.slice(ia, ib + 1).map((v) => v || 0);
+      const r = pearsonR(va, vb, 0, va.length - 1);
+      const p2p = (v) => (v.length ? Math.max(...v) - Math.min(...v) : 0);
+      const lowAmp = p2p(va) < 0.3 || p2p(vb) < 0.3; // near-isoelectric QRS: correlation measures noise
+      return {
+        ln, stRef, stCur, dSt: stCur - stRef, tRef: templateTAmp(a), tCur: templateTAmp(b), qrsRef: a.m.qrs, qrsCur: b.m.qrs,
+        corr: r, lowAmp, sameAnchor: !a.anchor || !b.anchor || a.anchor === b.anchor,
+      };
+    });
+    const f = [];
+    const list = (arr) => arr.map((x) => x.ln).join(", ");
+    const stUp = rows.filter((x) => x.dSt >= 0.1 && x.stCur >= 0.1 && x.ln !== "aVR");
+    const stDown = rows.filter((x) => x.dSt <= -0.1 && x.stCur <= -0.05 && x.ln !== "aVR");
+    const tInv = rows.filter((x) => x.tRef >= 0.1 && x.tCur <= -0.1);
+    const tUp = rows.filter((x) => x.tRef <= -0.1 && x.tCur >= 0.1);
+    const shape = rows.filter((x) => x.corr < 0.9 && !x.lowAmp);
+    if (stUp.length) f.push({ lvl: "bad", t: `Новый подъём ST ≥ 1 мм: ${list(stUp)}` });
+    if (stDown.length) f.push({ lvl: "warn", t: `Новая депрессия ST ≥ 1 мм: ${list(stDown)}` });
+    if (tInv.length) f.push({ lvl: "warn", t: `Зубец T стал отрицательным: ${list(tInv)}` });
+    if (tUp.length) f.push({ lvl: "info", t: `Зубец T стал положительным: ${list(tUp)}` });
+    const otherAnchor = rows.filter((x) => !x.sameAnchor);
+    if (otherAnchor.length) f.push({ lvl: "info", t: `Отведения ${list(otherAnchor)} совмещены по разным опорным отведениям — сравнивайте осторожно` });
+    if (shape.length) f.push({ lvl: "warn", t: `Изменилась форма QRS (r < 0,9): ${list(shape)} — проводимость, рубец или иное положение электродов` });
+    const g0 = ref.global || {};
+    const g1 = cur.global || {};
+    const d = (k) => (Number.isFinite(g1[k]) && Number.isFinite(g0[k]) ? g1[k] - g0[k] : NaN);
+    if (d("qrs") >= 20) f.push({ lvl: "warn", t: `QRS расширился на ${d("qrs").toFixed(0)} мс` });
+    if (d("qtcf") >= 60 || (g1.qtcf >= 500 && g0.qtcf < 500)) f.push({ lvl: "bad", t: `QTc удлинился на ${d("qtcf").toFixed(0)} мс (до ${g1.qtcf.toFixed(0)})` });
+    if (d("pq") >= 40 || (g1.pq > 200 && g0.pq <= 200)) f.push({ lvl: "warn", t: `PQ удлинился на ${d("pq").toFixed(0)} мс` });
+    if (Number.isFinite(d("axis"))) {
+      let da = Math.abs(d("axis")) % 360;
+      if (da > 180) da = 360 - da;
+      if (da >= 30) f.push({ lvl: "warn", t: `ЭОС сместилась на ${da.toFixed(0)}° (${fmtSigned(g0.axis)}° → ${fmtSigned(g1.axis)}°)` });
+    }
+    if (Math.abs(d("hr")) >= 20) f.push({ lvl: "info", t: `ЧСС ${g0.hr.toFixed(0)} → ${g1.hr.toFixed(0)} уд/мин` });
+    return { rows, findings: f, leads };
+  }
+
+  function fmtSigned(v) {
+    return Number.isFinite(v) ? `${v >= 0 ? "+" : ""}${Math.round(v)}` : "—";
+  }
+
+  function populateCompareSelect(selectId) {
+    const refs = loadCompareRefs();
+    const sel = el.selectCompareRef;
+    const keep = selectId || sel.value;
+    sel.innerHTML = refs.length
+      ? refs.map((r) => `<option value="${escapeHtml(r.id)}">${escapeHtml(r.name)}</option>`).join("")
+      : '<option value="">— нет сохранённых —</option>';
+    if (refs.some((r) => r.id === keep)) sel.value = keep;
+  }
+
+  function renderCompareTool() {
+    const refs = loadCompareRefs();
+    if (el.selectCompareRef.options.length !== Math.max(1, refs.length)) populateCompareSelect();
+    const ref = refs.find((r) => r.id === el.selectCompareRef.value);
+    if (!ref) {
+      canvasMessage(el.compareCanvas, "Нет эталона: откройте предыдущую ЭКГ пациента и нажмите «Сохранить текущую как эталон»");
+      el.compareMetrics.innerHTML = '<div class="atool-verdict">Эталон не выбран</div>';
+      state.atool.last.compare = null;
+      return;
+    }
+    const cur = buildEcgSnapshot();
+    const cmp = compareSnapshots(cur, ref);
+    state.atool.last.compare = { ref, cur, cmp };
+    const { ctx, W, H } = prepCanvas(el.compareCanvas, 360);
+    const cols = 4;
+    const rowsN = 3;
+    const cw = (W - 10) / cols;
+    const ch = (H - 10) / rowsN;
+    STANDARD_LEADS.forEach((ln, k) => {
+      const x0 = 5 + (k % cols) * cw;
+      const y0 = 5 + Math.floor(k / cols) * ch;
+      ctx.strokeStyle = "#E2E8F0";
+      ctx.strokeRect(x0 + 2, y0 + 2, cw - 4, ch - 4);
+      ctx.fillStyle = "#141923";
+      ctx.font = "600 11px 'IBM Plex Mono', monospace";
+      ctx.textAlign = "left";
+      ctx.fillText(ln, x0 + 7, y0 + 15);
+      const a = ref.leads[ln];
+      const b = cur.leads[ln];
+      if (!a || !b) {
+        ctx.fillStyle = "#A0AEC0";
+        ctx.font = "10px sans-serif";
+        ctx.fillText(!a && !b ? "нет" : !a ? "нет в эталоне" : "нет сейчас", x0 + 7, y0 + 30);
+        return;
+      }
+      let lo = -0.3;
+      let hi = 0.3;
+      [a.tpl, b.tpl].forEach((tp) => tp.forEach((v) => {
+        if (v !== null) {
+          lo = Math.min(lo, v);
+          hi = Math.max(hi, v);
+        }
+      }));
+      const X = (t) => x0 + 6 + ((t + CMP_PRE) / (CMP_PRE + CMP_POST)) * (cw - 12);
+      const Y = (v) => y0 + ch - 8 - ((v - lo) / Math.max(0.1, hi - lo)) * (ch - 26);
+      ctx.strokeStyle = "rgba(160, 174, 192, 0.5)";
+      ctx.setLineDash([2, 3]);
+      ctx.beginPath();
+      ctx.moveTo(x0 + 6, Y(0));
+      ctx.lineTo(x0 + cw - 6, Y(0));
+      ctx.stroke();
+      ctx.setLineDash([]);
+      const line = (tp, color, lw, dash) => {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = lw;
+        ctx.setLineDash(dash || []);
+        ctx.beginPath();
+        let pen = false;
+        tp.forEach((v, i) => {
+          if (v === null) {
+            pen = false;
+            return;
+          }
+          const x = X(-CMP_PRE + i * CMP_STEP);
+          const y = Y(v);
+          if (pen) ctx.lineTo(x, y);
+          else ctx.moveTo(x, y);
+          pen = true;
+        });
+        ctx.stroke();
+        ctx.setLineDash([]);
+      };
+      line(a.tpl, "#94A3B8", 1.6, [4, 3]);
+      line(b.tpl, "#0F4C81", 1.6);
+      const row = cmp.rows.find((r) => r.ln === ln);
+      if (row && Number.isFinite(row.dSt)) {
+        const big = Math.abs(row.dSt) >= 0.1;
+        ctx.fillStyle = big ? (row.dSt > 0 ? "#C5221F" : "#B06000") : "#718096";
+        ctx.font = `${big ? 700 : 500} 10px 'IBM Plex Mono', monospace`;
+        ctx.textAlign = "right";
+        ctx.fillText(`ΔST ${row.dSt >= 0 ? "+" : ""}${row.dSt.toFixed(2)}`, x0 + cw - 7, y0 + 15);
+      }
+    });
+
+    const g0 = ref.global || {};
+    const g1 = cur.global || {};
+    const tr = (k, label, unit, d = 0) => {
+      const a = g0[k];
+      const b = g1[k];
+      const dv = Number.isFinite(a) && Number.isFinite(b) ? Number((b - a).toFixed(d)) + 0 : NaN;
+      return { k: label, v: `${fmtNum(a, d)} → ${fmtNum(b, d)}`, r: `${Number.isFinite(dv) ? `${dv > 0 ? "+" : ""}${dv.toFixed(d)}` : "—"} ${unit}` };
+    };
+    const verdict = cmp.findings.some((x) => x.lvl === "bad")
+      ? "bad"
+      : cmp.findings.some((x) => x.lvl === "warn") ? "warn" : "ok";
+    el.compareMetrics.innerHTML =
+      `<div class="atool-verdict ${verdict}">${cmp.findings.length ? `Динамика: ${cmp.findings.length} наход.` : "Без существенной динамики"}</div>` +
+      `<div class="sub">Эталон</div><div class="cmp-ref-name">${escapeHtml(ref.name)}</div>` +
+      metricsTable([
+        { sub: "Было → стало" },
+        tr("hr", "ЧСС", "уд/мин"),
+        tr("pq", "PQ", "мс"),
+        tr("qrs", "QRS", "мс"),
+        tr("qt", "QT", "мс"),
+        tr("qtcf", "QTcF", "мс"),
+        tr("axis", "ЭОС", "°"),
+        {
+          k: "Интервалы",
+          v: g0.source === "autoanalysis" && g1.source === "autoanalysis" ? "автоанализ" : "медиана отв.",
+          r: g0.source === "autoanalysis" && g1.source === "autoanalysis" ? "" : "точнее — автоанализ на обеих ЭКГ",
+          lvl: g0.source === "autoanalysis" && g1.source === "autoanalysis" ? "" : "warn",
+        },
+      ]) +
+      (cmp.findings.length
+        ? `<div class="sub">Находки</div><ul class="cmp-findings">${cmp.findings.map((x) => `<li class="${x.lvl}">${escapeHtml(x.t)}</li>`).join("")}</ul>`
+        : "") +
+      `<div class="sub">Отведений сравнено: ${cmp.leads.length}</div>`;
+  }
+
+  function bindCompareTool() {
+    if (!el.selectCompareRef) return;
+    populateCompareSelect();
+    el.selectCompareRef.addEventListener("change", renderAnalysisTools);
+    el.btnCompareSave.addEventListener("click", () => {
+      if (!state.analysis || !state.digitization) return;
+      const snap = buildEcgSnapshot();
+      if (!Object.keys(snap.leads).length) {
+        setStatus("Не удалось построить медианные комплексы стандартных отведений", "error");
+        return;
+      }
+      const refs = loadCompareRefs();
+      refs.unshift(snap);
+      if (!saveCompareRefs(refs.slice(0, 60))) {
+        setStatus("Хранилище браузера переполнено — удалите старые эталоны или сохраните в файл", "error");
+        return;
+      }
+      populateCompareSelect(snap.id);
+      setStatus(`Эталон сохранён: ${snap.name}`, "ready");
+      renderAnalysisTools();
+    });
+    el.btnCompareDelete.addEventListener("click", () => {
+      const id = el.selectCompareRef.value;
+      if (!id) return;
+      const ref = loadCompareRefs().find((r) => r.id === id);
+      if (!ref || !window.confirm(`Удалить эталон «${ref.name}» из браузера?`)) return;
+      saveCompareRefs(loadCompareRefs().filter((r) => r.id !== id));
+      populateCompareSelect();
+      renderAnalysisTools();
+    });
+    el.btnCompareExport.addEventListener("click", () => {
+      const ref = loadCompareRefs().find((r) => r.id === el.selectCompareRef.value);
+      if (!ref) return;
+      const blob = new Blob([JSON.stringify({ type: "ecg-compare-ref", version: 1, ref })], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `ecg_reference_${ref.date.replace(/[^\d]+/g, "-")}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    });
+    el.inpCompareImport.addEventListener("change", async (e) => {
+      const file = e.target.files && e.target.files[0];
+      e.target.value = "";
+      if (!file) return;
+      try {
+        const data = JSON.parse(await file.text());
+        const ref = data && data.type === "ecg-compare-ref" ? data.ref : null;
+        if (!ref || !ref.leads || typeof ref.leads !== "object") throw new Error("это не файл эталона ЭКГ");
+        Object.values(ref.leads).forEach((l) => {
+          if (!Array.isArray(l.tpl) || !Number.isFinite(l.j)) throw new Error("повреждённые комплексы");
+        });
+        ref.id = `ref-${Date.now()}`;
+        ref.name = String(ref.name || file.name).slice(0, 140);
+        const refs = loadCompareRefs();
+        refs.unshift(ref);
+        saveCompareRefs(refs.slice(0, 60));
+        populateCompareSelect(ref.id);
+        setStatus(`Эталон загружен из файла: ${ref.name}`, "ready");
+        renderAnalysisTools();
+      } catch (err) {
+        setStatus(`Не удалось загрузить эталон: ${err.message}`, "error");
+      }
+    });
+  }
+
   // ---- tab texts for the conclusion
   function analysisToolReportText() {
     const tab = state.atool.tab;
@@ -1878,6 +2409,12 @@
       return `Дисперсия QT ${q.qtd.toFixed(0)} мс (QT ${q.min.qt.toFixed(0)} мс в ${q.min.ln} — ${q.max.qt.toFixed(0)} мс в ${q.max.ln}, ${q.inc.length} отв.), QTcd ${fmtNum(q.qtcd, 0)} мс` +
         (q.manual ? "." : "; границы автоматические, требуют проверки.");
     }
+    if (tab === "compare" && L.compare) {
+      const { ref, cmp } = L.compare;
+      return cmp.findings.length
+        ? `В сравнении с ЭКГ от ${ref.date}: ${cmp.findings.map((x) => x.t.charAt(0).toLowerCase() + x.t.slice(1)).join("; ")}.`
+        : `В сравнении с ЭКГ от ${ref.date} — без существенной динамики.`;
+    }
     if (tab === "noise" && L.noise && L.noise.nz) {
       const n = L.noise.nz;
       return `Качество сигнала (отв. ${L.noise.ln}): дрейф изолинии ${fmtNum(n.wander, 2)} мВ, наводка 50 Гц ${fmtNum(n.mains[50], 0)} дБ, ВЧ-шум ${fmtNum(n.hfRmsUv, 0)} мкВ, сигнал/шум ${fmtNum(n.snrDb, 0)} дБ.`;
@@ -1894,6 +2431,7 @@
     else if (tab === "overlay") renderOverlayTool();
     else if (tab === "qtd") renderQtdTool();
     else if (tab === "noise") renderNoiseTool();
+    else if (tab === "compare") renderCompareTool();
   }
 
   function scheduleAnalysisTools() {
@@ -2350,8 +2888,17 @@
     if (text) setStatus(text, busy ? "busy" : "ready");
   }
 
+  function signalFilterParams() {
+    const mode = (el.selectSignalFilter && el.selectSignalFilter.value) || "none";
+    const notch = el.selectSignalNotch && el.selectSignalNotch.value ? parseFloat(el.selectSignalNotch.value) : null;
+    return { filter_mode: mode, notch_hz: notch };
+  }
+
   async function postSignalFiles(files, extra) {
     const fd = new FormData();
+    const fp = signalFilterParams();
+    fd.append("filter_mode", fp.filter_mode);
+    if (fp.notch_hz) fd.append("notch_hz", String(fp.notch_hz));
     files.forEach((f) => fd.append("files", f, f.name));
     Object.entries(extra || {}).forEach(([k, v]) => {
       if (v !== null && v !== undefined && v !== "") fd.append(k, String(v));
@@ -2412,6 +2959,7 @@
           segment_start_s: start,
           segment_duration_s: dur,
           patient_sex: (el.selectPatientSex && el.selectPatientSex.value) || null,
+          ...signalFilterParams(),
         }),
       });
       let data = null;
@@ -2462,6 +3010,11 @@
       `фрагмент ${fmtHms(s.segment_start_s)}–${fmtHms(s.segment_start_s + s.segment_duration_s)}`,
     ];
     if (info.start) parts.push(`начало записи ${info.start}`);
+    const flt = s.filter || {};
+    if ((flt.mode && flt.mode !== "none") || flt.notch_hz) {
+      const fl = el.selectSignalFilter ? Array.from(el.selectSignalFilter.options).find((o) => o.value === flt.mode) : null;
+      parts.push(`фильтр: ${fl ? fl.textContent : flt.mode}${flt.notch_hz ? ` + ${flt.notch_hz} Гц` : ""}`);
+    }
     const ageN = parseInt(info.age, 10);
     const ageTxt = Number.isFinite(ageN)
       ? `${ageN} ${ageN % 10 === 1 && ageN % 100 !== 11 ? "год" : [2, 3, 4].includes(ageN % 10) && ![12, 13, 14].includes(ageN % 100) ? "года" : "лет"}`
@@ -2588,6 +3141,9 @@
     el.btnSignalPrev.addEventListener("click", () => state.signal && loadSignalSegment(state.signal.segment_start_s - durNow()));
     el.btnSignalNext.addEventListener("click", () => state.signal && loadSignalSegment(state.signal.segment_start_s + state.signal.segment_duration_s));
     el.selectSignalDuration.addEventListener("change", () => state.signal && loadSignalSegment(state.signal.segment_start_s));
+    [el.selectSignalFilter, el.selectSignalNotch].forEach((sel) => sel && sel.addEventListener("change", () => {
+      if (state.signal) loadSignalSegment(state.signal.segment_start_s);
+    }));
     el.chkSignalOverview.addEventListener("change", () => {
       updateSignalModeUI();
       setTimeout(renderMultiLeadCanvas, 30);
@@ -9049,6 +9605,8 @@ ${img ? `<h2>Запись (оцифрованные отведения)</h2><img
     bindAxisCaliperEvents();
     bindInterfaceExtras();
     bindAnalysisTools();
+    bindPhraseLibrary();
+    bindCompareTool();
     // Calibration pulse disagrees with the entered gain → re-digitize with the gain the pulse shows
     if (el.btnApplyPulseGain) {
       el.btnApplyPulseGain.addEventListener("click", () => {
